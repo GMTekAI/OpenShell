@@ -787,6 +787,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -825,6 +826,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         None,
         true,
         false,
+        None,
         None,
         Some("500m"),
         Some("2Gi"),
@@ -885,6 +887,52 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
 }
 
 #[tokio::test]
+async fn sandbox_create_sends_gpu_count_request() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("gpu-count"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        Some(2),
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        "manual",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let gpu = requests[0]
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.gpu.as_ref())
+        .expect("GPU request should be sent");
+
+    assert!(gpu.device_id.is_empty());
+    assert_eq!(gpu.count, Some(2));
+}
+
+#[tokio::test]
 async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
     let server = run_server().await;
     enable_providers_v2(&server).await;
@@ -902,6 +950,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         None,
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -963,6 +1012,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1016,6 +1066,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1061,6 +1112,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1098,6 +1150,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         None,
         false,
         false,
+        None,
         None,
         None,
         None,
@@ -1147,6 +1200,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1192,6 +1246,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1233,6 +1288,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         false,
         false,
+        None,
         None,
         None,
         None,

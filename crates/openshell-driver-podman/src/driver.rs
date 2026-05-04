@@ -10,7 +10,7 @@ use crate::watcher::{
     self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
 };
 use openshell_core::ComputeDriverError;
-use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse, GpuRequestSpec};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -280,12 +280,17 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu);
-        Self::validate_gpu_request(gpu_requested)
+        let gpu = sandbox.spec.as_ref().and_then(|s| s.gpu.as_ref());
+        Self::validate_gpu_request(gpu)
     }
 
-    fn validate_gpu_request(gpu_requested: bool) -> Result<(), ComputeDriverError> {
-        if gpu_requested && !Self::has_gpu_capacity() {
+    fn validate_gpu_request(gpu: Option<&GpuRequestSpec>) -> Result<(), ComputeDriverError> {
+        if gpu.is_some_and(|gpu| gpu.count.is_some()) {
+            return Err(ComputeDriverError::Precondition(
+                "podman compute driver does not support GPU count requests".to_string(),
+            ));
+        }
+        if gpu.is_some() && !Self::has_gpu_capacity() {
             return Err(ComputeDriverError::Precondition(
                 "GPU sandbox requested, but no NVIDIA GPU devices are available.".to_string(),
             ));
@@ -305,6 +310,7 @@ impl PodmanComputeDriver {
                 "sandbox id is required".into(),
             ));
         }
+        self.validate_sandbox_create(sandbox)?;
 
         // Validate the composed container name early, before creating any
         // resources (volume), so we don't leave orphans when the name is
@@ -665,6 +671,19 @@ mod tests {
     fn podman_driver_error_from_not_found() {
         let err = ComputeDriverError::from(PodmanApiError::NotFound("gone".into()));
         assert!(matches!(err, ComputeDriverError::Message(_)));
+    }
+
+    #[test]
+    fn validate_gpu_request_rejects_count() {
+        let err = PodmanComputeDriver::validate_gpu_request(Some(&GpuRequestSpec {
+            device_id: vec![],
+            count: Some(2),
+        }))
+        .expect_err("GPU count should be rejected");
+
+        assert!(
+            matches!(err, ComputeDriverError::Precondition(message) if message.contains("does not support GPU count"))
+        );
     }
 
     // ── grpc_endpoint auto-detection ───────────────────────────────────
