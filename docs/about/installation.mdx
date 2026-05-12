@@ -47,7 +47,7 @@ Download the CLI and gateway release artifacts. Choose targets that match your h
 | macOS Apple Silicon | `aarch64-apple-darwin` | `aarch64-apple-darwin` |
 
 ```shell
-VERSION=dev
+VERSION="v0.0.0"
 CLI_TARGET=x86_64-unknown-linux-musl
 GATEWAY_TARGET=x86_64-unknown-linux-gnu
 BASE_URL="https://github.com/NVIDIA/OpenShell/releases/download/${VERSION}"
@@ -59,7 +59,7 @@ chmod 755 "$HOME/.local/bin/openshell" "$HOME/.local/bin/openshell-gateway"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Set `VERSION` to `dev` for the rolling build, or to a release tag from [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases). For production installs, download and verify the release checksum files before installing the artifacts.
+Set `VERSION` to a release tag from [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases). For production installs, download and verify the release checksum files before installing the artifacts.
 
 Generate a local mTLS bundle and start a Docker-backed gateway on loopback:
 
