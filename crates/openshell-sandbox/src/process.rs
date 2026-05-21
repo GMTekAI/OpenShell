@@ -22,6 +22,12 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tracing::debug;
 
+#[cfg(target_os = "linux")]
+const CHILD_NPROC_LIMIT: libc::rlim_t = 8192;
+
+#[cfg(all(unix, not(target_os = "linux")))]
+const CHILD_NPROC_LIMIT: libc::rlim_t = 512;
+
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
     for (key, value) in provider_env {
         cmd.env(key, value);
@@ -43,13 +49,13 @@ pub fn harden_child_process() -> Result<()> {
         ));
     }
 
-    // Limit process creation to prevent fork bombs. 512 processes per UID is
-    // sufficient for typical agent workloads (shell, compilers, language servers)
-    // while preventing runaway forking. Set as a hard limit so the sandbox user
-    // cannot raise it after privilege drop.
+    // Limit process creation to prevent fork bombs. Linux sandboxes need enough
+    // headroom for agent runtimes that create many worker threads, while still
+    // preventing runaway forking. Set as a hard limit so the sandbox user cannot
+    // raise it after privilege drop.
     let nproc_limit = libc::rlimit {
-        rlim_cur: 512,
-        rlim_max: 512,
+        rlim_cur: CHILD_NPROC_LIMIT,
+        rlim_max: CHILD_NPROC_LIMIT,
     };
     let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const nproc_limit) };
     if rc != 0 {
