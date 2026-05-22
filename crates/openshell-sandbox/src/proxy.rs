@@ -176,8 +176,8 @@ pub struct ProxyHandle {
 pub struct LoopbackProxyHandle {
     http_addr: SocketAddr,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
-    host_join: TokioJoinHandle<()>,
+    sandbox_acceptor_thread: Option<std::thread::JoinHandle<()>>,
+    supervisor_dispatcher_join: TokioJoinHandle<()>,
 }
 
 impl ProxyHandle {
@@ -323,10 +323,15 @@ fn spawn_proxy_connection(
 
 #[cfg(target_os = "linux")]
 impl LoopbackProxyHandle {
-    /// Start a managed loopback proxy listener inside the sandbox network
-    /// namespace. The listener uses the same L7 proxy handler as the gateway
-    /// proxy, preserving policy evaluation and credential rewrite behavior for
-    /// clients that can only be configured with a loopback proxy URL.
+    /// Start a managed loopback proxy for clients that can only be configured
+    /// with a loopback proxy URL.
+    ///
+    /// This is intentionally split across two network namespaces:
+    /// - the sandbox-netns acceptor thread enters `setns()`, binds loopback,
+    ///   accepts client sockets, and sends accepted sockets out;
+    /// - the supervisor dispatcher task stays in the supervisor namespace and
+    ///   invokes the normal proxy path for policy, DNS, SSRF checks, TLS/L7,
+    ///   WebSocket rewrite, credential resolution, and upstream connect.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start_in_netns(
         netns_fd: RawFd,
@@ -350,7 +355,7 @@ impl LoopbackProxyHandle {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let (accepted_tx, accepted_rx) = mpsc::unbounded_channel();
 
-        let host_join = spawn_loopback_dispatch_task(
+        let supervisor_dispatcher_join = spawn_loopback_supervisor_dispatcher_task(
             accepted_rx,
             opa_engine,
             identity_cache,
@@ -363,9 +368,9 @@ impl LoopbackProxyHandle {
         );
 
         let thread = match std::thread::Builder::new()
-            .name("openshell-loopback-proxy".to_string())
+            .name("openshell-loopback-netns-acceptor".to_string())
             .spawn(move || {
-                run_loopback_proxy_thread(
+                run_loopback_sandbox_netns_acceptor_thread(
                     netns_fd,
                     listen_addr,
                     ready_tx,
@@ -375,7 +380,7 @@ impl LoopbackProxyHandle {
             }) {
             Ok(thread) => thread,
             Err(err) => {
-                host_join.abort();
+                supervisor_dispatcher_join.abort();
                 return Err(err).into_diagnostic();
             }
         };
@@ -387,11 +392,11 @@ impl LoopbackProxyHandle {
             Ok(Ok(addr)) => addr,
             Ok(Err(message)) => {
                 let _ = thread.join();
-                host_join.abort();
+                supervisor_dispatcher_join.abort();
                 return Err(miette::miette!("{message}"));
             }
             Err(std::sync::mpsc::RecvError) => {
-                host_join.abort();
+                supervisor_dispatcher_join.abort();
                 return Err(miette::miette!(
                     "Loopback proxy thread exited before startup on {listen_addr}"
                 ));
@@ -401,8 +406,8 @@ impl LoopbackProxyHandle {
         Ok(Self {
             http_addr,
             shutdown: Some(shutdown_tx),
-            thread: Some(thread),
-            host_join,
+            sandbox_acceptor_thread: Some(thread),
+            supervisor_dispatcher_join,
         })
     }
 
@@ -413,7 +418,7 @@ impl LoopbackProxyHandle {
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn spawn_loopback_dispatch_task(
+fn spawn_loopback_supervisor_dispatcher_task(
     mut accepted_rx: mpsc::UnboundedReceiver<std::net::TcpStream>,
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
@@ -426,9 +431,11 @@ fn spawn_loopback_dispatch_task(
 ) -> TokioJoinHandle<()> {
     tokio::spawn(async move {
         // Detect the trusted host gateway from the supervisor context, matching
-        // the primary gateway proxy. The loopback thread only accepts sandbox
-        // sockets; policy, DNS, credential rewrite, and upstream dialing remain
-        // on this host-side task.
+        // the primary gateway proxy.
+        //
+        // Invariant: this task is the only half allowed to run policy, DNS,
+        // SSRF checks, TLS/L7 handling, WebSocket rewrite, credential
+        // resolution, or upstream dialing for managed loopback traffic.
         let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
         while let Some(stream) = accepted_rx.recv().await {
             if let Err(err) = stream.set_nonblocking(true) {
@@ -479,7 +486,7 @@ fn spawn_loopback_dispatch_task(
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn run_loopback_proxy_thread(
+fn run_loopback_sandbox_netns_acceptor_thread(
     netns_fd: RawFd,
     listen_addr: SocketAddr,
     ready_tx: std::sync::mpsc::Sender<std::result::Result<SocketAddr, String>>,
@@ -488,6 +495,10 @@ fn run_loopback_proxy_thread(
 ) {
     let startup_failure_tx = ready_tx.clone();
     let result = (|| -> std::result::Result<(), String> {
+        // Invariant: after setns(), this dedicated thread only binds loopback,
+        // accepts sandbox client sockets, and hands those accepted sockets back
+        // to the supervisor dispatcher. It must not perform DNS, policy checks,
+        // credential rewrite, or upstream dialing from the sandbox netns.
         // SAFETY: setns is called on a dedicated OS thread that only serves
         // this listener and exits with the sandbox supervisor.
         #[allow(unsafe_code)]
@@ -608,10 +619,10 @@ impl Drop for LoopbackProxyHandle {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self.sandbox_acceptor_thread.take() {
             let _ = thread.join();
         }
-        self.host_join.abort();
+        self.supervisor_dispatcher_join.abort();
     }
 }
 
