@@ -45,32 +45,39 @@ fn main() {
         }
     };
 
-    let supervisor_path = env::var_os("CARGO_BIN_FILE_OPENSHELL_SANDBOX")
-        .or_else(|| env::var_os("CARGO_BIN_FILE_OPENSHELL_SANDBOX_openshell-sandbox"))
-        .expect("CARGO_BIN_FILE_OPENSHELL_SANDBOX not set");
-    let supervisor_path = PathBuf::from(supervisor_path);
-    println!("cargo:rerun-if-changed={}", supervisor_path.display());
+    let supervisor_artifact = env::var_os("CARGO_BIN_FILE_OPENSHELL_SANDBOX")
+        .or_else(|| env::var_os("CARGO_BIN_FILE_OPENSHELL_SANDBOX_openshell-sandbox"));
+    let supervisor_embedded = supervisor_artifact.is_some();
+    if let Some(supervisor_path) = supervisor_artifact {
+        let supervisor_path = PathBuf::from(supervisor_path);
+        println!("cargo:rerun-if-changed={}", supervisor_path.display());
 
-    let mut supervisor = File::open(&supervisor_path)
-        .unwrap_or_else(|e| panic!("Failed to open {}: {e}", supervisor_path.display()));
-    let dst_path = out_dir.join("openshell-sandbox.zst");
-    let mut dst = File::create(&dst_path)
-        .unwrap_or_else(|e| panic!("Failed to create {}: {e}", dst_path.display()));
-    zstd::stream::copy_encode(&mut supervisor, &mut dst, 1).unwrap_or_else(|e| {
-        panic!(
-            "Failed to compress {} to {}: {e}",
-            supervisor_path.display(),
-            dst_path.display()
-        )
-    });
-    let size = fs::metadata(&dst_path).map_or(0, |m| m.len());
-    println!("cargo:warning=Embedded openshell-sandbox.zst: {size} bytes");
+        let mut supervisor = File::open(&supervisor_path)
+            .unwrap_or_else(|e| panic!("Failed to open {}: {e}", supervisor_path.display()));
+        let dst_path = out_dir.join("openshell-sandbox.zst");
+        let mut dst = File::create(&dst_path)
+            .unwrap_or_else(|e| panic!("Failed to create {}: {e}", dst_path.display()));
+        zstd::stream::copy_encode(&mut supervisor, &mut dst, 1).unwrap_or_else(|e| {
+            panic!(
+                "Failed to compress {} to {}: {e}",
+                supervisor_path.display(),
+                dst_path.display()
+            )
+        });
+        let size = fs::metadata(&dst_path).map_or(0, |m| m.len());
+        println!("cargo:warning=Embedded openshell-sandbox.zst: {size} bytes");
+    }
+    let setup_hint = if supervisor_embedded {
+        "Run: mise run vm:setup"
+    } else {
+        "Run: mise run vm:setup && mise run vm:supervisor"
+    };
 
     let compressed_dir = if let Ok(dir) = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR") {
         PathBuf::from(dir)
     } else {
         println!("cargo:warning=OPENSHELL_VM_RUNTIME_COMPRESSED_DIR not set");
-        println!("cargo:warning=Run: mise run vm:setup && mise run vm:supervisor");
+        println!("cargo:warning={setup_hint}");
         generate_stub_resources(
             &out_dir,
             &[
@@ -89,7 +96,7 @@ fn main() {
             "cargo:warning=Compressed runtime dir not found: {}",
             compressed_dir.display()
         );
-        println!("cargo:warning=Run: mise run vm:setup && mise run vm:supervisor");
+        println!("cargo:warning={setup_hint}");
         generate_stub_resources(
             &out_dir,
             &[
@@ -110,11 +117,19 @@ fn main() {
             format!("{libkrunfw_name}.zst"),
         ),
         ("gvproxy.zst".to_string(), "gvproxy.zst".to_string()),
+        (
+            "openshell-sandbox.zst".to_string(),
+            "openshell-sandbox.zst".to_string(),
+        ),
         ("umoci.zst".to_string(), "umoci.zst".to_string()),
     ];
 
     let mut all_found = true;
     for (src_name, dst_name) in &files {
+        if supervisor_embedded && src_name == "openshell-sandbox.zst" {
+            continue;
+        }
+
         let src_path = compressed_dir.join(src_name);
         let dst_path = out_dir.join(dst_name);
 
@@ -143,9 +158,7 @@ fn main() {
     }
 
     if !all_found {
-        println!(
-            "cargo:warning=Some artifacts missing. Run: mise run vm:setup && mise run vm:supervisor"
-        );
+        println!("cargo:warning=Some artifacts missing. {setup_hint}");
         generate_stub_resources(
             &out_dir,
             &[
