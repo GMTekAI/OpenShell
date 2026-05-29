@@ -11,7 +11,7 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 
 | Job | Runner | Verifies |
 |---|---|---|
-| `macos` | `macos-latest-xlarge` | `install.sh` resolves the Homebrew formula, brew installs the cask, and `openshell status` reaches the brew-services–backed local gateway with the VM driver. |
+| `macos` | `macos-latest-xlarge` | `install.sh` resolves the Homebrew formula, brew installs the cask, Homebrew `e2fsprogs` provides ext4 tools for the VM driver, `openshell status` reaches the brew-services–backed local gateway, and a VM-backed sandbox can run a command while default-deny egress blocks `api.github.com`. |
 | `ubuntu` | `ubuntu-latest` | `install.sh` installs the Debian package, the post-install systemd user service starts, and `openshell status` reaches the local gateway with the Docker driver. |
 | `fedora` | `fedora:latest` container | `install.sh` installs the RPM packages, the local gateway starts under Podman, and `openshell status` succeeds. |
 | `kubernetes` | `ubuntu-latest` + kind | `helm install oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev` succeeds in a kind cluster, the gateway pod becomes Ready, port-forward exposes 8080, and the released CLI registers the in-cluster gateway and runs `openshell status` against it. |
@@ -109,6 +109,8 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 |---|---|---|
 | `macos`/`ubuntu`/`fedora` job fails on `install.sh` | Latest tagged release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
 | `macos`/`ubuntu`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_DRIVERS` env in the "Ensure …" step. |
+| `macos` job fails with missing `mkfs.ext4`, `mke2fs`, or `debugfs` | Homebrew `e2fsprogs` did not install or is not visible at the expected Homebrew prefix. | The "Install VM driver dependencies" step checks the package before sandbox creation. |
+| `macos` job fails on sandbox create or default-deny verification | VM provisioning, base image startup, sandbox exec, policy enforcement, or denial evidence regressed. | The macOS diagnostics step dumps `openshell status`, `openshell sandbox list`, recent sandbox logs, brew service info, and Homebrew gateway logs. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
 | `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
 | `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |

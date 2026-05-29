@@ -19,16 +19,105 @@ jobs:
     name: macOS Homebrew
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: macos-latest-xlarge
-    timeout-minutes: 20
+    timeout-minutes: 30
+    env:
+      OPENSHELL_PROVISION_TIMEOUT: "600"
     steps:
       - name: Ensure VM driver
         run: |
           launchctl setenv OPENSHELL_DRIVERS vm
 
+      - name: Install VM driver dependencies
+        run: |
+          set -euo pipefail
+          brew install e2fsprogs
+          E2FS_PREFIX="$(brew --prefix e2fsprogs)"
+          if ! [ -x "${E2FS_PREFIX}/sbin/mkfs.ext4" ] && ! [ -x "${E2FS_PREFIX}/bin/mkfs.ext4" ]; then
+            echo "mkfs.ext4 was not installed by e2fsprogs." >&2
+            exit 1
+          fi
+          if ! [ -x "${E2FS_PREFIX}/sbin/debugfs" ] && ! [ -x "${E2FS_PREFIX}/bin/debugfs" ]; then
+            echo "debugfs was not installed by e2fsprogs." >&2
+            exit 1
+          fi
+
       - name: Install and check status
         run: |
+          set -euo pipefail
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
+
+      - name: Create sandbox and verify default-deny egress
+        run: |
+          set -euo pipefail
+          SANDBOX="release-canary-${GITHUB_RUN_ID}"
+          TMP_DIR="$(mktemp -d)"
+
+          cleanup() {
+            local exit_status=$?
+            rm -rf "$TMP_DIR" || true
+            return "$exit_status"
+          }
+          trap cleanup EXIT
+
+          set +e
+          openshell sandbox create \
+            --name "$SANDBOX" \
+            --from base \
+            --no-auto-providers \
+            --no-tty \
+            -- curl -sS https://api.github.com/zen > "${TMP_DIR}/curl.out" 2>&1
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            echo "Expected sandbox create to run a curl command blocked by default-deny egress, but curl succeeded." >&2
+            exit 1
+          fi
+
+          for attempt in 1 2 3 4 5; do
+            openshell logs "$SANDBOX" --since 10m --source sandbox > "${TMP_DIR}/sandbox-logs.out" 2>&1 || true
+            if grep -Eiq 'DENIED .*curl.*api[.]github[.]com' "${TMP_DIR}/sandbox-logs.out"; then
+              echo "Confirmed default-deny egress denial in sandbox logs."
+              if openshell sandbox delete "$SANDBOX"; then
+                echo "Deleted sandbox $SANDBOX."
+                exit 0
+              fi
+              echo "Confirmed denial, but failed to delete sandbox $SANDBOX." >&2
+              exit 1
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              sleep 1
+            fi
+          done
+
+          echo "Sandbox create returned nonzero, but sandbox logs did not show the expected DENIED curl event for api.github.com." >&2
+          exit 1
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          SANDBOX="release-canary-${GITHUB_RUN_ID}"
+
+          echo "--- openshell status ---"
+          openshell status
+          echo "--- openshell sandbox list ---"
+          openshell sandbox list
+          echo "--- openshell logs ---"
+          openshell logs "$SANDBOX" --since 10m --source sandbox
+          echo "--- brew services info ---"
+          brew services info nvidia/openshell/openshell
+
+          for log in \
+            /opt/homebrew/var/log/openshell/openshell-gateway.err.log \
+            /opt/homebrew/var/log/openshell/openshell-gateway.out.log; do
+            echo "--- ${log} ---"
+            tail -200 "$log" 2>/dev/null || true
+          done
+
+          echo "--- cleanup sandbox ---"
+          openshell sandbox delete "$SANDBOX" || true
 
   ubuntu:
     name: Ubuntu Docker
