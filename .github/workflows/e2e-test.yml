@@ -114,6 +114,7 @@ jobs:
               PATH="/root/.cargo/bin:/root/.local/bin:/opt/mise/shims:/opt/mise/bin:${PATH}" \
               CARGO_HOME="/root/.cargo" \
               RUSTUP_HOME="/root/.rustup" \
+              MISE_CACHE_DIR="/home/openshell-test/.cache/mise" \
               OPENSHELL_SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE}" \
               OPENSHELL_REGISTRY="${OPENSHELL_REGISTRY}" \
               OPENSHELL_REGISTRY_HOST="${OPENSHELL_REGISTRY_HOST}" \
