@@ -4,6 +4,10 @@
 {
   description = "OpenShell development environment";
 
+  nixConfig = {
+    allow-import-from-derivation = true;
+  };
+
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -37,10 +41,10 @@
           inherit system;
           overlays = [
             (import rust-overlay)
-            (import ./nix/overlay.nix)
           ];
         };
         lib = pkgs.lib;
+        mkOpenShellPackages = pkgs: args: pkgs.callPackage ./nix/pkgs args;
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         shellPackages = with pkgs; [
           rustToolchain
@@ -54,51 +58,25 @@
         shellEnv = {
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         };
+        cargoNixSrc = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./.cargo
+            ./Cargo.lock
+            ./Cargo.toml
+            ./crates
+            ./providers
+            ./proto
+          ];
+        };
         generatedCargoNix = crate2nix.tools.${system}.generatedCargoNix {
           name = "openshell";
-          src = ./.;
+          src = cargoNixSrc;
           cargo = rustToolchain;
         };
+        crateOverrides = pkgs.callPackage ./nix/crate-overrides.nix { };
         cargoNix = pkgs.callPackage generatedCargoNix {
-          defaultCrateOverrides = pkgs.defaultCrateOverrides // {
-            "openshell-core" = prev: {
-              src = pkgs.runCommand "openshell-core-src" { } ''
-                mkdir -p "$out/crates" "$out/proto"
-                cp -R ${prev.src} "$out/crates/openshell-core"
-                cp -R ${./proto}/. "$out/proto/"
-              '';
-              workspace_member = "crates/openshell-core";
-            };
-            "openshell-providers" = prev: {
-              src = pkgs.runCommand "openshell-providers-src" { } ''
-                mkdir -p "$out/crates" "$out/providers"
-                cp -R ${prev.src} "$out/crates/openshell-providers"
-                cp -R ${./providers}/. "$out/providers/"
-              '';
-              workspace_member = "crates/openshell-providers";
-            };
-            "protobuf-src" = _: {
-              postConfigure = ''
-                build_dir="$(pwd)/target/build/protobuf-src.out/install"
-                install_dir="$lib/lib/protobuf-src.out/install"
-
-                export INSTALL_DIR="$install_dir"
-
-                substituteInPlace target/env \
-                  --replace "$build_dir" "$install_dir"
-              '';
-            };
-            "z3-sys" = _: {
-              nativeBuildInputs = with pkgs; [
-                pkg-config
-                llvmPackages.libclang
-              ];
-              buildInputs = with pkgs; [
-                z3
-              ];
-              LIBCLANG_PATH = "${pkgs.lib.getLib pkgs.llvmPackages.libclang}/lib";
-            };
-          };
+          defaultCrateOverrides = pkgs.defaultCrateOverrides // crateOverrides;
           buildRustCrateForPkgs =
             pkgs:
             pkgs.buildRustCrate.override {
@@ -109,7 +87,7 @@
         releaseCrates = lib.mapAttrs' (
           name: crate: lib.nameValuePair "${name}-release" crate.build
         ) cargoNix.workspaceMembers;
-        vmRuntimeCompressed = pkgs.callPackage ./nix/vm-runtime.nix {
+        openshellPackages = mkOpenShellPackages pkgs {
           openshellSandbox = releaseCrates."openshell-sandbox-release";
         };
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
@@ -137,7 +115,7 @@
               ]);
 
             env = shellEnv // {
-              OPENSHELL_VM_RUNTIME_COMPRESSED_DIR = "${vmRuntimeCompressed}";
+              OPENSHELL_VM_RUNTIME_COMPRESSED_DIR = "${openshellPackages.vmRuntimeCompressed}";
             };
           };
         };
@@ -147,7 +125,7 @@
         }
         // releaseCrates
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-          inherit vmRuntimeCompressed;
+          inherit (openshellPackages) vmRuntimeCompressed;
         };
 
         formatter = treefmtEval.config.build.wrapper;
