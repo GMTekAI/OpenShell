@@ -30,13 +30,14 @@ use openshell_core::progress::{
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, GpuRequestSpec,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
-    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
-    WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver, watch_sandboxes_event,
+    DriverCondition as SandboxCondition, DriverGpuResourceRequirement,
+    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
+    DriverSandboxStatus as SandboxStatus, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_vfio::SysfsRoot;
 use prost::Message;
@@ -618,7 +619,8 @@ impl VmDriver {
         let gpu_device = sandbox
             .spec
             .as_ref()
-            .and_then(|spec| requested_gpu_device(spec.gpu.as_ref()));
+            .and_then(driver_gpu_requirement)
+            .and_then(|gpu| requested_gpu_device(Some(gpu)));
         let gpu_bdf = if let Some(gpu_device) = gpu_device {
             Some(self.assign_gpu_to_record(&sandbox.id, gpu_device).await?)
         } else {
@@ -2578,7 +2580,7 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
 
-    validate_gpu_request(spec.gpu.as_ref(), gpu_enabled)?;
+    validate_gpu_request(driver_gpu_requirement(spec), gpu_enabled)?;
 
     if let Some(template) = spec.template.as_ref() {
         if !template.agent_socket_path.is_empty() {
@@ -2621,13 +2623,24 @@ fn validate_sandbox_id(sandbox_id: &str) -> Result<(), Status> {
     Ok(())
 }
 
-fn requested_gpu_device(gpu: Option<&GpuRequestSpec>) -> Option<&str> {
+fn driver_gpu_requirement(
+    spec: &openshell_core::proto::compute::v1::DriverSandboxSpec,
+) -> Option<&DriverGpuResourceRequirement> {
+    spec.resource_requirements
+        .as_ref()
+        .and_then(|requirements| requirements.gpu.as_ref())
+}
+
+fn requested_gpu_device(gpu: Option<&DriverGpuResourceRequirement>) -> Option<&str> {
     let gpu = gpu?;
-    Some(gpu.device_id.first().map_or("", String::as_str))
+    Some(gpu.device_ids.first().map_or("", String::as_str))
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_gpu_request(gpu: Option<&GpuRequestSpec>, gpu_enabled: bool) -> Result<(), Status> {
+fn validate_gpu_request(
+    gpu: Option<&DriverGpuResourceRequirement>,
+    gpu_enabled: bool,
+) -> Result<(), Status> {
     if gpu.is_some() && !gpu_enabled {
         return Err(Status::failed_precondition(
             "GPU support is not enabled on this driver; start with --gpu",
@@ -2640,7 +2653,7 @@ fn validate_gpu_request(gpu: Option<&GpuRequestSpec>, gpu_enabled: bool) -> Resu
         ));
     }
 
-    if gpu.is_some_and(|gpu| gpu.device_id.len() > 1) {
+    if gpu.is_some_and(|gpu| gpu.device_ids.len() > 1) {
         return Err(Status::invalid_argument(
             "vm compute driver supports at most one GPU device ID",
         ));
@@ -4432,7 +4445,8 @@ mod tests {
         PROGRESS_COMPLETE_STEP_KEY,
     };
     use openshell_core::proto::compute::v1::{
-        DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate, GpuRequestSpec,
+        DriverGpuResourceRequirement, DriverSandboxResourceRequirements,
+        DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate,
     };
     use prost_types::{Struct, Value, value::Kind};
     use std::fs;
@@ -4443,6 +4457,15 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    fn gpu_resource_requirements(
+        device_ids: Vec<String>,
+        count: Option<u32>,
+    ) -> DriverSandboxResourceRequirements {
+        DriverSandboxResourceRequirements {
+            gpu: Some(DriverGpuResourceRequirement { device_ids, count }),
+        }
+    }
 
     #[test]
     fn vm_pulling_layer_event_adds_progress_detail_metadata() {
@@ -4511,10 +4534,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: Some(GpuRequestSpec {
-                    device_id: vec![],
-                    count: None,
-                }),
+                resource_requirements: Some(gpu_resource_requirements(vec![], None)),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4530,10 +4550,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: Some(GpuRequestSpec {
-                    device_id: vec![],
-                    count: None,
-                }),
+                resource_requirements: Some(gpu_resource_requirements(vec![], None)),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4546,10 +4563,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: Some(GpuRequestSpec {
-                    device_id: vec![],
-                    count: Some(1),
-                }),
+                resource_requirements: Some(gpu_resource_requirements(vec![], Some(1))),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4562,10 +4576,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: Some(GpuRequestSpec {
-                    device_id: vec![],
-                    count: Some(2),
-                }),
+                resource_requirements: Some(gpu_resource_requirements(vec![], Some(2))),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4581,10 +4592,10 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: Some(GpuRequestSpec {
-                    device_id: vec!["0000:2d:00.0".to_string(), "0000:3d:00.0".to_string()],
-                    count: None,
-                }),
+                resource_requirements: Some(gpu_resource_requirements(
+                    vec!["0000:2d:00.0".to_string(), "0000:3d:00.0".to_string()],
+                    None,
+                )),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4602,8 +4613,8 @@ mod tests {
 
     #[test]
     fn requested_gpu_device_defaults_empty_request_to_inventory_choice() {
-        let gpu = GpuRequestSpec {
-            device_id: vec![],
+        let gpu = DriverGpuResourceRequirement {
+            device_ids: vec![],
             count: None,
         };
 
@@ -4612,8 +4623,8 @@ mod tests {
 
     #[test]
     fn requested_gpu_device_returns_first_explicit_device_id() {
-        let gpu = GpuRequestSpec {
-            device_id: vec!["0000:2d:00.0".to_string()],
+        let gpu = DriverGpuResourceRequirement {
+            device_ids: vec!["0000:2d:00.0".to_string()],
             count: None,
         };
 

@@ -39,18 +39,18 @@ use openshell_core::proto::{
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuRequestSpec,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirement,
     HealthRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
     ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
     ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PlatformEvent,
     PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
     ProviderProfileImportItem, RejectDraftChunkRequest, RevokeSshSessionRequest,
-    RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec,
-    SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope,
-    SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
-    tcp_forward_init,
+    RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxResourceRequirements, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
+    SetClusterInferenceRequest, SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit,
+    TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -1766,7 +1766,11 @@ pub async fn sandbox_create(
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            gpu: gpu_request_from_cli(requested_gpu, gpu_device, gpu_count),
+            resource_requirements: resource_requirements_from_cli(
+                requested_gpu,
+                gpu_device,
+                gpu_count,
+            ),
             policy,
             providers: configured_providers,
             template,
@@ -2191,17 +2195,19 @@ pub async fn sandbox_create(
     }
 }
 
-fn gpu_request_from_cli(
+fn resource_requirements_from_cli(
     requested_gpu: bool,
     gpu_device: Option<&str>,
     gpu_count: Option<u32>,
-) -> Option<GpuRequestSpec> {
-    requested_gpu.then(|| GpuRequestSpec {
-        device_id: gpu_device
-            .filter(|device_id| !device_id.is_empty())
-            .map(|device_id| vec![device_id.to_string()])
-            .unwrap_or_default(),
-        count: gpu_count,
+) -> Option<SandboxResourceRequirements> {
+    requested_gpu.then(|| SandboxResourceRequirements {
+        gpu: Some(GpuResourceRequirement {
+            device_ids: gpu_device
+                .filter(|device_id| !device_id.is_empty())
+                .map(|device_id| vec![device_id.to_string()])
+                .unwrap_or_default(),
+            count: gpu_count,
+        }),
     })
 }
 
@@ -7454,14 +7460,14 @@ mod tests {
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
-        git_sync_files, gpu_request_from_cli, http_health_check, image_requests_gpu,
-        import_local_package_mtls_bundle, inferred_provider_type, package_managed_tls_dirs,
-        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
+        git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
+        inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
+        parse_credential_expiry_cli_value, parse_credential_expiry_pairs, parse_credential_pairs,
+        plaintext_gateway_is_remote, progress_step_from_metadata,
         provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
-        service_url_for_gateway,
+        resource_requirements_from_cli, sandbox_should_persist, sandbox_upload_plan,
+        service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7941,43 +7947,48 @@ mod tests {
     }
 
     #[test]
-    fn gpu_request_from_cli_uses_presence_with_empty_device_ids_for_default_gpu() {
-        let request =
-            gpu_request_from_cli(true, None, None).expect("gpu request should be present");
+    fn resource_requirements_from_cli_uses_presence_for_default_gpu() {
+        let requirements = resource_requirements_from_cli(true, None, None)
+            .expect("resource requirements should be present");
+        let gpu = requirements.gpu.expect("GPU requirement should be present");
 
-        assert!(request.device_id.is_empty());
-        assert_eq!(request.count, None);
+        assert!(gpu.device_ids.is_empty());
+        assert_eq!(gpu.count, None);
     }
 
     #[test]
-    fn gpu_request_from_cli_maps_gpu_device_to_one_device_id() {
-        let request = gpu_request_from_cli(true, Some("0000:2d:00.0"), None)
-            .expect("gpu request should be present");
+    fn resource_requirements_from_cli_maps_gpu_device_to_one_device_id() {
+        let requirements = resource_requirements_from_cli(true, Some("0000:2d:00.0"), None)
+            .expect("resource requirements should be present");
+        let gpu = requirements.gpu.expect("GPU requirement should be present");
 
-        assert_eq!(request.device_id, vec!["0000:2d:00.0"]);
-        assert_eq!(request.count, None);
+        assert_eq!(gpu.device_ids, vec!["0000:2d:00.0"]);
+        assert_eq!(gpu.count, None);
     }
 
     #[test]
-    fn gpu_request_from_cli_maps_gpu_count() {
-        let request = gpu_request_from_cli(true, None, Some(2)).expect("gpu request should exist");
+    fn resource_requirements_from_cli_maps_gpu_count() {
+        let requirements =
+            resource_requirements_from_cli(true, None, Some(2)).expect("requirements should exist");
+        let gpu = requirements.gpu.expect("GPU requirement should be present");
 
-        assert!(request.device_id.is_empty());
-        assert_eq!(request.count, Some(2));
+        assert!(gpu.device_ids.is_empty());
+        assert_eq!(gpu.count, Some(2));
     }
 
     #[test]
-    fn gpu_request_from_cli_preserves_device_and_gpu_count_for_gateway_validation() {
-        let request = gpu_request_from_cli(true, Some("nvidia.com/gpu=0"), Some(2))
-            .expect("gpu request should exist");
+    fn resource_requirements_from_cli_preserves_device_and_gpu_count_for_gateway_validation() {
+        let requirements = resource_requirements_from_cli(true, Some("nvidia.com/gpu=0"), Some(2))
+            .expect("requirements should exist");
+        let gpu = requirements.gpu.expect("GPU requirement should be present");
 
-        assert_eq!(request.device_id, vec!["nvidia.com/gpu=0"]);
-        assert_eq!(request.count, Some(2));
+        assert_eq!(gpu.device_ids, vec!["nvidia.com/gpu=0"]);
+        assert_eq!(gpu.count, Some(2));
     }
 
     #[test]
-    fn gpu_request_from_cli_omits_gpu_request_when_not_requested() {
-        assert!(gpu_request_from_cli(false, Some("0"), None).is_none());
+    fn resource_requirements_from_cli_omits_gpu_request_when_not_requested() {
+        assert!(resource_requirements_from_cli(false, Some("0"), None).is_none());
     }
 
     #[test]

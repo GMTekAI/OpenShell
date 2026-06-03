@@ -379,7 +379,11 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
 
 /// Build CDI GPU device list if GPU is requested.
 fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    let gpu = sandbox.spec.as_ref().and_then(|spec| spec.gpu.as_ref());
+    let gpu = sandbox.spec.as_ref().and_then(|spec| {
+        spec.resource_requirements
+            .as_ref()
+            .and_then(|requirements| requirements.gpu.as_ref())
+    });
     cdi_gpu_device_ids(gpu).map(|device_ids| {
         device_ids
             .into_iter()
@@ -808,13 +812,17 @@ mod tests {
     #[test]
     fn container_spec_maps_empty_gpu_request_to_all_cdi_device() {
         use openshell_core::config::CDI_GPU_DEVICE_ALL;
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, GpuRequestSpec};
+        use openshell_core::proto::compute::v1::{
+            DriverGpuResourceRequirement, DriverSandboxResourceRequirements, DriverSandboxSpec,
+        };
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: Some(GpuRequestSpec {
-                device_id: vec![],
-                count: None,
+            resource_requirements: Some(DriverSandboxResourceRequirements {
+                gpu: Some(DriverGpuResourceRequirement {
+                    device_ids: vec![],
+                    count: None,
+                }),
             }),
             ..Default::default()
         });
@@ -829,13 +837,17 @@ mod tests {
 
     #[test]
     fn container_spec_passes_explicit_cdi_device_id_through() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, GpuRequestSpec};
+        use openshell_core::proto::compute::v1::{
+            DriverGpuResourceRequirement, DriverSandboxResourceRequirements, DriverSandboxSpec,
+        };
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: Some(GpuRequestSpec {
-                device_id: vec!["nvidia.com/gpu=0".to_string()],
-                count: None,
+            resource_requirements: Some(DriverSandboxResourceRequirements {
+                gpu: Some(DriverGpuResourceRequirement {
+                    device_ids: vec!["nvidia.com/gpu=0".to_string()],
+                    count: None,
+                }),
             }),
             ..Default::default()
         });

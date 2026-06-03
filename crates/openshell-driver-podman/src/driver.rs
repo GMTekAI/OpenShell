@@ -10,7 +10,9 @@ use crate::watcher::{
     self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
 };
 use openshell_core::ComputeDriverError;
-use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse, GpuRequestSpec};
+use openshell_core::proto::compute::v1::{
+    DriverGpuResourceRequirement, DriverSandbox, GetCapabilitiesResponse,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -280,11 +282,13 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let gpu = sandbox.spec.as_ref().and_then(|s| s.gpu.as_ref());
+        let gpu = sandbox.spec.as_ref().and_then(driver_gpu_requirement);
         Self::validate_gpu_request(gpu)
     }
 
-    fn validate_gpu_request(gpu: Option<&GpuRequestSpec>) -> Result<(), ComputeDriverError> {
+    fn validate_gpu_request(
+        gpu: Option<&DriverGpuResourceRequirement>,
+    ) -> Result<(), ComputeDriverError> {
         if gpu.is_some_and(|gpu| gpu.count.is_some()) {
             return Err(ComputeDriverError::Precondition(
                 "podman compute driver does not support GPU count requests".to_string(),
@@ -578,6 +582,14 @@ impl PodmanComputeDriver {
     }
 }
 
+fn driver_gpu_requirement(
+    spec: &openshell_core::proto::compute::v1::DriverSandboxSpec,
+) -> Option<&DriverGpuResourceRequirement> {
+    spec.resource_requirements
+        .as_ref()
+        .and_then(|requirements| requirements.gpu.as_ref())
+}
+
 #[cfg(test)]
 impl PodmanComputeDriver {
     pub(crate) fn for_tests(config: PodmanComputeConfig) -> Self {
@@ -675,8 +687,8 @@ mod tests {
 
     #[test]
     fn validate_gpu_request_rejects_count() {
-        let err = PodmanComputeDriver::validate_gpu_request(Some(&GpuRequestSpec {
-            device_id: vec![],
+        let err = PodmanComputeDriver::validate_gpu_request(Some(&DriverGpuResourceRequirement {
+            device_ids: vec![],
             count: Some(2),
         }))
         .expect_err("GPU count should be rejected");

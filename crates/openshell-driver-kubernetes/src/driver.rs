@@ -22,11 +22,12 @@ use openshell_core::progress::{
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
-    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
-    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, GpuRequestSpec, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
+    DriverCondition as SandboxCondition, DriverGpuResourceRequirement,
+    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
+    DriverSandboxSpec as SandboxSpec, DriverSandboxStatus as SandboxStatus,
+    DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent,
+    watch_sandboxes_event,
 };
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -79,8 +80,14 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const DEFAULT_GPU_COUNT: u32 = 1;
 
-fn gpu_has_explicit_device_ids(gpu: Option<&GpuRequestSpec>) -> bool {
-    gpu.is_some_and(|gpu| !gpu.device_id.is_empty())
+fn driver_gpu_requirement(spec: &SandboxSpec) -> Option<&DriverGpuResourceRequirement> {
+    spec.resource_requirements
+        .as_ref()
+        .and_then(|requirements| requirements.gpu.as_ref())
+}
+
+fn gpu_has_explicit_device_ids(gpu: Option<&DriverGpuResourceRequirement>) -> bool {
+    gpu.is_some_and(|gpu| !gpu.device_ids.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -207,13 +214,13 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
-        let gpu = sandbox.spec.as_ref().and_then(|spec| spec.gpu.as_ref());
+        let gpu = sandbox.spec.as_ref().and_then(driver_gpu_requirement);
         self.validate_gpu_request(gpu).await
     }
 
     async fn validate_gpu_request(
         &self,
-        gpu: Option<&GpuRequestSpec>,
+        gpu: Option<&DriverGpuResourceRequirement>,
     ) -> Result<(), tonic::Status> {
         if gpu_has_explicit_device_ids(gpu) {
             return Err(tonic::Status::invalid_argument(
@@ -312,7 +319,7 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
-        if let Some(gpu) = sandbox.spec.as_ref().and_then(|spec| spec.gpu.as_ref())
+        if let Some(gpu) = sandbox.spec.as_ref().and_then(driver_gpu_requirement)
             && gpu_has_explicit_device_ids(Some(gpu))
         {
             return Err(KubernetesDriverError::Precondition(
@@ -1128,7 +1135,7 @@ fn sandbox_to_k8s_spec(
                 "podTemplate".to_string(),
                 sandbox_template_to_k8s(
                     template,
-                    spec.gpu.as_ref(),
+                    driver_gpu_requirement(spec),
                     &pod_env,
                     inject_workspace,
                     params,
@@ -1164,7 +1171,7 @@ fn sandbox_to_k8s_spec(
             "podTemplate".to_string(),
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
-                spec.and_then(|s| s.gpu.as_ref()),
+                spec.and_then(driver_gpu_requirement),
                 &pod_env,
                 inject_workspace,
                 params,
@@ -1179,7 +1186,7 @@ fn sandbox_to_k8s_spec(
 
 fn sandbox_template_to_k8s(
     template: &SandboxTemplate,
-    gpu: Option<&GpuRequestSpec>,
+    gpu: Option<&DriverGpuResourceRequirement>,
     spec_environment: &std::collections::HashMap<String, String>,
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
@@ -1416,7 +1423,7 @@ fn image_pull_secret_refs(secrets: &[String]) -> Vec<serde_json::Value> {
 
 fn container_resources(
     template: &SandboxTemplate,
-    gpu: Option<&GpuRequestSpec>,
+    gpu: Option<&DriverGpuResourceRequirement>,
 ) -> Option<serde_json::Value> {
     // Start from the raw resources passthrough in platform_config (preserves
     // custom resource types like GPU limits that users set via the public API
@@ -1716,9 +1723,9 @@ mod tests {
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
-    fn gpu_request(count: Option<u32>) -> GpuRequestSpec {
-        GpuRequestSpec {
-            device_id: vec![],
+    fn gpu_request(count: Option<u32>) -> DriverGpuResourceRequirement {
+        DriverGpuResourceRequirement {
+            device_ids: vec![],
             count,
         }
     }
@@ -2072,17 +2079,19 @@ mod tests {
 
     #[test]
     fn gpu_has_explicit_device_ids_only_when_ids_are_present() {
-        use openshell_core::proto::compute::v1::GpuRequestSpec;
-
         assert!(!gpu_has_explicit_device_ids(None));
-        assert!(!gpu_has_explicit_device_ids(Some(&GpuRequestSpec {
-            device_id: vec![],
-            count: None,
-        })));
-        assert!(gpu_has_explicit_device_ids(Some(&GpuRequestSpec {
-            device_id: vec!["nvidia.com/gpu=0".to_string()],
-            count: None,
-        })));
+        assert!(!gpu_has_explicit_device_ids(Some(
+            &DriverGpuResourceRequirement {
+                device_ids: vec![],
+                count: None,
+            }
+        )));
+        assert!(gpu_has_explicit_device_ids(Some(
+            &DriverGpuResourceRequirement {
+                device_ids: vec!["nvidia.com/gpu=0".to_string()],
+                count: None,
+            }
+        )));
     }
 
     #[test]

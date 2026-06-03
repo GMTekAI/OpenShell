@@ -925,10 +925,11 @@ async fn sandbox_create_sends_gpu_count_request() {
     let gpu = requests[0]
         .spec
         .as_ref()
-        .and_then(|spec| spec.gpu.as_ref())
+        .and_then(|spec| spec.resource_requirements.as_ref())
+        .and_then(|requirements| requirements.gpu.as_ref())
         .expect("GPU request should be sent");
 
-    assert!(gpu.device_id.is_empty());
+    assert!(gpu.device_ids.is_empty());
     assert_eq!(gpu.count, Some(2));
 }
 
