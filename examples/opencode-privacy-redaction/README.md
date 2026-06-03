@@ -20,7 +20,7 @@ The "demo magic": the proxy reads an OpenShell-style policy file (`policies/cont
 |------|------|
 | `proxy/` | The redaction proxy + `call_inference` MCP server (a `uv` project). |
 | `proxy/Makefile` | Start/stop the proxy and MCP; flip the demo policy. |
-| `policies/opencode-policy.yaml` | Sandbox policy you give to OpenShell at create time. |
+| `policies/opencode-policy.yaml` | Sandbox policy you give to OpenShell at create time (includes weather egress for the demo task). |
 | `policies/content-policy.yaml` | Copy of the policy **plus** the `content_policy` block the proxy reads. |
 | `sandbox/opencode.json` | opencode config: `inference.local` provider + `local_model` MCP. |
 | `sandbox/opencode-provision.sh` | Writes the config + workspace inside the sandbox. |

@@ -57,6 +57,22 @@ network_policies:
     binaries:
       - { path: "**" }
 
+  # Weather data sources for the demo task ("check the weather").
+  weather_forecast:
+    name: weather_forecast
+    endpoints:
+      - { host: api.met.no, port: 443 }
+      - { host: api.open-meteo.com, port: 443 }
+      - { host: api.weather.gov, port: 443 }
+      - { host: aviationweather.gov, port: 443 }
+      - { host: dd.weather.gc.ca, port: 443 }
+      - { host: tgftp.nws.noaa.gov, port: 443 }
+      - { host: weather.gc.ca, port: 443 }
+      - { host: wttr.in, port: 443 }
+      - { host: www.timeanddate.com, port: 443 }
+    binaries:
+      - { path: /usr/lib/node_modules/opencode-ai/bin/.opencode }
+
 # --- demo magic: interpreted by the redaction proxy, ignored by OpenShell ---
 content_policy:
   content_type:
