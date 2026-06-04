@@ -118,6 +118,21 @@ Still open:
 - Fill the pipeline-placement appendix from the real supervisor relay path.
 - Expand the request-response-contract and policy-integration appendices beyond the README sketches.
 - Write the failure-and-audit appendix (OCSF field mappings).
+- Decide and document the "research preview" framing (see below).
+
+## Limits, failure modes, and limitations (to cover)
+
+These need a home in the RFC - likely a "Limits and limitations" section plus content in Risks and the failure-and-audit appendix.
+
+- **Limits and timeouts.** Define how request size limits and call timeouts are enforced and by whom. Core tension to capture: rejecting an over-limit request can break sandbox workloads (e.g. inference calls whose context grows each turn until it exceeds the cap), but allowing it through unprocessed means content that should have been redacted egresses anyway. Decide the default and whether it is policy-configurable (ties into the `on_error` / over-cap skip behavior). Reconcile with the proxy's current 256 KiB buffering cap and the capability `max_body_bytes`.
+- **Failure modes / rate limiting.** The middleware service is responsible for its own rate limiting; OpenShell does not rate limit middleware calls. Document this, plus behavior when the middleware is overloaded or unavailable (fail-closed by default).
+- **Content encoding (gzip).** Define how gzip/compressed HTTP request bodies are handled: does OpenShell decode before the hook, or does the middleware receive the encoded bytes and decode itself? Pick one and state it (also affects size-limit accounting: encoded vs decoded size).
+- **Chunked / slow-drip uploads.** How chunked transfer-encoding and slow "drip" uploads interact with buffering and timeouts. Note this is already a constraint for credential injection, which buffers the request today - document the existing behavior and whether middleware changes it.
+- **Opaque payloads (limitation).** Payloads that are zipped, otherwise encoded, or encrypted cannot be introspected. State explicitly that middleware can only act on content it can parse; opaque bodies cannot be inspected, so policy must decide whether such traffic is allowed through or denied.
+
+## Framing
+
+- Consider presenting this initial state of middleware as a **research preview**: set expectations that the contract, scope, and stability are provisional and may change. Decide where to say it (Summary and/or Current Status) and what it implies for support and compatibility guarantees.
 
 ## Potential ideas to explore
 
