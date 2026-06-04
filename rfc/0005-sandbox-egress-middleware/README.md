@@ -169,13 +169,13 @@ message RequestContext {
   google.protobuf.Struct config = 5;    // service-specific, from policy
 }
 
-// Verdict plus optional replacement body.
+// Outcome plus optional replacement body.
 message ProcessResponse {
-  Verdict verdict = 1;
+  Outcome outcome = 1;
   bytes body = 2;                       // replacement content when transformed
 }
 
-message Verdict {
+message Outcome {
   Decision decision = 1;                // ALLOW or DENY
   string deny_reason = 2;               // safe, machine-readable
   map<string, string> set_headers = 3;  // subject to an OpenShell allow-list

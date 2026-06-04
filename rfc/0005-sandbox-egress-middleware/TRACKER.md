@@ -73,7 +73,7 @@ Prefer Mermaid diagrams in the main RFC when they clarify the core proposal. Mov
 - [partial] Supervisor configuration delivery: README says it reuses the existing authenticated config path. Exact delivery shape still open - extend `GetSandboxConfig` / `SandboxPolicy` or add a `GetInferenceBundle`-style bundle RPC (see open question below).
 - [done] Middleware capability discovery: `GetCapabilities` + simplified proto sketch in the contract section.
 - [partial] Capability response fields: sketch covers name, version, hooks, max body, timeout, metadata namespaces. Full field list deferred to the request-response-contract appendix.
-- [done] Middleware inspection RPC: `ProcessRequestBeforeUpstream` request/response sketched (bidi stream, single-message v1, `{context, body}` / `{verdict, body}`).
+- [done] Middleware inspection RPC: `ProcessRequestBeforeUpstream` request/response sketched (bidi stream, single-message v1, `{context, body}` / `{outcome, body}`).
 - [done] Policy shape + middleware section: top-level `network_middlewares` list referenced by `middleware: [...]` on network policies; chains; `on_error`.
 - [done] Failure behavior: `on_error` per middleware, fail-closed by default; capability validation fails the config load.
 - [done] Audit/logging: OCSF categories (HttpActivity, DetectionFinding, ConfigStateChange) + safety rules. Field mappings deferred to failure-and-audit appendix.
@@ -90,7 +90,7 @@ Prefer Mermaid diagrams in the main RFC when they clarify the core proposal. Mov
 - Built-in middleware ships in the supervisor, served in-process over the same gRPC contract; reserved `openshell-` name prefix.
 - Multiple middleware run as an ordered chain (chains are in v1; supersedes thought-01's single-middleware decision). Order = policy `middleware: [...]` list; globally-included middleware run before, in `network_middlewares` order; each runs at most once.
 - Top-level policy section is `network_middlewares` (chosen over `request_middlewares` for the umbrella/`network_policies` pairing).
-- Hot-path RPC is declared as a bidi stream but exchanges a single message each way in v1 (cardinality cannot change compatibly; streaming added later). Messages stay flat with nested `RequestContext`/`Verdict` (no phase `oneof` - that is a now-or-never choice we declined).
+- Hot-path RPC is declared as a bidi stream but exchanges a single message each way in v1 (cardinality cannot change compatibly; streaming added later). Messages stay flat with nested `RequestContext`/`Outcome` (no phase `oneof` - that is a now-or-never choice we declined).
 - Capability validation runs at gateway config load, on policy reference, and at supervisor startup; failure fails the load.
 - Findings become structured, namespaced metadata for a future model router; router out of scope (#1734).
 - Model routing tracked separately: https://github.com/NVIDIA/OpenShell/issues/1734.
