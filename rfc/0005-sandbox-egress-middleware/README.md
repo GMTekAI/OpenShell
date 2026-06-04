@@ -217,7 +217,7 @@ Supervisors receive the effective configuration over the same authenticated conf
 
 Middleware registration lives in gateway configuration, which is not hot-reloaded ([RFC 0003](../0003-gateway-configuration/README.md) lists this as a non-goal): changing the registered set requires restarting the gateway. On restart, supervisors re-sync the effective configuration over their existing connection, so running sandboxes pick up a newly added middleware rather than only newly created sandboxes seeing it - there is no per-sandbox snapshot of the registered set.
 
-Removal is the hazardous direction. Because a policy references a middleware by name and validation fails the load on a dangling reference, the gateway rejects a configuration that drops a middleware an active policy still references, rather than letting those sandboxes silently begin to fail closed. An operator therefore removes a middleware by first removing the policy references, then the registration. A registered middleware that instead becomes unavailable at runtime (its process is down, or the network is partitioned) is a runtime failure governed by `on_error` (fail-closed by default), not a registration change.
+Removing a middleware that an active policy still references will cause those sandboxes to fail: requests that require the removed middleware can no longer be processed, so `on_error` (fail-closed by default) denies them. For now, the operator is responsible for removing the policy references before removing the registration. A registered middleware that becomes unavailable at runtime (its process is down, or the network is partitioned) is handled the same way, by `on_error`.
 
 ### Policy integration
 
