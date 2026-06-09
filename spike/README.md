@@ -1,6 +1,17 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # Node Enforcer Topology Findings
 
 Date: 2026-05-29
+
+## Diagrams
+
+- [OpenShell isolation architecture](openshell-isolation-diagram.html)
+- [Kubernetes isolation tradeoffs](kubernetes-isolation-tradeoffs-diagram.html)
+- [Kubernetes node-enforcer option](kubernetes-node-enforcer-options-diagram.html)
 
 ## Summary
 
@@ -83,7 +94,8 @@ The current prototype enforcement flow is registration-driven:
 
 3. The node enforcer DaemonSet runs the same supervisor binary with
    `supervisor_role = "enforcer"`. In that role it does not start an agent
-   supervisor; it binds `0.0.0.0:17671` and waits for workload registrations.
+   supervisor; it binds the configured host-network listener and waits for
+   workload registrations.
 
 4. The workload supervisor starts normally, loads policy, computes the effective
    network enforcement mode, and registers with the node enforcer before
@@ -152,10 +164,9 @@ cluster because enforcement is node-local and pod-local, not gateway-local:
 
 The important deployment constraint is that the node enforcer should be treated
 as shared node infrastructure. A node can only have one process binding the
-default host-network listener `0.0.0.0:17671`. If multiple gateway releases each
-enable their own node-enforcer DaemonSet on the same nodes with the same listen
-address, they will compete for the same port and duplicate the privileged
-component.
+same host-network listener. If multiple gateway releases each enable their own
+node-enforcer DaemonSet on the same nodes with the same listen address, they
+will compete for the same port and duplicate the privileged component.
 
 For a shared cluster, the expected shape is one node-enforcer DaemonSet per
 node pool or cluster security boundary, with all participating gateways pointing
@@ -172,58 +183,44 @@ registering workload is allowed to ask for enforcement on that pod.
 
 ## Validation
 
-Validated against the development Kubernetes cluster using the normal OpenShell
-gateway path. GKE was used as a real managed-cluster validation target, but it
-should not be part of the implementation criteria.
+Validated against the local Kubernetes development cluster using the normal
+OpenShell gateway path and the node-enforcer Helm overlay.
 
-The unchanged Kubernetes e2e test passed:
-
-```shell
-OPENSHELL_GATEWAY_ENDPOINT=http://34.171.165.42 \
-  cargo test --manifest-path e2e/rust/Cargo.toml \
-  --features e2e-kubernetes \
-  --test bypass_detection \
-  -- --nocapture
-```
-
-Result:
-
-```text
-test bypass_attempt_is_rejected_fast ... ok
-1 passed; 0 failed
-```
-
-The full existing Rust e2e suite also passed unchanged against the Kubernetes
-gateway once the local e2e invocation used a named temporary gateway config:
+The Kubernetes smoke path passed with the node-enforcer overlay:
 
 ```shell
-XDG_CONFIG_HOME=/private/tmp/openshell-gke/e2e-config \
-OPENSHELL_GATEWAY=gke-e2e \
-OPENSHELL_E2E_DRIVER=kubernetes \
-  cargo test --manifest-path e2e/rust/Cargo.toml \
-  --features e2e \
-  --no-fail-fast \
-  -- --nocapture
+OPENSHELL_E2E_KUBE_CONTEXT=k3d-openshell-dev-tmutch \
+OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-node-enforcer.yaml \
+OPENSHELL_E2E_KUBE_BUILD_IMAGES=1 \
+OPENSHELL_E2E_KUBE_TEST=smoke \
+  e2e/rust/e2e-kubernetes.sh
 ```
 
-Result:
+The bypass-detection path also passed with the same overlay:
 
-```text
-all e2e test targets passed
+```shell
+OPENSHELL_E2E_KUBE_CONTEXT=k3d-openshell-dev-tmutch \
+OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-node-enforcer.yaml \
+OPENSHELL_E2E_KUBE_BUILD_IMAGES=1 \
+OPENSHELL_E2E_KUBE_TEST=bypass_detection \
+  e2e/rust/e2e-kubernetes.sh
 ```
 
-Important test harness note: the e2e settings test expects the local CLI to be
-built with `openshell-core/dev-settings`, which the normal e2e scripts already
-do. Direct ad hoc cargo invocations should rebuild `openshell-cli` with that
-feature before running the full suite.
-
-Node-enforcer logs showed the expected action:
+Manual validation also created a sandbox through the gateway and confirmed the
+node enforcer acted on the sandbox network namespace:
 
 ```text
 Observed sandbox workload registration
 Reconciling sandbox network enforcement
-Installing sandbox network egress enforcement for pod 10.40.1.35
-Sandbox network egress enforcement installed for pod 10.40.1.35 in /proc/309096/ns/net
+Installing sandbox network egress enforcement for registered pod
+Sandbox network egress enforcement installed for registered pod
+```
+
+The manual sandbox check then attempted raw direct TCP from the sandbox user
+path and observed a fast rejection instead of a hanging bypass attempt.
+
+```text
+direct-connect-exit-code 111
 ```
 
 ## Key Debug Finding
@@ -239,51 +236,12 @@ The fix was to require that the pod IP is present as a local address in the
 target namespace:
 
 ```text
-10.40.1.33
-/32 host LOCAL
+<pod-ip>
+<host-local-route-marker>
 ```
 
 That distinction selected the sandbox pod namespace instead of the host
 namespace and made the unchanged e2e test pass.
-
-## Envoy Gateway Timeout Finding
-
-The managed-cluster validation exposed a second, unrelated deployment issue:
-Envoy Gateway was terminating long-lived gRPC streams after about 15 seconds.
-The symptom was:
-
-```text
-h2 protocol error: error reading a body from connection
-```
-
-This affected the existing `WatchSandbox`, `ForwardTcp`, and supervisor
-`RelayStream` paths used by `sandbox create -- <cmd>`, upload/create, sync, and
-TTY lifecycle tests. The sandbox pods themselves were running and the node
-enforcer had installed rules correctly; the failure was at the external gateway
-proxy layer.
-
-The fix belongs to the deployment that installs Envoy Gateway, not to the
-OpenShell product Helm chart. Envoy Gateway deployments can attach a
-`BackendTrafficPolicy` to the OpenShell `GRPCRoute`:
-
-```yaml
-apiVersion: gateway.envoyproxy.io/v1alpha1
-kind: BackendTrafficPolicy
-metadata:
-  name: openshell-grpc-streams
-spec:
-  targetRefs:
-    - group: gateway.networking.k8s.io
-      kind: GRPCRoute
-      name: openshell
-  timeout:
-    http:
-      requestTimeout: 0s
-      maxStreamDuration: 0s
-```
-
-After that policy was applied, Envoy reported it as accepted and the previous
-15-second failures passed without test changes.
 
 ## Product Finding
 
@@ -297,9 +255,6 @@ That is likely the right direction if the goal is:
 - OpenShell keeps dynamic network proxy enforcement.
 - The supervisor remains responsible for the agent lifecycle.
 - Non-Kubernetes deployments can keep the existing combined supervisor mode.
-- External ingress and Gateway API controllers are deployment concerns. If they
-  impose request or stream duration limits, the deployment must configure them
-  to preserve OpenShell's long-lived gRPC streams.
 
 It is not a claim that the system has no privileged code. On Linux, dynamic
 network namespace enforcement needs some trusted component with elevated
@@ -353,13 +308,9 @@ Known risks:
   one enforcer DaemonSet per release, which is not safe to enable repeatedly on
   the same nodes without coordination.
 - The current rules are coarse: UID 0 is allowed, non-root TCP/UDP is rejected.
-- IPv6 namespace lookup exists conceptually but has not been validated in the
-  managed-cluster path.
+- IPv6 namespace lookup exists conceptually but has not been validated.
 - Observability is useful but should become structured enough for operators to
   prove what pod/netns/rules were acted on.
-- Edge proxies can break otherwise healthy sandboxes if they impose short
-  request or stream duration timeouts on gRPC. This is deployment-specific and
-  should be validated wherever OpenShell is exposed through a proxy.
 
 ## Hardening Plan
 
@@ -414,8 +365,6 @@ The branch added configuration and code paths for:
 - Helm `server.sandboxImagePullPolicy`
 - Kubernetes driver injection of node and pod IP environment variables
 - Supervisor image packaging with `nftables`
-- Deployment-owned Envoy Gateway `BackendTrafficPolicy` for long-lived
-  OpenShell gRPC streams.
 
 The development cluster currently uses:
 
@@ -423,8 +372,6 @@ The development cluster currently uses:
 - `server.networkEnforcementMode: external-enforcer`
 - `server.sandboxImagePullPolicy: IfNotPresent`
 - `nodeEnforcer.enabled: true`
-- An Envoy Gateway `BackendTrafficPolicy` with `requestTimeout = 0s` and
-  `maxStreamDuration = 0s`.
 
 ## Recommendation
 
@@ -436,8 +383,3 @@ Do not present it as removing privilege entirely. Present it as moving privilege
 network enforcement into a narrow, operator-controlled component that can be
 authenticated, audited, reconciled, and hardened independently from untrusted
 agent workloads.
-
-Keep Envoy Gateway and other ingress-controller tuning out of the product chart
-unless OpenShell intentionally takes ownership of that controller. The product
-requirement is that long-lived gRPC streams must be supported; the deployment
-implementation should provide the controller-specific policy.
