@@ -9,6 +9,7 @@
 
 use std::{collections::BTreeSet, str::FromStr};
 
+use crate::credentials::CredentialSet;
 use crate::policy::{Endpoint, L7Rule, NetworkPolicyRule, PolicyModel};
 use z3::ast::{Bool, Int, Regexp, String as Z3String};
 use z3::{Context, SatResult, Solver};
@@ -16,6 +17,20 @@ use z3::{Context, SatResult, Solver};
 const READ_ONLY_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS"];
 const READ_WRITE_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"];
 const ALL_METHODS: &[&str] = &["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
+const WEBSOCKET_METHODS: &[&str] = &["GET", "WEBSOCKET_TEXT"];
+const ACTION_METHODS: &[&str] = &[
+    "GET",
+    "HEAD",
+    "OPTIONS",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE",
+    "WEBSOCKET_TEXT",
+];
+const LAYER_L4: &str = "l4";
+const LAYER_REST: &str = "rest";
+const LAYER_WEBSOCKET: &str = "websocket";
 
 /// Result of checking whether a candidate policy is inside a maximum policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +55,8 @@ pub struct PolicyCounterexample {
     pub binary: String,
     pub host: String,
     pub port: u16,
+    /// Modeled action layer (`l4`, `rest`, or `websocket`) retained under the
+    /// policy protocol field name for this spike.
     pub protocol: String,
     pub method: String,
     pub path: String,
@@ -58,7 +75,7 @@ pub struct NarrownessBudget {
 }
 
 impl NarrownessBudget {
-    /// Conservative spike budget: one small exact grant, no recursive globs.
+    /// Conservative spike budget: one small exact grant.
     pub const fn one_exact_grant() -> Self {
         Self {
             max_delta_grants: 1,
@@ -90,6 +107,23 @@ pub enum NarrownessCheck {
     },
 }
 
+/// Result of checking for credentialed authority over uninspected L4 egress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialedL4Check {
+    /// No modeled L4 action reaches a credential target.
+    NoUninspectedCredentialedL4,
+    /// The policy allows at least one uninspected L4 action to a credential target.
+    HasUninspectedCredentialedL4 {
+        /// Representative action allowed by the policy.
+        counterexample: PolicyCounterexample,
+    },
+    /// The policy uses a surface the first credentialed-L4 slice does not model.
+    Unsupported {
+        /// Human-readable reason. The check must fail closed at callers.
+        reason: String,
+    },
+}
+
 /// Summary of the modeled scope increase from current policy to candidate policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NarrownessSummary {
@@ -104,6 +138,8 @@ pub struct ScopeDelta {
     pub binary: String,
     pub host: String,
     pub port: u16,
+    /// Modeled action layer (`l4`, `rest`, or `websocket`) retained under the
+    /// policy protocol field name for this spike.
     pub protocol: String,
     pub method: String,
     pub path: String,
@@ -122,6 +158,7 @@ pub enum ScopeIncreaseReason {
     RecursivePathGlob,
     RecursiveHostGlob,
     RecursiveBinaryGlob,
+    L7ToL4Broadening,
 }
 
 impl ScopeIncreaseReason {
@@ -131,6 +168,7 @@ impl ScopeIncreaseReason {
             Self::PathWildcard => 2,
             Self::HostWildcard | Self::BinaryWildcard => 3,
             Self::RecursivePathGlob | Self::RecursiveHostGlob | Self::RecursiveBinaryGlob => 6,
+            Self::L7ToL4Broadening => 8,
         }
     }
 
@@ -146,7 +184,7 @@ struct SymbolicAction {
     binary: Z3String,
     host: Z3String,
     port: Int,
-    protocol: Z3String,
+    layer: Z3String,
     method: Z3String,
     path: Z3String,
 }
@@ -157,7 +195,7 @@ struct ModeledGrant {
     binary: String,
     host: String,
     port: u16,
-    protocol: String,
+    layer: String,
     method_label: String,
     methods: Vec<String>,
     path: String,
@@ -204,13 +242,13 @@ pub fn check_narrowness(
         match find_z3_grant_delta(current, &grant) {
             Z3GrantDelta::NoIncrease => {}
             Z3GrantDelta::Increases { counterexample } => {
-                let (score, reasons) = score_grant(&grant);
+                let (score, reasons) = score_grant(current, &grant);
                 delta_grants.push(ScopeDelta {
                     rule_name: grant.rule_name,
                     binary: grant.binary,
                     host: grant.host,
                     port: grant.port,
-                    protocol: grant.protocol,
+                    protocol: grant.layer,
                     method: grant.method_label,
                     path: grant.path,
                     score,
@@ -245,6 +283,52 @@ pub fn check_narrowness(
         NarrownessCheck::ExceedsBudget { summary }
     } else {
         NarrownessCheck::WithinBudget { summary }
+    }
+}
+
+/// Check whether a policy grants uninspected L4 reach to any host with an
+/// injected credential in scope.
+pub fn check_uninspected_credentialed_l4(
+    policy: &PolicyModel,
+    credentials: &CredentialSet,
+) -> CredentialedL4Check {
+    if let Some(reason) = unsupported_reason("policy", policy) {
+        return CredentialedL4Check::Unsupported { reason };
+    }
+
+    let solver = Solver::new();
+    let action = symbolic_action("credentialed_l4_action");
+    assert_action_domain(&solver, &action);
+    solver.assert(Bool::and(&[
+        policy_allows(policy, &action),
+        action.layer.eq(LAYER_L4),
+        credential_target_matches(credentials, &action),
+    ]));
+
+    match solver.check() {
+        SatResult::Unsat => CredentialedL4Check::NoUninspectedCredentialedL4,
+        SatResult::Unknown => CredentialedL4Check::Unsupported {
+            reason: "Z3 returned unknown while checking uninspected credentialed L4 reach"
+                .to_owned(),
+        },
+        SatResult::Sat => {
+            let Some(model) = solver.get_model() else {
+                return CredentialedL4Check::Unsupported {
+                    reason: "Z3 returned sat without a model for uninspected credentialed L4 reach"
+                        .to_owned(),
+                };
+            };
+            let Some(counterexample) = counterexample_from_model(
+                &model,
+                &action,
+                "policy allows uninspected L4 reach to a credential target",
+            ) else {
+                return CredentialedL4Check::Unsupported {
+                    reason: "Z3 returned sat but the model could not be decoded into an uninspected credentialed L4 counterexample".to_owned(),
+                };
+            };
+            CredentialedL4Check::HasUninspectedCredentialedL4 { counterexample }
+        }
     }
 }
 
@@ -344,7 +428,7 @@ fn symbolic_action(name: &str) -> SymbolicAction {
         binary: Z3String::new_const(format!("{name}_binary")),
         host: Z3String::new_const(format!("{name}_host")),
         port: Int::new_const(format!("{name}_port")),
-        protocol: Z3String::new_const(format!("{name}_protocol")),
+        layer: Z3String::new_const(format!("{name}_layer")),
         method: Z3String::new_const(format!("{name}_method")),
         path: Z3String::new_const(format!("{name}_path")),
     }
@@ -355,8 +439,11 @@ fn assert_action_domain(solver: &Solver, action: &SymbolicAction) {
     solver.assert(action.host.regex_matches(&Regexp::full()));
     solver.assert(Int::from_u64(1).le(&action.port));
     solver.assert(action.port.le(65535));
-    solver.assert(str_eq_any(&action.protocol, &["rest"]));
-    solver.assert(str_eq_any(&action.method, ALL_METHODS));
+    solver.assert(str_eq_any(
+        &action.layer,
+        &[LAYER_L4, LAYER_REST, LAYER_WEBSOCKET],
+    ));
+    solver.assert(str_eq_any(&action.method, ACTION_METHODS));
     solver.assert(
         Z3String::from_str("/")
             .expect("literal")
@@ -401,9 +488,9 @@ fn endpoint_allows(endpoint: &Endpoint, action: &SymbolicAction) -> Bool {
             .regex_matches(&glob_regex(&endpoint.host.to_ascii_lowercase(), ".")),
     ];
 
-    if !normalized_protocol(&endpoint.protocol).is_empty() {
-        constraints.push(action.protocol.eq(normalized_protocol(&endpoint.protocol)));
-        constraints.push(bool_or(effective_rest_allows(endpoint).into_iter().map(
+    if let Some(layer) = endpoint_layer(endpoint) {
+        constraints.push(action.layer.eq(layer));
+        constraints.push(bool_or(effective_l7_allows(endpoint).into_iter().map(
             |(method, path)| {
                 Bool::and(&[
                     action.method.eq(method.as_str()),
@@ -417,16 +504,46 @@ fn endpoint_allows(endpoint: &Endpoint, action: &SymbolicAction) -> Bool {
 }
 
 fn grant_allows(grant: &ModeledGrant, action: &SymbolicAction) -> Bool {
-    Bool::and(&[
+    let mut constraints = vec![
         action.binary.regex_matches(&glob_regex(&grant.binary, "/")),
         action
             .host
             .regex_matches(&glob_regex(&grant.host.to_ascii_lowercase(), ".")),
         action.port.eq(Int::from_u64(u64::from(grant.port))),
-        action.protocol.eq(grant.protocol.as_str()),
-        str_eq_any_owned(&action.method, &grant.methods),
-        action.path.regex_matches(&glob_regex(&grant.path, "/")),
-    ])
+    ];
+
+    if grant.layer == LAYER_L4 {
+        constraints.push(str_eq_any(
+            &action.layer,
+            &[LAYER_L4, LAYER_REST, LAYER_WEBSOCKET],
+        ));
+    } else {
+        constraints.push(action.layer.eq(grant.layer.as_str()));
+        constraints.push(str_eq_any_owned(&action.method, &grant.methods));
+        constraints.push(action.path.regex_matches(&glob_regex(&grant.path, "/")));
+    }
+
+    Bool::and(&constraints)
+}
+
+fn credential_target_matches(credentials: &CredentialSet, action: &SymbolicAction) -> Bool {
+    bool_or(
+        credentials
+            .credentials
+            .iter()
+            .flat_map(|credential| credential.target_hosts.iter())
+            .filter_map(|target| {
+                let normalized = target.trim().trim_end_matches('.');
+                if normalized.is_empty() {
+                    return None;
+                }
+                Some(
+                    action
+                        .host
+                        .regex_matches(&glob_regex(&normalized.to_ascii_lowercase(), ".")),
+                )
+            }),
+    )
 }
 
 fn counterexample_from_model(
@@ -435,13 +552,24 @@ fn counterexample_from_model(
     reason: &str,
 ) -> Option<PolicyCounterexample> {
     let port = model.eval(&action.port, true)?.as_u64()?;
+    let layer = model.eval(&action.layer, true)?.as_string()?;
+    let method = if layer == LAYER_L4 {
+        String::new()
+    } else {
+        model.eval(&action.method, true)?.as_string()?
+    };
+    let path = if layer == LAYER_L4 {
+        String::new()
+    } else {
+        model.eval(&action.path, true)?.as_string()?
+    };
     Some(PolicyCounterexample {
         binary: model.eval(&action.binary, true)?.as_string()?,
         host: model.eval(&action.host, true)?.as_string()?,
         port: u16::try_from(port).ok()?,
-        protocol: model.eval(&action.protocol, true)?.as_string()?,
-        method: model.eval(&action.method, true)?.as_string()?,
-        path: model.eval(&action.path, true)?.as_string()?,
+        protocol: layer,
+        method,
+        path,
         reason: reason.to_owned(),
     })
 }
@@ -532,12 +660,14 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
                     endpoint.tls
                 ));
             }
-            if endpoint.allow_encoded_slash
-                || endpoint.websocket_credential_rewrite
-                || endpoint.request_body_credential_rewrite
-            {
+            if endpoint.allow_encoded_slash {
                 return Some(format!(
                     "{prefix} policy rule '{rule_name}' uses endpoint behavior flags that policy envelope checks do not model yet"
+                ));
+            }
+            if endpoint.request_body_credential_rewrite || endpoint.websocket_credential_rewrite {
+                return Some(format!(
+                    "{prefix} policy rule '{rule_name}' uses credential rewrite flags that policy envelope checks do not model yet"
                 ));
             }
             if !endpoint.persisted_queries.is_empty()
@@ -562,12 +692,10 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
                 ));
             }
             let protocol = normalized_protocol(&endpoint.protocol);
-            if protocol.is_empty() {
-                return Some(format!(
-                    "{prefix} policy rule '{rule_name}' uses L4-only endpoint, which policy envelope checks do not model beyond REST yet"
-                ));
-            }
-            if !protocol.is_empty() && !protocol.eq_ignore_ascii_case("rest") {
+            if !protocol.is_empty()
+                && !protocol.eq_ignore_ascii_case("rest")
+                && !protocol.eq_ignore_ascii_case("websocket")
+            {
                 return Some(format!(
                     "{prefix} policy rule '{rule_name}' uses protocol '{}', which policy envelope checks do not model yet",
                     endpoint.protocol
@@ -585,9 +713,9 @@ fn unsupported_reason(prefix: &str, policy: &PolicyModel) -> Option<String> {
                         "{prefix} policy rule '{rule_name}' uses L7 query, SQL, or GraphQL allow controls, which policy envelope checks do not model yet"
                     ));
                 }
-                if !rule.method.is_empty() && !modeled_rest_method(&rule.method) {
+                if !rule.method.is_empty() && !modeled_l7_method(protocol, &rule.method) {
                     return Some(format!(
-                        "{prefix} policy rule '{rule_name}' uses REST method '{}', which policy envelope checks do not model yet",
+                        "{prefix} policy rule '{rule_name}' uses method '{}', which policy envelope checks do not model yet",
                         rule.method
                     ));
                 }
@@ -621,7 +749,7 @@ fn modeled_grants(policy: &PolicyModel) -> Vec<ModeledGrant> {
                             binary: binary.path.clone(),
                             host: endpoint.host.clone(),
                             port,
-                            protocol: "rest".to_owned(),
+                            layer: endpoint_layer(endpoint).unwrap_or(LAYER_L4).to_owned(),
                             method_label,
                             methods,
                             path,
@@ -638,12 +766,16 @@ fn grant_method_groups(endpoint: &Endpoint) -> Vec<(String, Vec<String>, String)
     if normalized_protocol(&endpoint.protocol).is_empty() {
         return vec![(
             "*".to_owned(),
-            ALL_METHODS
+            ACTION_METHODS
                 .iter()
                 .map(|method| (*method).to_owned())
                 .collect(),
             "**".to_owned(),
         )];
+    }
+
+    if normalized_protocol(&endpoint.protocol).eq_ignore_ascii_case("websocket") {
+        return websocket_grant_method_groups(endpoint);
     }
 
     match endpoint.access.as_str() {
@@ -708,15 +840,21 @@ fn grant_method_groups(endpoint: &Endpoint) -> Vec<(String, Vec<String>, String)
     }
 }
 
-fn score_grant(grant: &ModeledGrant) -> (u32, Vec<ScopeIncreaseReason>) {
+fn score_grant(current: &PolicyModel, grant: &ModeledGrant) -> (u32, Vec<ScopeIncreaseReason>) {
     let mut reasons = vec![ScopeIncreaseReason::NewGrant];
 
-    add_glob_reasons(
-        &mut reasons,
-        &grant.path,
-        ScopeIncreaseReason::PathWildcard,
-        ScopeIncreaseReason::RecursivePathGlob,
-    );
+    if grant.layer == LAYER_L4 {
+        if grant_broadens_inspected_l7_to_l4(current, grant) {
+            reasons.push(ScopeIncreaseReason::L7ToL4Broadening);
+        }
+    } else {
+        add_glob_reasons(
+            &mut reasons,
+            &grant.path,
+            ScopeIncreaseReason::PathWildcard,
+            ScopeIncreaseReason::RecursivePathGlob,
+        );
+    }
     add_glob_reasons(
         &mut reasons,
         &grant.host,
@@ -732,6 +870,23 @@ fn score_grant(grant: &ModeledGrant) -> (u32, Vec<ScopeIncreaseReason>) {
 
     let score = reasons.iter().map(|reason| reason.score()).sum();
     (score, reasons)
+}
+
+fn grant_broadens_inspected_l7_to_l4(current: &PolicyModel, grant: &ModeledGrant) -> bool {
+    if grant.layer != LAYER_L4 {
+        return false;
+    }
+
+    let solver = Solver::new();
+    let action = symbolic_action("l7_to_l4_overlap");
+    assert_action_domain(&solver, &action);
+    solver.assert(Bool::and(&[
+        grant_allows(grant, &action),
+        policy_allows(current, &action),
+        !action.layer.eq(LAYER_L4),
+    ]));
+
+    matches!(solver.check(), SatResult::Sat)
 }
 
 fn add_glob_reasons(
@@ -755,11 +910,68 @@ fn l7_rule_is_unsupported(rule: &L7Rule) -> bool {
         || !rule.fields.is_empty()
 }
 
-fn effective_rest_allows(endpoint: &Endpoint) -> Vec<(String, String)> {
+fn websocket_grant_method_groups(endpoint: &Endpoint) -> Vec<(String, Vec<String>, String)> {
+    match endpoint.access.as_str() {
+        "read-only" => vec![(
+            "read-only".to_owned(),
+            vec!["GET".to_owned()],
+            "**".to_owned(),
+        )],
+        "read-write" | "full" => vec![(
+            endpoint.access.clone(),
+            WEBSOCKET_METHODS
+                .iter()
+                .map(|method| (*method).to_owned())
+                .collect(),
+            "**".to_owned(),
+        )],
+        _ if endpoint.rules.is_empty() => Vec::new(),
+        _ => endpoint
+            .rules
+            .iter()
+            .filter_map(|rule| {
+                if rule.method.is_empty() {
+                    return None;
+                }
+                let path = if rule.path.is_empty() {
+                    "**".to_owned()
+                } else {
+                    rule.path.clone()
+                };
+                let method = rule.method.to_ascii_uppercase();
+                if method == "*" {
+                    Some((
+                        "*".to_owned(),
+                        WEBSOCKET_METHODS
+                            .iter()
+                            .map(|method| (*method).to_owned())
+                            .collect(),
+                        path,
+                    ))
+                } else {
+                    Some((method.clone(), vec![method], path))
+                }
+            })
+            .collect(),
+    }
+}
+
+fn effective_l7_allows(endpoint: &Endpoint) -> Vec<(String, String)> {
     if normalized_protocol(&endpoint.protocol).is_empty() {
-        return ALL_METHODS
+        return ACTION_METHODS
             .iter()
             .map(|method| ((*method).to_owned(), "**".to_owned()))
+            .collect();
+    }
+
+    if normalized_protocol(&endpoint.protocol).eq_ignore_ascii_case("websocket") {
+        return websocket_grant_method_groups(endpoint)
+            .into_iter()
+            .flat_map(|(_, methods, path)| {
+                methods
+                    .into_iter()
+                    .map(move |method| (method, path.clone()))
+            })
             .collect();
     }
 
@@ -799,8 +1011,15 @@ fn methods_with_path(methods: &[&str], path: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn modeled_rest_method(method: &str) -> bool {
-    method == "*" || ALL_METHODS.contains(&method.to_ascii_uppercase().as_str())
+fn modeled_l7_method(protocol: &str, method: &str) -> bool {
+    if method == "*" {
+        return true;
+    }
+    let method = method.to_ascii_uppercase();
+    if protocol.eq_ignore_ascii_case("websocket") {
+        return WEBSOCKET_METHODS.contains(&method.as_str());
+    }
+    ALL_METHODS.contains(&method.as_str())
 }
 
 fn unsupported_glob_pattern(pattern: &str) -> bool {
@@ -811,6 +1030,17 @@ fn unsupported_glob_pattern(pattern: &str) -> bool {
 
 fn normalized_protocol(protocol: &str) -> &str {
     protocol.trim()
+}
+
+fn endpoint_layer(endpoint: &Endpoint) -> Option<&'static str> {
+    let protocol = normalized_protocol(&endpoint.protocol);
+    if protocol.is_empty() {
+        None
+    } else if protocol.eq_ignore_ascii_case("websocket") {
+        Some(LAYER_WEBSOCKET)
+    } else {
+        Some(LAYER_REST)
+    }
 }
 
 fn endpoint_label(endpoint: &Endpoint) -> String {
@@ -824,7 +1054,9 @@ fn endpoint_label(endpoint: &Endpoint) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::credentials::{Credential, CredentialSet};
     use crate::policy::parse_policy_str;
+    use std::collections::HashMap;
 
     fn policy(endpoint: &str, binaries: &str) -> PolicyModel {
         parse_policy_str(&format!(
@@ -842,6 +1074,17 @@ network_policies:
         .expect("parse policy")
     }
 
+    fn policy_doc(network_policies: &str) -> PolicyModel {
+        parse_policy_str(&format!(
+            r"
+version: 1
+network_policies:
+{network_policies}
+"
+        ))
+        .expect("parse policy")
+    }
+
     fn one_rest_endpoint(extra: &str) -> String {
         format!(
             r"      - host: api.github.com
@@ -854,6 +1097,19 @@ network_policies:
 
     fn gh_binary() -> &'static str {
         "      - path: /usr/bin/gh"
+    }
+
+    fn github_credentials() -> CredentialSet {
+        CredentialSet {
+            credentials: vec![Credential {
+                name: "github".to_owned(),
+                cred_type: "github-pat".to_owned(),
+                scopes: vec!["repo".to_owned()],
+                injected_via: "env".to_owned(),
+                target_hosts: vec!["api.github.com".to_owned()],
+            }],
+            api_registries: HashMap::new(),
+        }
     }
 
     #[test]
@@ -1055,14 +1311,17 @@ network_policies:
             gh_binary(),
         );
 
-        assert!(matches!(
-            check_within_maximum(&maximum, &candidate),
-            MaximumPolicyCheck::Unsupported { .. }
-        ));
+        let MaximumPolicyCheck::ExceedsMax { counterexample } =
+            check_within_maximum(&maximum, &candidate)
+        else {
+            panic!("expected L4 candidate to exceed REST maximum");
+        };
+        assert_eq!(counterexample.protocol, LAYER_L4);
+        assert_eq!(counterexample.host, "api.github.com");
     }
 
     #[test]
-    fn l4_maximum_is_unsupported_until_modeled() {
+    fn l4_maximum_covers_rest_candidate_within_modeled_rest_domain() {
         let maximum = policy(
             r"      - host: api.github.com
         port: 443",
@@ -1073,10 +1332,29 @@ network_policies:
             gh_binary(),
         );
 
-        assert!(matches!(
+        assert_eq!(
             check_within_maximum(&maximum, &candidate),
-            MaximumPolicyCheck::Unsupported { .. }
-        ));
+            MaximumPolicyCheck::WithinMax
+        );
+    }
+
+    #[test]
+    fn exact_l4_rule_is_within_l4_maximum() {
+        let maximum = policy(
+            r"      - host: api.github.com
+        port: 443",
+            gh_binary(),
+        );
+        let candidate = policy(
+            r"      - host: api.github.com
+        port: 443",
+            gh_binary(),
+        );
+
+        assert_eq!(
+            check_within_maximum(&maximum, &candidate),
+            MaximumPolicyCheck::WithinMax
+        );
     }
 
     #[test]
@@ -1088,11 +1366,55 @@ network_policies:
             gh_binary(),
         );
 
-        let MaximumPolicyCheck::Unsupported { reason } = check_within_maximum(&maximum, &candidate)
+        let MaximumPolicyCheck::ExceedsMax { counterexample } =
+            check_within_maximum(&maximum, &candidate)
         else {
-            panic!("expected L4 candidate to fail closed");
+            panic!("expected L4 candidate to exceed REST maximum");
         };
-        assert!(reason.contains("L4-only endpoint"));
+        assert_eq!(counterexample.protocol, LAYER_L4);
+        assert_eq!(counterexample.method, "");
+        assert_eq!(counterexample.path, "");
+    }
+
+    #[test]
+    fn l4_host_wildcard_broadening_exceeds_maximum() {
+        let maximum = policy(
+            r"      - host: api.github.com
+        port: 443",
+            gh_binary(),
+        );
+        let candidate = policy(
+            r#"      - host: "*.github.com"
+        port: 443"#,
+            gh_binary(),
+        );
+
+        assert!(matches!(
+            check_within_maximum(&maximum, &candidate),
+            MaximumPolicyCheck::ExceedsMax { .. }
+        ));
+    }
+
+    #[test]
+    fn l4_port_broadening_exceeds_maximum() {
+        let maximum = policy(
+            r"      - host: api.github.com
+        port: 443",
+            gh_binary(),
+        );
+        let candidate = policy(
+            r"      - host: api.github.com
+        ports: [443, 8443]",
+            gh_binary(),
+        );
+
+        let MaximumPolicyCheck::ExceedsMax { counterexample } =
+            check_within_maximum(&maximum, &candidate)
+        else {
+            panic!("expected L4 port broadening");
+        };
+        assert_eq!(counterexample.protocol, LAYER_L4);
+        assert_eq!(counterexample.port, 8443);
     }
 
     #[test]
@@ -1236,19 +1558,63 @@ network_policies:
             check_within_maximum(&enforced_maximum, &tls_skip_candidate),
             MaximumPolicyCheck::Unsupported { .. }
         ));
+    }
 
-        let websocket_candidate = policy(
-            r"      - host: api.github.com
+    #[test]
+    fn websocket_endpoint_with_text_rules_is_modeled() {
+        let maximum = policy(
+            r#"      - host: wss-primary.slack.com
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: WEBSOCKET_TEXT, path: "/**" }"#,
+            r#"      - path: "/**""#,
+        );
+        let candidate = policy(
+            r#"      - host: wss-primary.slack.com
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow: { method: WEBSOCKET_TEXT, path: "/rooms/alerts" }"#,
+            "      - path: /usr/bin/node",
+        );
+
+        assert_eq!(
+            check_within_maximum(&maximum, &candidate),
+            MaximumPolicyCheck::WithinMax
+        );
+    }
+
+    #[test]
+    fn websocket_read_only_does_not_cover_text_send() {
+        let maximum = policy(
+            r"      - host: wss-primary.slack.com
         port: 443
         protocol: websocket
         enforcement: enforce
         access: read-only",
-            gh_binary(),
+            "      - path: /usr/bin/node",
         );
-        assert!(matches!(
-            check_within_maximum(&enforced_maximum, &websocket_candidate),
-            MaximumPolicyCheck::Unsupported { .. }
-        ));
+        let candidate = policy(
+            r#"      - host: wss-primary.slack.com
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow: { method: WEBSOCKET_TEXT, path: "/rooms/alerts" }"#,
+            "      - path: /usr/bin/node",
+        );
+
+        let MaximumPolicyCheck::ExceedsMax { counterexample } =
+            check_within_maximum(&maximum, &candidate)
+        else {
+            panic!("expected text send to exceed read-only websocket maximum");
+        };
+        assert_eq!(counterexample.protocol, LAYER_WEBSOCKET);
+        assert_eq!(counterexample.method, "WEBSOCKET_TEXT");
     }
 
     #[test]
@@ -1266,6 +1632,34 @@ network_policies:
 
         assert!(matches!(
             check_within_maximum(&maximum, &candidate),
+            MaximumPolicyCheck::Unsupported { .. }
+        ));
+
+        let rewrite_candidate = policy(
+            r"      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+        request_body_credential_rewrite: true",
+            gh_binary(),
+        );
+        assert!(matches!(
+            check_within_maximum(&maximum, &rewrite_candidate),
+            MaximumPolicyCheck::Unsupported { .. }
+        ));
+
+        let websocket_rewrite_candidate = policy(
+            r"      - host: wss-primary.slack.com
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        access: read-write
+        websocket_credential_rewrite: true",
+            "      - path: /usr/bin/node",
+        );
+        assert!(matches!(
+            check_within_maximum(&websocket_rewrite_candidate, &websocket_rewrite_candidate),
             MaximumPolicyCheck::Unsupported { .. }
         ));
     }
@@ -1493,7 +1887,31 @@ network_policies:
     }
 
     #[test]
-    fn narrowness_l4_candidate_is_unsupported_until_modeled() {
+    fn narrowness_exact_l4_candidate_fits_one_grant_budget_without_l7_overlap() {
+        let current = policy(&one_rest_endpoint("        access: full"), gh_binary());
+        let candidate = policy(
+            r"      - host: files.pythonhosted.org
+        port: 443",
+            gh_binary(),
+        );
+
+        let NarrownessCheck::WithinBudget { summary } =
+            check_narrowness(&current, &candidate, &NarrownessBudget::one_exact_grant())
+        else {
+            panic!("expected exact L4 delta to fit one-grant budget");
+        };
+        assert_eq!(summary.total_score, 1);
+        assert_eq!(summary.delta_grants.len(), 1);
+        assert_eq!(summary.delta_grants[0].protocol, LAYER_L4);
+        assert_eq!(
+            summary.delta_grants[0].reasons,
+            vec![ScopeIncreaseReason::NewGrant]
+        );
+        assert_eq!(summary.delta_grants[0].counterexample.protocol, LAYER_L4);
+    }
+
+    #[test]
+    fn narrowness_l7_to_l4_broadening_is_high_cost() {
         let current = policy(&one_rest_endpoint("        access: full"), gh_binary());
         let candidate = policy(
             r"      - host: api.github.com
@@ -1501,11 +1919,293 @@ network_policies:
             gh_binary(),
         );
 
-        let NarrownessCheck::Unsupported { reason } =
+        let NarrownessCheck::ExceedsBudget { summary } =
             check_narrowness(&current, &candidate, &NarrownessBudget::one_exact_grant())
         else {
-            panic!("expected L4 candidate to fail closed");
+            panic!("expected L7-to-L4 broadening to exceed one-grant budget");
         };
-        assert!(reason.contains("L4-only endpoint"));
+        assert_eq!(summary.total_score, 9);
+        assert_eq!(summary.delta_grants.len(), 1);
+        assert_eq!(summary.delta_grants[0].protocol, LAYER_L4);
+        assert_eq!(
+            summary.delta_grants[0].reasons,
+            vec![
+                ScopeIncreaseReason::NewGrant,
+                ScopeIncreaseReason::L7ToL4Broadening
+            ]
+        );
+
+        let broader_budget = NarrownessBudget {
+            max_delta_grants: 1,
+            max_total_score: 9,
+            allow_recursive_globs: false,
+        };
+        assert!(matches!(
+            check_narrowness(&current, &candidate, &broader_budget),
+            NarrownessCheck::WithinBudget { .. }
+        ));
+    }
+
+    #[test]
+    fn narrowness_l4_current_covers_rest_candidate_within_modeled_rest_domain() {
+        let current = policy(
+            r"      - host: api.github.com
+        port: 443",
+            gh_binary(),
+        );
+        let candidate = policy(&one_rest_endpoint("        access: full"), gh_binary());
+
+        assert_eq!(
+            check_narrowness(&current, &candidate, &NarrownessBudget::one_exact_grant()),
+            NarrownessCheck::NoIncrease
+        );
+    }
+
+    #[test]
+    fn narrowness_websocket_delta_preserves_modeled_layer() {
+        let current = policy(
+            r#"      - host: wss-primary.slack.com
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow: { method: WEBSOCKET_TEXT, path: "/rooms/alerts" }"#,
+            "      - path: /usr/bin/node",
+        );
+        let candidate = policy(
+            r#"      - host: wss-primary.slack.com
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow: { method: WEBSOCKET_TEXT, path: "/rooms/alerts" }
+          - allow: { method: WEBSOCKET_TEXT, path: "/rooms/incidents" }"#,
+            "      - path: /usr/bin/node",
+        );
+
+        let NarrownessCheck::WithinBudget { summary } =
+            check_narrowness(&current, &candidate, &NarrownessBudget::one_exact_grant())
+        else {
+            panic!("expected one exact websocket delta to fit budget");
+        };
+        assert_eq!(summary.total_score, 1);
+        assert_eq!(summary.delta_grants.len(), 1);
+        assert_eq!(summary.delta_grants[0].protocol, LAYER_WEBSOCKET);
+        assert_eq!(
+            summary.delta_grants[0].counterexample.protocol,
+            LAYER_WEBSOCKET
+        );
+        assert_eq!(summary.delta_grants[0].method, "WEBSOCKET_TEXT");
+    }
+
+    #[test]
+    fn mixed_l4_and_rest_fixture_is_modelable() {
+        let policy = parse_policy_str(include_str!("../testdata/policy.yaml"))
+            .expect("parse prover fixture");
+
+        assert_eq!(
+            check_within_maximum(&policy, &policy),
+            MaximumPolicyCheck::WithinMax
+        );
+    }
+
+    #[test]
+    fn credentialed_rest_is_not_uninspected_l4() {
+        let policy = policy(
+            &one_rest_endpoint("        access: read-write"),
+            gh_binary(),
+        );
+
+        assert_eq!(
+            check_uninspected_credentialed_l4(&policy, &github_credentials()),
+            CredentialedL4Check::NoUninspectedCredentialedL4
+        );
+    }
+
+    #[test]
+    fn exact_l4_to_credential_target_is_reported() {
+        let policy = policy(
+            r"      - host: api.github.com
+        port: 443",
+            gh_binary(),
+        );
+
+        let CredentialedL4Check::HasUninspectedCredentialedL4 { counterexample } =
+            check_uninspected_credentialed_l4(&policy, &github_credentials())
+        else {
+            panic!("expected uninspected credentialed L4 finding");
+        };
+        assert_eq!(counterexample.protocol, LAYER_L4);
+        assert_eq!(counterexample.host, "api.github.com");
+    }
+
+    #[test]
+    fn broad_l4_to_credential_target_is_reported_with_symbolic_host() {
+        let policy = policy(
+            r#"      - host: "**"
+        port: 443"#,
+            gh_binary(),
+        );
+
+        let CredentialedL4Check::HasUninspectedCredentialedL4 { counterexample } =
+            check_uninspected_credentialed_l4(&policy, &github_credentials())
+        else {
+            panic!("expected broad L4 to overlap credential target");
+        };
+        assert_eq!(counterexample.protocol, LAYER_L4);
+        assert_eq!(counterexample.host, "api.github.com");
+    }
+
+    #[test]
+    fn credential_target_matching_normalizes_trailing_dot() {
+        let policy = policy(
+            r"      - host: api.github.com
+        port: 443",
+            gh_binary(),
+        );
+        let credentials = CredentialSet {
+            credentials: vec![Credential {
+                name: "github".to_owned(),
+                cred_type: "github-pat".to_owned(),
+                scopes: vec!["repo".to_owned()],
+                injected_via: "env".to_owned(),
+                target_hosts: vec![" API.GITHUB.COM. ".to_owned()],
+            }],
+            api_registries: HashMap::new(),
+        };
+
+        let CredentialedL4Check::HasUninspectedCredentialedL4 { counterexample } =
+            check_uninspected_credentialed_l4(&policy, &credentials)
+        else {
+            panic!("expected normalized credential target to match L4 policy host");
+        };
+        assert_eq!(counterexample.host, "api.github.com");
+    }
+
+    #[test]
+    fn provider_shaped_cursor_allows_known_download_but_rejects_new_url() {
+        let maximum = policy_doc(
+            r#"  _provider_cursor:
+    name: _provider_cursor
+    endpoints:
+      - host: cursor.blob.core.windows.net
+        port: 443
+      - host: api2.cursor.sh
+        port: 443
+      - host: repo.cursor.sh
+        port: 443
+      - host: download.cursor.sh
+        port: 443
+      - host: cursor.download.prss.microsoft.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+      - path: /usr/bin/wget
+      - path: "/sandbox/.cursor-server/**""#,
+        );
+        let known_candidate = policy_doc(
+            r"  cursor_bootstrap:
+    name: cursor_bootstrap
+    endpoints:
+      - host: repo.cursor.sh
+        port: 443
+    binaries:
+      - path: /usr/bin/curl",
+        );
+        let new_url_candidate = policy_doc(
+            r"  cursor_bootstrap:
+    name: cursor_bootstrap
+    endpoints:
+      - host: updates.example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl",
+        );
+
+        assert_eq!(
+            check_within_maximum(&maximum, &known_candidate),
+            MaximumPolicyCheck::WithinMax
+        );
+        let MaximumPolicyCheck::ExceedsMax { counterexample } =
+            check_within_maximum(&maximum, &new_url_candidate)
+        else {
+            panic!("expected new URL to exceed Cursor provider maximum");
+        };
+        assert_eq!(counterexample.protocol, LAYER_L4);
+        assert_eq!(counterexample.host, "updates.example.com");
+    }
+
+    #[test]
+    fn provider_shaped_copilot_mixed_rest_and_l4_are_modelable() {
+        let maximum = policy_doc(
+            r#"  _provider_copilot:
+    name: _provider_copilot
+    endpoints:
+      - host: api.githubcopilot.com
+        port: 443
+        protocol: rest
+        access: read-write
+        enforcement: enforce
+      - host: api.individual.githubcopilot.com
+        port: 443
+        protocol: rest
+        access: read-write
+        enforcement: enforce
+      - host: api.business.githubcopilot.com
+        port: 443
+        protocol: rest
+        access: read-write
+        enforcement: enforce
+      - host: api.enterprise.githubcopilot.com
+        port: 443
+        protocol: rest
+        access: read-write
+        enforcement: enforce
+      - host: copilot-proxy.githubusercontent.com
+        port: 443
+        protocol: rest
+        access: read-write
+        enforcement: enforce
+      - host: telemetry.enterprise.githubcopilot.com
+        port: 443
+      - host: default.exp-tas.com
+        port: 443
+    binaries:
+      - path: /usr/bin/copilot
+      - path: "/usr/lib/node_modules/@github/copilot/node_modules/@github/**/copilot""#,
+        );
+        let rest_candidate = policy_doc(
+            r"  copilot_api:
+    name: copilot_api
+    endpoints:
+      - host: api.githubcopilot.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: /chat/completions
+    binaries:
+      - path: /usr/bin/copilot",
+        );
+        let l4_candidate = policy_doc(
+            r"  copilot_telemetry:
+    name: copilot_telemetry
+    endpoints:
+      - host: telemetry.enterprise.githubcopilot.com
+        port: 443
+    binaries:
+      - path: /usr/bin/copilot",
+        );
+
+        assert_eq!(
+            check_within_maximum(&maximum, &rest_candidate),
+            MaximumPolicyCheck::WithinMax
+        );
+        assert_eq!(
+            check_within_maximum(&maximum, &l4_candidate),
+            MaximumPolicyCheck::WithinMax
+        );
     }
 }

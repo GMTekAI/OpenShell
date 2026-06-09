@@ -17,12 +17,24 @@ exists x:
 
 Rust normalizes schema-level OpenShell policy semantics, such as access presets
 and unsupported field detection. Z3 owns the action variables (`binary`, `host`,
-`port`, `protocol`, `method`, and `path`) and checks whether any symbolic action
-is allowed by the candidate but not by the maximum. Host, path, and binary globs
+`port`, `layer`, `method`, and `path`) and checks whether any symbolic action is
+allowed by the candidate but not by the maximum. Host, path, and binary globs
 compile to Z3 regular-expression constraints. If the solver finds such an `x`,
 the candidate exceeds the maximum. If no such `x` exists, the candidate is within
 the modeled maximum. If either policy uses a surface the spike does not model
 yet, the check fails closed as `Unsupported`.
+
+The first modeled action layers are:
+
+```text
+L4:        binary, host, port
+REST:      binary, host, port, method, path
+WebSocket: binary, host, port, method, path
+```
+
+An L4 endpoint is broader than inspected protocols: it covers raw L4, REST, and
+WebSocket actions on the same binary/host/port. REST and WebSocket endpoints
+cover only their own inspected action layer.
 
 ## Demo 1: Narrow Candidate Within Maximum
 
@@ -155,11 +167,66 @@ port: 443                  -> [443, 8443]
 
 Why: each change creates at least one action that the maximum does not allow.
 
-L4-only endpoints are not modeled in this spike. They fail closed as
-`Unsupported` rather than being compared against the REST-only symbolic action
-domain.
+## Demo 5: L4, REST, And WebSocket Layering
 
-## Demo 5: Unsupported Surfaces Fail Closed
+An L4 maximum covers a narrower REST candidate on the same binary/host/port:
+
+```yaml
+maximum:
+  endpoints:
+    - host: api.github.com
+      port: 443
+
+candidate:
+  endpoints:
+    - host: api.github.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-write
+```
+
+Result:
+
+```text
+WithinMax
+```
+
+A REST maximum does not cover a raw L4 candidate:
+
+```text
+ExceedsMax {
+  protocol: "l4",
+  host: "api.github.com",
+  port: 443,
+  ...
+}
+```
+
+Why: raw L4 egress is broader and less inspected than an enforced REST or
+WebSocket surface.
+
+WebSocket endpoints are modeled as their own inspected layer with `GET` and
+`WEBSOCKET_TEXT` actions. `read-only` WebSocket access covers the opening
+`GET`, not text send authority. Credential rewrite flags fail closed until the
+prover has an explicit authority check for introducing credential injection.
+
+## Demo 6: Credentialed L4 Is A Separate High-Risk Check
+
+The spike also includes a separate check for uninspected credentialed L4 reach:
+
+```text
+exists x:
+  policy_allows(x)
+  AND x.layer = L4
+  AND credential_target_matches(x.host)
+```
+
+This is intentionally separate from maximum containment. It lets product policy
+decide whether credentialed L4 should be explicitly allowed, auto-denied, or
+sent to human review without changing the meaning of the signed maximum.
+
+## Demo 7: Unsupported Surfaces Fail Closed
 
 Maximum:
 
@@ -189,7 +256,7 @@ GraphQL operation and field constraints
 MCP tool/resource constraints
 CIDR-only allowed_ips
 endpoint path scoping
-L4-only endpoints
+credential rewrite flags
 ```
 
 ## Narrowness Companion
@@ -227,9 +294,11 @@ exact new grant:        +1
 single path wildcard:   +2
 host/binary wildcard:   +3
 recursive glob (**):    +6
+L7-to-L4 broadening:    +8
 ```
 
-A conservative budget can allow one exact grant and reject recursive globs:
+A conservative budget can allow one exact grant, including an exact L4
+host/port grant, while rejecting recursive globs and L7-to-L4 broadening:
 
 ```rust
 NarrownessBudget {
@@ -239,7 +308,12 @@ NarrownessBudget {
 }
 ```
 
-## Demo 6: One Exact Path Fits A Narrow Budget
+Credentialed raw L4 is handled by the separate credentialed-L4 check above. A
+production auto-approval gate can combine that result with this budget, for
+example by assigning a high score or requiring human review when raw L4 reaches
+a credential target.
+
+## Demo 8: One Exact Path Fits A Narrow Budget
 
 Current:
 
@@ -280,7 +354,59 @@ WithinBudget {
 Why: the candidate adds one exact modeled grant. The grant allows both `GET` and
 runtime-implied `HEAD`, but the budget counts the source grant once.
 
-## Demo 7: Lazy Recursive Path Exceeds A Narrow Budget
+## Demo 9: Exact L4 Versus L7-To-L4 Broadening
+
+An exact L4 grant to a new normal host is still one exact grant:
+
+```yaml
+candidate:
+  endpoints:
+    - host: files.pythonhosted.org
+      port: 443
+```
+
+Result:
+
+```text
+WithinBudget {
+  total_score: 1,
+  reasons: [NewGrant]
+}
+```
+
+If the current policy already has inspected REST/WebSocket access for the same
+authority and the candidate asks for raw L4, the same exact host/port becomes a
+larger jump:
+
+```yaml
+current:
+  endpoints:
+    - host: api.github.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: full
+
+candidate:
+  endpoints:
+    - host: api.github.com
+      port: 443
+```
+
+Result:
+
+```text
+ExceedsBudget {
+  total_score: 9,
+  reasons: [NewGrant, L7ToL4Broadening]
+}
+```
+
+Why: the candidate is not just adding a host. It is replacing inspected
+method/path reasoning with raw host/port authority for a service the current
+policy already modeled at L7.
+
+## Demo 10: Lazy Recursive Path Exceeds A Narrow Budget
 
 Current:
 
@@ -330,29 +456,22 @@ it.
 mise exec -- cargo test -p openshell-prover
 ```
 
-Maximal-policy tests include:
+Coverage includes:
 
 ```text
-envelope::tests::exact_rest_rule_is_within_maximum
-envelope::tests::broader_rest_path_exceeds_maximum
-envelope::tests::method_escalation_exceeds_maximum
-envelope::tests::host_wildcard_broadening_exceeds_maximum
-envelope::tests::binary_wildcard_broadening_exceeds_maximum
-envelope::tests::port_broadening_exceeds_maximum
-envelope::tests::l4_candidate_exceeds_l7_maximum
-envelope::tests::maximum_wildcards_cover_exact_candidate
-envelope::tests::deny_rules_are_unsupported_until_modeled
-envelope::tests::query_graphql_cidr_and_mcp_surfaces_are_unsupported
-envelope::tests::narrowness_allows_one_exact_path_delta_within_budget
-envelope::tests::narrowness_allows_one_exact_method_delta_within_budget
-envelope::tests::narrowness_rejects_multiple_exact_grants_over_budget
-envelope::tests::narrowness_rejects_recursive_path_glob_as_too_broad
+REST method/path/host/binary/port containment
+L4 versus REST/WebSocket layer containment
+WebSocket text-send and read-only behavior
+credentialed raw L4 detection
+fail-closed unsupported deny/query/GraphQL/MCP/CIDR/rewrite surfaces
+exact, wildcard, recursive-glob, L4, and WebSocket narrowness deltas
+representative provider-shaped accept/reject cases
 ```
 
 ## Readout
 
-This validates the product shape for REST/path/binary/host/port maximum-policy
-envelopes and narrowness budgets with symbolic Z3 counterexample queries. Deny
-rules, MCP, GraphQL, query constraints, CIDR, and L4-only endpoints can land as
-follow-on modeled surfaces once the containment and delta mechanics are proven
-useful.
+This validates the product shape for L4, REST, and WebSocket maximum-policy
+envelopes, narrowness budgets, and uninspected credentialed L4 detection with
+symbolic Z3 counterexample queries. Deny rules, MCP, GraphQL, query constraints,
+and CIDR can land as follow-on modeled surfaces once the containment and delta
+mechanics are proven useful.

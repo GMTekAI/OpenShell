@@ -46,14 +46,16 @@ exists x:
   AND NOT maximum_allows(x)
 ```
 
-The first implementation models REST allow surfaces for binaries,
-hosts, ports, protocols, methods, paths, access presets, and the
+The first implementation models L4, REST, and WebSocket allow surfaces
+for binaries, hosts, ports, methods, paths, access presets, and the
 supported host/path/binary glob subset. Rust normalizes policy schema
 details such as access presets and fail-closed unsupported fields, then
 encodes candidate and maximum allow predicates as Z3 constraints over
-symbolic action variables (`binary`, `host`, `port`, `protocol`,
-`method`, and `path`). Host, path, and binary globs are encoded as Z3
-regular-expression membership constraints. Query parameters are not
+symbolic action variables (`binary`, `host`, `port`, `layer`, `method`,
+and `path`). L4 endpoints cover raw L4, REST, and WebSocket actions on
+the same binary/host/port; REST and WebSocket endpoints cover only their
+own inspected action layer. Host, path, and binary globs are encoded as
+Z3 regular-expression membership constraints. Query parameters are not
 modeled yet. It returns:
 
 - `WithinMax` when every modeled candidate action is covered.
@@ -61,7 +63,8 @@ modeled yet. It returns:
   is broader.
 - `Unsupported` when either policy uses a surface not modeled yet, such
   as deny rules, query constraints, GraphQL controls, MCP controls,
-  endpoint path scoping, CIDR-only `allowed_ips`, or L4-only endpoints.
+  endpoint path scoping, credential rewrite flags, or CIDR-only
+  `allowed_ips`.
 
 Unsupported is intentionally fail-closed. Future work can flip those
 fixtures to modeled results as deny rules, MCP, GraphQL, and richer
@@ -71,10 +74,15 @@ The spike also includes a narrowness-budget check for candidate updates
 against the current policy. It uses the same symbolic action model to
 prove whether candidate grants add reach, then scores the shape of the
 delta so exact grants can fit a small budget while broad globs such as
-`**` exceed it. See
+`**` and L7-to-L4 broadening exceed the conservative default. See
 [`MAXIMUM_POLICY_ENVELOPE_SPIKE.md`](MAXIMUM_POLICY_ENVELOPE_SPIKE.md)
 for a walkthrough of the current maximum-policy and narrowness-budget
 behavior.
+
+The spike also exposes a credentialed-L4 check that asks whether any
+modeled raw L4 action can reach a credential target. This keeps
+uninspected credentialed authority separate from plain outbound egress
+and from the maximum-policy containment proof.
 
 ## Evidence shape
 
