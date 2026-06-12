@@ -145,13 +145,17 @@ async fn handle_create_sandbox_inner(
 
     // Ensure the template always carries the resolved image.
     let mut spec = spec;
-    if spec.policy.is_none()
-        && let Some(default_policy) = state
-            .policy_source
-            .as_ref()
-            .and_then(|source| source.default_policy.as_ref())
+    if let Some(global_policy) = state
+        .policy_source
+        .as_ref()
+        .and_then(|source| source.global_policy())
     {
-        spec.policy = Some(default_policy.clone());
+        if spec.policy.is_some() {
+            return Err(Status::failed_precondition(
+                "sandbox policies are managed by the configured policy source global_policy",
+            ));
+        }
+        spec.policy = Some(global_policy.policy.clone());
     }
 
     let template = spec.template.get_or_insert_with(SandboxTemplate::default);
@@ -1946,7 +1950,7 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc::test_support::test_server_state;
+    use crate::grpc::test_support::{test_server_state, test_server_state_with_policy_source};
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use std::collections::HashMap;
 
@@ -2268,6 +2272,39 @@ mod tests {
         let spec = sandbox.spec.unwrap();
         assert_eq!(spec.providers, vec!["work-github"]);
         assert_eq!(spec.log_level, "debug");
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_still_works_in_strict_policy_source_mode() {
+        let state = test_server_state_with_policy_source(Some(loaded_policy_source(
+            openshell_policy::restrictive_default_policy(),
+            crate::config_file::GatewayPolicyEnforcement::Strict,
+        )))
+        .await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        let response = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.attached);
     }
 
     #[tokio::test]
@@ -2598,14 +2635,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sandbox_applies_configured_default_policy() {
-        let store = Arc::new(
-            crate::persistence::Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
-        let compute = crate::compute::new_test_runtime(store.clone()).await;
-        let default_policy = openshell_policy::parse_sandbox_policy(
+    async fn create_sandbox_applies_configured_global_policy() {
+        let global_policy = openshell_policy::parse_sandbox_policy(
             r"
 version: 1
 network_policies:
@@ -2618,20 +2649,12 @@ network_policies:
       - path: /usr/bin/curl
 ",
         )
-        .expect("default policy");
-        let state = Arc::new(ServerState::new(
-            openshell_core::Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
-            store,
-            compute,
-            crate::sandbox_index::SandboxIndex::new(),
-            crate::sandbox_watch::SandboxWatchBus::new(),
-            crate::tracing_bus::TracingLogBus::new(),
-            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
-            None,
-            Some(crate::policy_source::LoadedPolicySource {
-                default_policy: Some(default_policy),
-            }),
-        ));
+        .expect("global policy");
+        let state = test_server_state_with_policy_source(Some(loaded_policy_source(
+            global_policy,
+            crate::config_file::GatewayPolicyEnforcement::Permissive,
+        )))
+        .await;
 
         let response = handle_create_sandbox(
             &state,
@@ -2647,6 +2670,32 @@ network_policies:
 
         let sandbox = response.sandbox.expect("sandbox");
         assert!(sandbox.spec.expect("spec").policy.is_some());
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_explicit_policy_when_global_policy_configured() {
+        let state = test_server_state_with_policy_source(Some(loaded_policy_source(
+            openshell_policy::restrictive_default_policy(),
+            crate::config_file::GatewayPolicyEnforcement::Permissive,
+        )))
+        .await;
+
+        let err = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "explicit-policy".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    policy: Some(openshell_policy::restrictive_default_policy()),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .expect_err("explicit policy should be rejected");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("global_policy"));
     }
 
     #[tokio::test]
@@ -3299,5 +3348,19 @@ network_policies:
             final_sandbox.metadata.as_ref().unwrap().resource_version,
             initial_version + 1
         );
+    }
+
+    fn loaded_policy_source(
+        policy: openshell_core::proto::SandboxPolicy,
+        enforcement: crate::config_file::GatewayPolicyEnforcement,
+    ) -> crate::policy_source::LoadedPolicySource {
+        crate::policy_source::LoadedPolicySource {
+            global_policy: Some(crate::policy_source::LoadedGlobalPolicy {
+                name: "default".to_string(),
+                policy,
+                document_sha256: "test-digest".to_string(),
+            }),
+            enforcement,
+        }
     }
 }

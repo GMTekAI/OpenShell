@@ -1190,10 +1190,26 @@ use openshell_providers::{
 use std::sync::Arc;
 use tonic::{Request, Response};
 
+fn strict_policy_source_enabled(state: &ServerState) -> bool {
+    state
+        .policy_source
+        .as_ref()
+        .is_some_and(|source| source.is_strict())
+}
+
+fn strict_provider_mutation_error() -> Status {
+    Status::failed_precondition(
+        "provider mutations are disabled when policy source enforcement is strict",
+    )
+}
+
 pub(super) async fn handle_create_provider(
     state: &Arc<ServerState>,
     request: Request<CreateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
+    if strict_policy_source_enabled(state) {
+        return Err(strict_provider_mutation_error());
+    }
     let req = request.into_inner();
     let Some(provider) = req.provider else {
         emit_provider_lifecycle(
@@ -1270,6 +1286,14 @@ fn is_source_backed_provider_profile(profile: &StoredProviderProfile) -> bool {
         .is_some_and(|value| value == SOURCE_PROVIDER_PROFILE_LABEL_VALUE)
 }
 
+fn is_source_backed_provider(provider: &Provider) -> bool {
+    provider
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.labels.get(SOURCE_PROVIDER_PROFILE_LABEL_KEY))
+        .is_some_and(|value| value == SOURCE_PROVIDER_PROFILE_LABEL_VALUE)
+}
+
 pub(super) async fn handle_list_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ListProviderProfilesRequest>,
@@ -1309,6 +1333,9 @@ pub(super) async fn handle_import_provider_profiles(
     state: &Arc<ServerState>,
     request: Request<ImportProviderProfilesRequest>,
 ) -> Result<Response<ImportProviderProfilesResponse>, Status> {
+    if strict_policy_source_enabled(state) {
+        return Err(strict_provider_mutation_error());
+    }
     let request = request.into_inner();
     let (profiles, mut diagnostics) = profiles_from_import_items(&request.profiles);
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
@@ -1374,6 +1401,9 @@ pub(super) async fn handle_delete_provider_profile(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderProfileRequest>,
 ) -> Result<Response<DeleteProviderProfileResponse>, Status> {
+    if strict_policy_source_enabled(state) {
+        return Err(strict_provider_mutation_error());
+    }
     let id = request.into_inner().id;
     let id = normalize_profile_id_request(&id)?;
     if get_default_profile(&id).is_some() {
@@ -1423,11 +1453,6 @@ pub(crate) async fn upsert_source_provider_profile(
             profile.id
         )));
     };
-    if get_default_profile(&id).is_some() {
-        return Err(Status::failed_precondition(format!(
-            "provider profile '{id}' is built-in and cannot be managed by a policy source"
-        )));
-    }
 
     let existing = store
         .get_message_by_name::<StoredProviderProfile>(&id)
@@ -1508,6 +1533,99 @@ pub(crate) async fn upsert_source_provider_profile(
     Ok(())
 }
 
+pub(crate) async fn upsert_source_provider(
+    store: &Store,
+    profile: &ProviderTypeProfile,
+    digest_hex: &str,
+) -> Result<(), Status> {
+    let Some(name) = normalize_profile_id(&profile.id) else {
+        return Err(Status::failed_precondition(format!(
+            "provider profile '{}' has an invalid id",
+            profile.id
+        )));
+    };
+    if !profile.allows_empty_provider_credentials() {
+        return Err(Status::failed_precondition(format!(
+            "source provider '{name}' requires credentials that cannot be resolved at runtime"
+        )));
+    }
+
+    let existing = store
+        .get_message_by_name::<Provider>(&name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?;
+    if existing
+        .as_ref()
+        .is_some_and(|provider| !is_source_backed_provider(provider))
+    {
+        return Err(Status::failed_precondition(format!(
+            "custom provider '{name}' already exists and is not source-backed"
+        )));
+    }
+
+    let now_ms = crate::persistence::current_time_ms();
+    let mut provider = Provider {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.clone(),
+            created_at_ms: now_ms,
+            labels: std::collections::HashMap::from([
+                (
+                    SOURCE_PROVIDER_PROFILE_LABEL_KEY.to_string(),
+                    SOURCE_PROVIDER_PROFILE_LABEL_VALUE.to_string(),
+                ),
+                (
+                    SOURCE_PROVIDER_PROFILE_FORMAT_LABEL_KEY.to_string(),
+                    "yaml".to_string(),
+                ),
+                (
+                    SOURCE_PROVIDER_PROFILE_DIGEST_PREFIX_LABEL_KEY.to_string(),
+                    digest_hex.chars().take(16).collect(),
+                ),
+            ]),
+            resource_version: 0,
+        }),
+        r#type: name,
+        credentials: std::collections::HashMap::new(),
+        config: std::collections::HashMap::new(),
+        credential_expires_at_ms: std::collections::HashMap::new(),
+    };
+    if let Some(existing) = existing.as_ref()
+        && let (Some(metadata), Some(existing_metadata)) =
+            (provider.metadata.as_mut(), existing.metadata.as_ref())
+    {
+        metadata.id.clone_from(&existing_metadata.id);
+        metadata.created_at_ms = existing_metadata.created_at_ms;
+    }
+
+    super::validation::validate_object_metadata(provider.metadata.as_ref(), "provider")?;
+    validate_provider_fields(&provider)?;
+
+    let labels_json = provider
+        .object_labels()
+        .filter(|labels| !labels.is_empty())
+        .map(|labels| {
+            serde_json::to_string(&labels)
+                .map_err(|e| Status::internal(format!("serialize provider labels failed: {e}")))
+        })
+        .transpose()?;
+    let result = store
+        .put_if(
+            Provider::object_type(),
+            provider.object_id(),
+            provider.object_name(),
+            &provider.encode_to_vec(),
+            labels_json.as_deref(),
+            WriteCondition::Unconditional,
+        )
+        .await
+        .map_err(|e| Status::internal(format!("persist source provider failed: {e}")))?;
+    if let Some(metadata) = provider.metadata.as_mut() {
+        metadata.resource_version = result.resource_version;
+    }
+    Ok(())
+}
+
 pub(super) async fn get_provider_type_profile(
     store: &Store,
     id: &str,
@@ -1515,16 +1633,16 @@ pub(super) async fn get_provider_type_profile(
     let Some(id) = normalize_profile_id(id) else {
         return Ok(None);
     };
-    if let Some(profile) = get_default_profile(&id) {
-        return Ok(Some(profile.clone()));
-    }
-    let profile = store
+    if let Some(profile) = store
         .get_message_by_name::<StoredProviderProfile>(&id)
         .await
         .map_err(|e| Status::internal(format!("fetch provider profile failed: {e}")))?
         .and_then(|stored| stored.profile)
-        .map(|profile| ProviderTypeProfile::from_proto(&profile));
-    Ok(profile)
+        .map(|profile| ProviderTypeProfile::from_proto(&profile))
+    {
+        return Ok(Some(profile));
+    }
+    Ok(get_default_profile(&id).cloned())
 }
 
 async fn provider_refresh_defaults(
@@ -1585,13 +1703,20 @@ async fn provider_type_allows_empty_credentials(
 
 async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfile>, Status> {
     let mut profiles = default_profiles().to_vec();
-    profiles.extend(
-        custom_provider_profiles(store)
-            .await?
-            .into_iter()
-            .filter_map(|stored| stored.profile)
-            .map(|profile| ProviderTypeProfile::from_proto(&profile)),
-    );
+    for profile in custom_provider_profiles(store)
+        .await?
+        .into_iter()
+        .filter_map(|stored| stored.profile)
+        .map(|profile| ProviderTypeProfile::from_proto(&profile))
+    {
+        if let Some(existing) = profiles.iter_mut().find(|existing| {
+            normalize_profile_id(&existing.id) == normalize_profile_id(&profile.id)
+        }) {
+            *existing = profile;
+        } else {
+            profiles.push(profile);
+        }
+    }
     Ok(profiles)
 }
 
@@ -1839,6 +1964,9 @@ pub(super) async fn handle_update_provider(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
+    if strict_policy_source_enabled(state) {
+        return Err(strict_provider_mutation_error());
+    }
     let req = request.into_inner();
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
@@ -1919,6 +2047,9 @@ pub(super) async fn handle_configure_provider_refresh(
     state: &Arc<ServerState>,
     request: Request<ConfigureProviderRefreshRequest>,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
+    if strict_policy_source_enabled(state) {
+        return Err(strict_provider_mutation_error());
+    }
     let request = request.into_inner();
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
@@ -2117,6 +2248,9 @@ pub(super) async fn handle_rotate_provider_credential(
     state: &Arc<ServerState>,
     request: Request<RotateProviderCredentialRequest>,
 ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+    if strict_policy_source_enabled(state) {
+        return Err(strict_provider_mutation_error());
+    }
     let request = request.into_inner();
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
@@ -2144,6 +2278,9 @@ pub(super) async fn handle_delete_provider_refresh(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRefreshRequest>,
 ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
+    if strict_policy_source_enabled(state) {
+        return Err(strict_provider_mutation_error());
+    }
     let request = request.into_inner();
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
@@ -2210,6 +2347,9 @@ pub(super) async fn handle_delete_provider(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
+    if strict_policy_source_enabled(state) {
+        return Err(strict_provider_mutation_error());
+    }
     let name = request.into_inner().name;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &name).await;
     let result = delete_provider_record(state.store.as_ref(), &name).await;
@@ -2283,7 +2423,7 @@ fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc::test_support::test_server_state;
+    use crate::grpc::test_support::{test_server_state, test_server_state_with_policy_source};
     use crate::grpc::{MAX_MAP_KEY_LEN, MAX_PROVIDER_TYPE_LEN};
     use crate::persistence::test_store;
     use openshell_core::proto::{
@@ -2615,6 +2755,52 @@ mod tests {
             .collect(),
             credential_expires_at_ms: HashMap::new(),
         }
+    }
+
+    fn loaded_strict_policy_source() -> crate::policy_source::LoadedPolicySource {
+        crate::policy_source::LoadedPolicySource {
+            global_policy: Some(crate::policy_source::LoadedGlobalPolicy {
+                name: "default".to_string(),
+                policy: openshell_policy::restrictive_default_policy(),
+                document_sha256: "test-digest".to_string(),
+            }),
+            enforcement: crate::config_file::GatewayPolicyEnforcement::Strict,
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_policy_source_rejects_provider_create() {
+        let state = test_server_state_with_policy_source(Some(loaded_strict_policy_source())).await;
+        let err = handle_create_provider(
+            &state,
+            Request::new(CreateProviderRequest {
+                provider: Some(provider_with_values("test-provider", "generic")),
+            }),
+        )
+        .await
+        .expect_err("strict mode should reject provider create");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("provider mutations"));
+    }
+
+    #[tokio::test]
+    async fn strict_policy_source_rejects_provider_profile_import() {
+        let state = test_server_state_with_policy_source(Some(loaded_strict_policy_source())).await;
+        let err = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(custom_profile("custom-api")),
+                    source: "custom-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .expect_err("strict mode should reject provider profile import");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("provider mutations"));
     }
 
     fn custom_profile(id: &str) -> ProviderProfile {

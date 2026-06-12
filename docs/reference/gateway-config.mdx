@@ -109,8 +109,10 @@ grpc_rate_limit_window_seconds = 60
 [openshell.gateway.policies]
 # Filesystem directory, file:// URI, or grpc+unix:// socket.
 location = "grpc+unix:///var/run/openshell/policy-source.sock"
-# Applied to new sandboxes only when CreateSandbox omits spec.policy.
-default_policy = "default"
+# Effective global policy loaded from the policy source.
+global_policy = "default"
+# Set to "strict" to disable manual policy/provider mutation APIs.
+enforcement = "strict"
 
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
@@ -153,7 +155,9 @@ Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth
 
 ## Policy Sources
 
-`[openshell.gateway.policies]` configures an optional startup-loaded source for governed sandbox policies and provider type profiles. Set `location` to a filesystem directory, a `file://` URI, or a `grpc+unix://` Unix socket. Set `default_policy` to the policy document name the gateway should apply when `CreateSandbox` omits `spec.policy`; an explicit request policy always wins.
+`[openshell.gateway.policies]` configures an optional startup-loaded source for governed sandbox policies and provider type profiles. Set `location` to a filesystem directory, a `file://` URI, or a `grpc+unix://` Unix socket. Set `global_policy` to the policy document name the gateway should use as the effective global sandbox policy. When `global_policy` is configured, sandbox create requests cannot provide their own policy payloads and sandbox policy updates are rejected. Provider documents materialize source-backed provider records with the same names when their credentials can be resolved at runtime; attaching those providers composes governed provider policy rules into the effective policy.
+
+Set `enforcement = "strict"` to also block runtime policy and provider mutation APIs. Strict mode allows attaching and detaching source-backed providers from sandboxes, but rejects manual policy updates, provider profile import/delete, provider instance create/update/delete, and provider credential refresh mutations.
 
 Filesystem sources use this layout:
 

@@ -674,6 +674,7 @@ pub mod test_support {
     use crate::ServerState;
     use crate::compute::new_test_runtime;
     use crate::persistence::Store;
+    use crate::policy_source::LoadedPolicySource;
     use crate::sandbox_index::SandboxIndex;
     use crate::sandbox_watch::SandboxWatchBus;
     use crate::supervisor_session::SupervisorSessionRegistry;
@@ -682,6 +683,12 @@ pub mod test_support {
 
     /// Build an in-memory `ServerState` for unit tests.
     pub async fn test_server_state() -> Arc<ServerState> {
+        test_server_state_with_policy_source(None).await
+    }
+
+    pub async fn test_server_state_with_policy_source(
+        policy_source: Option<LoadedPolicySource>,
+    ) -> Arc<ServerState> {
         let store = Arc::new(
             Store::connect("sqlite::memory:?cache=shared")
                 .await
@@ -697,7 +704,7 @@ pub mod test_support {
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
             None,
-            None,
+            policy_source,
         ))
     }
 }

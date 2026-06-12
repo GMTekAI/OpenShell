@@ -8,3 +8,9 @@ credentials:
   - name: token
     env_vars: [GITLAB_TOKEN]
     required: true
+    auth_style: bearer
+    header_name: authorization
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+      audience: gitlab
+      scopes: [api]

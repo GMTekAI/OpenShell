@@ -32,7 +32,8 @@ Configure the gateway with:
 ```toml
 [openshell.gateway.policies]
 location = "grpc+unix:///tmp/openshell-policy-source.sock"
-default_policy = "default"
+global_policy = "default"
+enforcement = "strict"
 ```
 
 Or load the bundle directly from the filesystem:
@@ -40,7 +41,8 @@ Or load the bundle directly from the filesystem:
 ```toml
 [openshell.gateway.policies]
 location = "./examples/policy-source/bundle"
-default_policy = "default"
+global_policy = "default"
+enforcement = "strict"
 ```
 
 `GetPolicy("default")` returns an OpenShell sandbox policy YAML document.
@@ -54,10 +56,12 @@ Run the smoke test:
 examples/policy-source/smoke.sh
 ```
 
-The script builds `policy-source-server` and `policy-source-check`, creates a
-temporary source root, adds the `default` policy and the `github` and `gitlab`
-provider profiles, starts the Unix-socket gRPC server, and verifies those
-documents through the gRPC API.
+The script builds the policy source, gateway, and check binaries, creates a
+temporary source root, starts the Unix-socket gRPC source, and verifies the
+`default` policy plus `github` and `gitlab` provider documents. If Docker or
+Podman is running, it also starts a strict local gateway and prints PASS/FAIL
+lines for custom policy rejection, policy mutation rejection, attaching a
+source-backed provider, and rejecting ad-hoc provider creation/attachment.
 
 Run the server directly:
 

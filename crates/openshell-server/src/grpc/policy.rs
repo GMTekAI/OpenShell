@@ -978,17 +978,25 @@ async fn current_effective_policy_for_sandbox(
     };
 
     let global_settings = load_global_settings(state.store.as_ref()).await?;
-    let policy_source = decode_policy_from_global_settings(&global_settings)?.map_or(
-        PolicySource::Sandbox,
-        |global_policy| {
-            policy = global_policy;
-            PolicySource::Global
-        },
-    );
+    let bundle_global_policy = bundle_global_policy(state);
+    let policy_source = if let Some(global_policy) = bundle_global_policy {
+        policy = global_policy.clone();
+        PolicySource::Global
+    } else {
+        decode_policy_from_global_settings(&global_settings)?.map_or(
+            PolicySource::Sandbox,
+            |global_policy| {
+                policy = global_policy;
+                PolicySource::Global
+            },
+        )
+    };
 
     let providers_v2_enabled =
         bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
-    if providers_v2_enabled && !matches!(policy_source, PolicySource::Global) {
+    if bundle_global_policy.is_some()
+        || (providers_v2_enabled && !matches!(policy_source, PolicySource::Global))
+    {
         let provider_names = sandbox
             .spec
             .as_ref()
@@ -1002,6 +1010,40 @@ async fn current_effective_policy_for_sandbox(
     }
 
     Ok(policy)
+}
+
+fn bundle_global_policy(state: &ServerState) -> Option<&ProtoSandboxPolicy> {
+    state
+        .policy_source
+        .as_ref()
+        .and_then(|source| source.global_policy())
+        .map(|global| &global.policy)
+}
+
+fn has_bundle_global_policy(state: &ServerState) -> bool {
+    state
+        .policy_source
+        .as_ref()
+        .is_some_and(|source| source.has_global_policy())
+}
+
+fn strict_policy_source_enabled(state: &ServerState) -> bool {
+    state
+        .policy_source
+        .as_ref()
+        .is_some_and(|source| source.is_strict())
+}
+
+fn bundle_global_policy_update_error() -> Status {
+    Status::failed_precondition(
+        "sandbox policies are managed by the configured policy source global_policy",
+    )
+}
+
+fn strict_policy_source_mutation_error() -> Status {
+    Status::failed_precondition(
+        "manual policy mutations are disabled when policy source enforcement is strict",
+    )
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1107,88 +1149,101 @@ pub(super) async fn handle_get_sandbox_config(
         .map(|spec| spec.providers.clone())
         .unwrap_or_default();
 
-    // Try to get the latest policy from the policy history table.
-    let latest = state
-        .store
-        .get_latest_policy(&sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
-
-    let mut policy_source = PolicySource::Sandbox;
-    let (mut policy, mut version, mut policy_hash) = if let Some(record) = latest {
-        let decoded = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode policy failed: {e}")))?;
-        debug!(
-            sandbox_id = %sandbox_id,
-            version = record.version,
-            "GetSandboxConfig served from policy history"
-        );
-        (
-            Some(decoded),
-            u32::try_from(record.version).unwrap_or(0),
-            record.policy_hash,
-        )
-    } else {
-        // Lazy backfill: no policy history exists yet.
-        let spec = sandbox
-            .spec
-            .as_ref()
-            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-
-        match spec.policy.clone() {
-            None => {
-                debug!(
-                    sandbox_id = %sandbox_id,
-                    "GetSandboxConfig: no policy configured, returning empty response"
-                );
-                (None, 0, String::new())
-            }
-            Some(spec_policy) => {
-                let hash = deterministic_policy_hash(&spec_policy);
-                let payload = spec_policy.encode_to_vec();
-                let policy_id = uuid::Uuid::new_v4().to_string();
-
-                if let Err(e) = state
-                    .store
-                    .put_policy_revision(&policy_id, &sandbox_id, 1, &payload, &hash)
-                    .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "Failed to backfill policy version 1"
-                    );
-                } else if let Err(e) = state
-                    .store
-                    .update_policy_status(&sandbox_id, 1, "loaded", None, None)
-                    .await
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        error = %e,
-                        "Failed to mark backfilled policy as loaded"
-                    );
-                }
-
-                info!(
-                    sandbox_id = %sandbox_id,
-                    "GetSandboxConfig served from spec (backfilled version 1)"
-                );
-
-                (Some(spec_policy), 1, hash)
-            }
-        }
-    };
-
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
         load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
     let providers_v2_enabled =
         bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
 
+    let bundle_global_policy = bundle_global_policy(state);
+    let mut policy_source = PolicySource::Sandbox;
     let mut global_policy_version: u32 = 0;
+    let (mut policy, mut version, mut policy_hash) =
+        if let Some(global_policy) = bundle_global_policy {
+            policy_source = PolicySource::Global;
+            global_policy_version = 1;
+            (
+                Some(global_policy.clone()),
+                1,
+                deterministic_policy_hash(global_policy),
+            )
+        } else {
+            // Try to get the latest policy from the policy history table.
+            let latest = state
+                .store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
 
-    if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
+            if let Some(record) = latest {
+                let decoded = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+                    .map_err(|e| Status::internal(format!("decode policy failed: {e}")))?;
+                debug!(
+                    sandbox_id = %sandbox_id,
+                    version = record.version,
+                    "GetSandboxConfig served from policy history"
+                );
+                (
+                    Some(decoded),
+                    u32::try_from(record.version).unwrap_or(0),
+                    record.policy_hash,
+                )
+            } else {
+                // Lazy backfill: no policy history exists yet.
+                let spec = sandbox
+                    .spec
+                    .as_ref()
+                    .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+
+                match spec.policy.clone() {
+                    None => {
+                        debug!(
+                            sandbox_id = %sandbox_id,
+                            "GetSandboxConfig: no policy configured, returning empty response"
+                        );
+                        (None, 0, String::new())
+                    }
+                    Some(spec_policy) => {
+                        let hash = deterministic_policy_hash(&spec_policy);
+                        let payload = spec_policy.encode_to_vec();
+                        let policy_id = uuid::Uuid::new_v4().to_string();
+
+                        if let Err(e) = state
+                            .store
+                            .put_policy_revision(&policy_id, &sandbox_id, 1, &payload, &hash)
+                            .await
+                        {
+                            warn!(
+                                sandbox_id = %sandbox_id,
+                                error = %e,
+                                "Failed to backfill policy version 1"
+                            );
+                        } else if let Err(e) = state
+                            .store
+                            .update_policy_status(&sandbox_id, 1, "loaded", None, None)
+                            .await
+                        {
+                            warn!(
+                                sandbox_id = %sandbox_id,
+                                error = %e,
+                                "Failed to mark backfilled policy as loaded"
+                            );
+                        }
+
+                        info!(
+                            sandbox_id = %sandbox_id,
+                            "GetSandboxConfig served from spec (backfilled version 1)"
+                        );
+
+                        (Some(spec_policy), 1, hash)
+                    }
+                }
+            }
+        };
+
+    if bundle_global_policy.is_none()
+        && let Some(global_policy) = decode_policy_from_global_settings(&global_settings)?
+    {
         policy = Some(global_policy.clone());
         policy_hash = deterministic_policy_hash(&global_policy);
         policy_source = PolicySource::Global;
@@ -1204,10 +1259,9 @@ pub(super) async fn handle_get_sandbox_config(
         }
     }
 
-    if providers_v2_enabled
-        && !matches!(policy_source, PolicySource::Global)
-        && let Some(source_policy) = policy.as_ref()
-    {
+    let should_compose_provider_layers = bundle_global_policy.is_some()
+        || (providers_v2_enabled && !matches!(policy_source, PolicySource::Global));
+    if should_compose_provider_layers && let Some(source_policy) = policy.as_ref() {
         let provider_layers =
             profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
         if !provider_layers.is_empty() {
@@ -1486,6 +1540,15 @@ async fn handle_update_config_inner(
         return Err(Status::invalid_argument(
             "one of policy, setting_key, or merge_operations must be provided",
         ));
+    }
+    if req.global
+        && strict_policy_source_enabled(state)
+        && (has_policy || key == POLICY_SETTING_KEY)
+    {
+        return Err(strict_policy_source_mutation_error());
+    }
+    if !req.global && (has_policy || has_merge_ops) && has_bundle_global_policy(state) {
+        return Err(bundle_global_policy_update_error());
     }
 
     if req.global {
@@ -2194,6 +2257,9 @@ pub(super) async fn handle_submit_policy_analysis(
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
+    if strict_policy_source_enabled(state) {
+        return Err(strict_policy_source_mutation_error());
+    }
 
     let sandbox =
         resolve_sandbox_by_name_for_principal(state.store.as_ref(), &principal, &req.name).await?;
@@ -2527,6 +2593,9 @@ async fn handle_approve_draft_chunk_inner(
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
+    if strict_policy_source_enabled(state) {
+        return Err(strict_policy_source_mutation_error());
+    }
 
     require_no_global_policy(state).await?;
 
@@ -2627,6 +2696,9 @@ async fn handle_reject_draft_chunk_inner(
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
+    if strict_policy_source_enabled(state) {
+        return Err(strict_policy_source_mutation_error());
+    }
 
     let sandbox = state
         .store
@@ -2720,6 +2792,9 @@ async fn handle_approve_all_draft_chunks_inner(
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
+    }
+    if strict_policy_source_enabled(state) {
+        return Err(strict_policy_source_mutation_error());
     }
 
     require_no_global_policy(state).await?;
@@ -2845,6 +2920,9 @@ pub(super) async fn handle_edit_draft_chunk(
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
     }
+    if strict_policy_source_enabled(state) {
+        return Err(strict_policy_source_mutation_error());
+    }
     let proposed_rule = req
         .proposed_rule
         .ok_or_else(|| Status::invalid_argument("proposed_rule is required"))?;
@@ -2908,6 +2986,9 @@ async fn handle_undo_draft_chunk_inner(
     }
     if req.chunk_id.is_empty() {
         return Err(Status::invalid_argument("chunk_id is required"));
+    }
+    if strict_policy_source_enabled(state) {
+        return Err(strict_policy_source_mutation_error());
     }
 
     let sandbox = state
@@ -2990,6 +3071,9 @@ pub(super) async fn handle_clear_draft_chunks(
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
+    }
+    if strict_policy_source_enabled(state) {
+        return Err(strict_policy_source_mutation_error());
     }
 
     let sandbox = state
@@ -3314,6 +3398,11 @@ fn validate_rule_not_always_blocked(rule: &NetworkPolicyRule) -> Result<(), Stat
 }
 
 async fn require_no_global_policy(state: &ServerState) -> Result<(), Status> {
+    if has_bundle_global_policy(state) {
+        return Err(Status::failed_precondition(
+            "cannot approve rules while a policy source global_policy is active",
+        ));
+    }
     let global = load_global_settings(state.store.as_ref()).await?;
     if global.settings.contains_key(POLICY_SETTING_KEY) {
         return Err(Status::failed_precondition(
@@ -3893,7 +3982,7 @@ mod tests {
     use crate::auth::principal::{
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
-    use crate::grpc::test_support::test_server_state;
+    use crate::grpc::test_support::{test_server_state, test_server_state_with_policy_source};
     use crate::persistence::test_store;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -4353,6 +4442,20 @@ mod tests {
             ))
             .collect(),
             ..Default::default()
+        }
+    }
+
+    fn loaded_policy_source(
+        policy: ProtoSandboxPolicy,
+        enforcement: crate::config_file::GatewayPolicyEnforcement,
+    ) -> crate::policy_source::LoadedPolicySource {
+        crate::policy_source::LoadedPolicySource {
+            global_policy: Some(crate::policy_source::LoadedGlobalPolicy {
+                name: "default".to_string(),
+                policy,
+                document_sha256: "test-digest".to_string(),
+            }),
+            enforcement,
         }
     }
 
@@ -5414,6 +5517,138 @@ mod tests {
                 .network_policies
                 .contains_key("_provider_work_github")
         );
+    }
+
+    #[tokio::test]
+    async fn bundle_global_policy_composes_provider_profile_layers() {
+        use openshell_core::proto::{
+            GetSandboxConfigRequest, NetworkEndpoint, NetworkPolicyRule, SandboxPhase,
+            SandboxPolicy, SandboxSpec,
+        };
+
+        let bundle_policy = SandboxPolicy {
+            network_policies: std::iter::once((
+                "bundle_global".to_string(),
+                NetworkPolicyRule {
+                    name: "bundle_global".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "bundle.example.com".to_string(),
+                        port: 443,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        let state = test_server_state_with_policy_source(Some(loaded_policy_source(
+            bundle_policy,
+            crate::config_file::GatewayPolicyEnforcement::Permissive,
+        )))
+        .await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-bundle-global-profile".to_string(),
+                name: "bundle-global-profile-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: vec!["work-github".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let response = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-bundle-global-profile".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let effective_policy = response.policy.expect("bundle policy should be returned");
+        assert_eq!(response.policy_source, PolicySource::Global as i32);
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("bundle_global")
+        );
+        assert!(
+            effective_policy
+                .network_policies
+                .contains_key("_provider_work_github")
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_global_policy_rejects_sandbox_policy_update() {
+        let state = test_server_state_with_policy_source(Some(loaded_policy_source(
+            openshell_policy::restrictive_default_policy(),
+            crate::config_file::GatewayPolicyEnforcement::Permissive,
+        )))
+        .await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-bundle-managed",
+                "bundle-managed",
+                openshell_policy::restrictive_default_policy(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                name: "bundle-managed".to_string(),
+                policy: Some(openshell_policy::restrictive_default_policy()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("bundle global policy should reject sandbox policy update");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("global_policy"));
+    }
+
+    #[tokio::test]
+    async fn strict_policy_source_rejects_global_policy_update() {
+        let state = test_server_state_with_policy_source(Some(loaded_policy_source(
+            openshell_policy::restrictive_default_policy(),
+            crate::config_file::GatewayPolicyEnforcement::Strict,
+        )))
+        .await;
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(openshell_policy::restrictive_default_policy()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("strict mode should reject global policy update");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("manual policy mutations"));
     }
 
     #[tokio::test]

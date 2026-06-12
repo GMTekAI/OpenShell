@@ -17,8 +17,8 @@ use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 use tracing::info;
 
-use crate::config_file::GatewayPoliciesSection;
-use crate::grpc::provider::upsert_source_provider_profile;
+use crate::config_file::{GatewayPoliciesSection, GatewayPolicyEnforcement};
+use crate::grpc::provider::{upsert_source_provider, upsert_source_provider_profile};
 use crate::grpc::validation::validate_policy_safety;
 use crate::persistence::{Store, WriteCondition};
 
@@ -28,7 +28,29 @@ const PROVIDER_KIND: &str = "provider";
 
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedPolicySource {
-    pub(crate) default_policy: Option<SandboxPolicy>,
+    pub(crate) global_policy: Option<LoadedGlobalPolicy>,
+    pub(crate) enforcement: GatewayPolicyEnforcement,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedGlobalPolicy {
+    pub(crate) name: String,
+    pub(crate) policy: SandboxPolicy,
+    pub(crate) document_sha256: String,
+}
+
+impl LoadedPolicySource {
+    pub(crate) fn global_policy(&self) -> Option<&LoadedGlobalPolicy> {
+        self.global_policy.as_ref()
+    }
+
+    pub(crate) fn has_global_policy(&self) -> bool {
+        self.global_policy.is_some()
+    }
+
+    pub(crate) fn is_strict(&self) -> bool {
+        self.enforcement == GatewayPolicyEnforcement::Strict
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,48 +90,62 @@ pub(crate) async fn load_policy_source(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let default_policy_name = config
-        .default_policy
+    let global_policy_name = config
+        .global_policy
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
 
     let Some(location) = location else {
-        if default_policy_name.is_some() {
+        if global_policy_name.is_some() {
             return Err(Error::config(
-                "[openshell.gateway.policies].location is required when default_policy is set",
+                "[openshell.gateway.policies].location is required when global_policy is set",
+            ));
+        }
+        if config.enforcement == GatewayPolicyEnforcement::Strict {
+            return Err(Error::config(
+                "[openshell.gateway.policies].location and global_policy are required when enforcement is strict",
             ));
         }
         return Ok(None);
     };
+    if config.enforcement == GatewayPolicyEnforcement::Strict && global_policy_name.is_none() {
+        return Err(Error::config(
+            "[openshell.gateway.policies].global_policy is required when enforcement is strict",
+        ));
+    }
 
     let mut source = PolicySourceConnection::connect(location).await?;
 
     let mut policy_names = source.list_policies().await?;
-    if let Some(default_name) = default_policy_name
-        && !policy_names.iter().any(|name| name == default_name)
+    if let Some(global_name) = global_policy_name
+        && !policy_names.iter().any(|name| name == global_name)
     {
-        policy_names.push(default_name.to_string());
+        policy_names.push(global_name.to_string());
     }
     policy_names.sort();
     policy_names.dedup();
 
-    let mut default_policy = None;
+    let mut global_policy = None;
     for name in &policy_names {
         validate_document_name(POLICY_KIND, name)?;
         let document = source.get_policy(name).await?;
         let policy = parse_policy_document(&document)?;
         persist_source_document(store, POLICY_KIND, &document).await?;
-        if default_policy_name.is_some_and(|default_name| default_name == name) {
-            default_policy = Some(policy);
+        if global_policy_name.is_some_and(|global_name| global_name == name) {
+            global_policy = Some(LoadedGlobalPolicy {
+                name: name.clone(),
+                policy,
+                document_sha256: document.digest_hex.clone(),
+            });
         }
     }
 
-    if let Some(default_name) = default_policy_name
-        && default_policy.is_none()
+    if let Some(global_name) = global_policy_name
+        && global_policy.is_none()
     {
         return Err(Error::config(format!(
-            "default policy '{default_name}' was not loaded from policy source"
+            "global policy '{global_name}' was not loaded from policy source"
         )));
     }
 
@@ -124,20 +160,37 @@ pub(crate) async fn load_policy_source(
         upsert_source_provider_profile(
             store,
             &format!("policy-source/{PROVIDER_KIND}/{}", document.name),
-            profile,
+            profile.clone(),
             &document.digest_hex,
         )
         .await
         .map_err(|status| Error::config(format!("provider profile source error: {status}")))?;
+        upsert_source_provider(store, &profile, &document.digest_hex)
+            .await
+            .map_err(|status| Error::config(format!("provider source error: {status}")))?;
     }
+
+    let loaded_global_name = global_policy
+        .as_ref()
+        .map(|policy| policy.name.as_str())
+        .unwrap_or("");
+    let loaded_global_sha256 = global_policy
+        .as_ref()
+        .map(|policy| policy.document_sha256.as_str())
+        .unwrap_or("");
 
     info!(
         policies = policy_names.len(),
         providers = provider_names.len(),
-        default_policy = default_policy_name.unwrap_or(""),
+        global_policy = loaded_global_name,
+        global_policy_sha256 = loaded_global_sha256,
+        enforcement = ?config.enforcement,
         "policy source loaded"
     );
-    Ok(Some(LoadedPolicySource { default_policy }))
+    Ok(Some(LoadedPolicySource {
+        global_policy,
+        enforcement: config.enforcement,
+    }))
 }
 
 impl PolicySourceConnection {
@@ -518,6 +571,7 @@ mod tests {
     };
     use crate::persistence::ObjectType;
     use openshell_core::proto::StoredProviderProfile;
+    use openshell_core::proto::datamodel::v1::Provider;
 
     #[test]
     fn parses_policy_source_locations() {
@@ -536,7 +590,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loads_file_source_default_policy_and_provider_profile() {
+    async fn loads_file_source_global_policy_and_provider_profile() {
         let root = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir(root.path().join("policies")).expect("policies dir");
         std::fs::create_dir(root.path().join("providers")).expect("providers dir");
@@ -563,6 +617,9 @@ display_name: Example
 credentials:
   - name: api_key
     env_vars: [EXAMPLE_API_KEY]
+    required: true
+    token_grant:
+      token_endpoint: https://auth.example.com/token
 "#,
         )
         .expect("provider");
@@ -570,14 +627,18 @@ credentials:
         let store = crate::persistence::test_store().await;
         let config = GatewayPoliciesSection {
             location: Some(root.path().display().to_string()),
-            default_policy: Some("default".to_string()),
+            global_policy: Some("default".to_string()),
+            enforcement: GatewayPolicyEnforcement::Permissive,
         };
         let loaded = load_policy_source(&store, Some(&config))
             .await
             .expect("load")
             .expect("configured");
 
-        assert!(loaded.default_policy.is_some());
+        assert_eq!(
+            loaded.global_policy().map(|policy| policy.name.as_str()),
+            Some("default")
+        );
         assert!(
             store
                 .get_by_name(SOURCE_DOCUMENT_OBJECT_TYPE, "policy/default")
@@ -599,5 +660,33 @@ credentials:
         );
         assert!(labels.contains_key(SOURCE_PROVIDER_PROFILE_DIGEST_PREFIX_LABEL_KEY));
         assert_eq!(StoredProviderProfile::object_type(), "provider_profile");
+
+        let provider = store
+            .get_message_by_name::<Provider>("example")
+            .await
+            .expect("provider")
+            .expect("source provider persisted");
+        assert_eq!(provider.r#type, "example");
+        let labels = provider.metadata.expect("metadata").labels;
+        assert_eq!(
+            labels
+                .get(SOURCE_PROVIDER_PROFILE_LABEL_KEY)
+                .map(String::as_str),
+            Some(SOURCE_PROVIDER_PROFILE_LABEL_VALUE)
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_enforcement_requires_global_policy() {
+        let store = crate::persistence::test_store().await;
+        let config = GatewayPoliciesSection {
+            location: None,
+            global_policy: None,
+            enforcement: GatewayPolicyEnforcement::Strict,
+        };
+        let err = load_policy_source(&store, Some(&config))
+            .await
+            .expect_err("strict mode without global_policy must fail");
+        assert!(err.to_string().contains("global_policy"));
     }
 }

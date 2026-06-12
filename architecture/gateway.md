@@ -442,9 +442,14 @@ provider profiles as source-backed. Source-backed profiles may be updated by the
 source on restart, but regular provider profile import/delete APIs cannot
 overwrite or remove them.
 
-`default_policy` names the policy applied to new sandboxes when
-`CreateSandbox` omits `spec.policy`. Request-supplied policies remain the
-highest-precedence sandbox policy input for creation.
+`global_policy` names the source policy used as the effective global policy for
+all sandboxes. Sandbox create requests cannot provide their own policy payload
+while a source global policy is active. Provider profile policy layers still
+compose on top of the source global policy when providers are attached.
+
+`enforcement = "strict"` also disables manual policy and provider mutation
+APIs while keeping sandbox provider attach/detach available for source-backed
+providers.
 
 ### Driver inheritance
 

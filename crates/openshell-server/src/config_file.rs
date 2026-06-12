@@ -171,9 +171,20 @@ pub struct GatewayPoliciesSection {
     /// Filesystem location or `grpc+unix://` socket serving YAML documents.
     #[serde(default)]
     pub location: Option<String>,
-    /// Policy document name applied when `CreateSandbox` omits `spec.policy`.
+    /// Policy document name used as the gateway-global policy.
     #[serde(default)]
-    pub default_policy: Option<String>,
+    pub global_policy: Option<String>,
+    /// Whether the policy source also locks down manual policy/provider mutation APIs.
+    #[serde(default)]
+    pub enforcement: GatewayPolicyEnforcement,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayPolicyEnforcement {
+    #[default]
+    Permissive,
+    Strict,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -497,7 +508,8 @@ version = 1
 
 [openshell.gateway.policies]
 location = "grpc+unix:///var/run/openshell/policy-source.sock"
-default_policy = "default"
+global_policy = "default"
+enforcement = "strict"
 "#;
         let tmp = write_tmp(toml);
         let config = load(tmp.path()).expect("policy source config should parse");
@@ -506,7 +518,23 @@ default_policy = "default"
             policies.location.as_deref(),
             Some("grpc+unix:///var/run/openshell/policy-source.sock")
         );
-        assert_eq!(policies.default_policy.as_deref(), Some("default"));
+        assert_eq!(policies.global_policy.as_deref(), Some("default"));
+        assert_eq!(policies.enforcement, GatewayPolicyEnforcement::Strict);
+    }
+
+    #[test]
+    fn rejects_deprecated_default_policy_field() {
+        let toml = r#"
+[openshell]
+version = 1
+
+[openshell.gateway.policies]
+location = "grpc+unix:///var/run/openshell/policy-source.sock"
+default_policy = "default"
+"#;
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("default_policy should be rejected");
+        assert!(matches!(err, ConfigFileError::Parse { .. }));
     }
 
     #[test]

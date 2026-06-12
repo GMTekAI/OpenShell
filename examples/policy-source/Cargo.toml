@@ -27,5 +27,9 @@ path = "src/main.rs"
 name = "policy-source-check"
 path = "src/bin/check.rs"
 
+[[bin]]
+name = "policy-source-gateway-check"
+path = "src/bin/gateway_check.rs"
+
 [lints]
 workspace = true

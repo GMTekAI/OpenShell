@@ -14,4 +14,5 @@ log_level = "info"
 
 [openshell.gateway.policies]
 location = "grpc+unix:///tmp/openshell-policy-source.sock"
-default_policy = "default"
+global_policy = "default"
+enforcement = "strict"
