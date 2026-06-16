@@ -229,6 +229,53 @@ server:
     # -- Gateway runtime settings rendered under [openshell.runtime.settings].
     # Values must match registered runtime setting types.
     settings: {}
+  sandboxPodExtensions:
+    # -- Operator-owned volumes added to every sandbox pod. Each entry must set
+    # exactly one source: emptyDir, configMapName, or secretName.
+    volumes: []
+    # -- Operator-owned volume mounts added to the sandbox agent container.
+    # Mounts may only reference sandboxPodExtensions.volumes.
+    agentVolumeMounts: []
+    # -- Operator-owned sidecar containers added to every sandbox pod.
+    # Sidecars may only mount sandboxPodExtensions.volumes.
+    sidecars: []
+  sandboxLogCollection:
+    # -- Mount a shared log volume into sandbox pods and set OPENSHELL_LOG_DIR.
+    enabled: false
+    # -- Shared volume name for sandbox supervisor log files.
+    volumeName: openshell-logs
+    # -- Agent and collector mount path for sandbox supervisor log files.
+    mountPath: /var/log/openshell
+    sidecar:
+      # -- Add a collector sidecar that reads the shared log volume.
+      enabled: false
+      # -- Collector sidecar container name.
+      name: openshell-log-collector
+      # -- Collector sidecar image.
+      image: ""
+      # -- Collector sidecar Kubernetes imagePullPolicy. Empty uses the Kubernetes default.
+      imagePullPolicy: ""
+      # -- Collector sidecar command override.
+      command: []
+      # -- Collector sidecar args.
+      args: []
+      # -- Collector sidecar environment variables.
+      env: {}
+      # -- Additional collector sidecar mounts from sandboxPodExtensions.volumes.
+      volumeMounts: []
+      configMap:
+        # -- Create a ConfigMap in the sandbox namespace for collector sidecar config.
+        create: false
+        # -- Existing or generated collector ConfigMap name.
+        name: ""
+        # -- ConfigMap key containing the collector config file.
+        key: config.yaml
+        # -- Mount path for the collector config ConfigMap.
+        mountPath: /etc/otelcol
+        # -- Collector config file contents when configMap.create=true.
+        contents: ""
+      # -- Collector sidecar resource requests and limits.
+      resources: {}
   auth:
     # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
     # principal. Intended only for trusted local Skaffold/k3d development or a

@@ -1841,6 +1841,52 @@ default_image = "k8s-specific:1.0"
     }
 
     #[test]
+    fn kubernetes_driver_reads_log_collection_extensions_from_toml() {
+        let file = config_file_from_toml(
+            r#"
+[openshell.drivers.kubernetes]
+namespace = "agents"
+
+[[openshell.drivers.kubernetes.pod_extensions.volumes]]
+name = "otel-config"
+config_map_name = "openshell-sandbox-log-collector"
+
+[[openshell.drivers.kubernetes.pod_extensions.sidecars]]
+name = "support-sidecar"
+image = "busybox:1.36"
+args = ["sleep", "3600"]
+
+[openshell.drivers.kubernetes.log_collection]
+enabled = true
+
+[openshell.drivers.kubernetes.log_collection.sidecar]
+enabled = true
+image = "otel/opentelemetry-collector-contrib:0.153.0"
+args = ["--config=/etc/otelcol/config.yaml"]
+
+[[openshell.drivers.kubernetes.log_collection.sidecar.volume_mounts]]
+name = "otel-config"
+mount_path = "/etc/otelcol"
+read_only = true
+"#,
+        );
+        let merged = crate::config_file::driver_table(
+            super::ComputeDriverKind::Kubernetes,
+            &file.openshell.gateway,
+            file.openshell.drivers.get("kubernetes"),
+        );
+        let parsed = merged
+            .try_into::<openshell_driver_kubernetes::KubernetesComputeConfig>()
+            .expect("deserializes");
+
+        parsed.validate().expect("validates");
+        assert!(parsed.log_collection.enabled);
+        assert!(parsed.log_collection.sidecar.enabled);
+        assert_eq!(parsed.pod_extensions.volumes[0].name, "otel-config");
+        assert_eq!(parsed.pod_extensions.sidecars[0].name, "support-sidecar");
+    }
+
+    #[test]
     fn docker_config_reads_bind_mount_opt_in_from_driver_table() {
         let file = config_file_from_toml(
             r"

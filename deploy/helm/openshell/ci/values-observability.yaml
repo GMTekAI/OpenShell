@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Local observability overlay for Skaffold development. Use with the optional
+# Loki, OpenTelemetry Collector, and Grafana releases in skaffold.yaml.
+
+server:
+  runtimeConfig:
+    enabled: true
+    settings:
+      ocsf_json_enabled: true
+  sandboxLogCollection:
+    enabled: true
+    sidecar:
+      enabled: true
+      image: otel/opentelemetry-collector-contrib:0.153.0
+      imagePullPolicy: IfNotPresent
+      args:
+        - --config=/etc/otelcol/config.yaml
+      configMap:
+        create: true
+        contents: |
+          receivers:
+            filelog:
+              include:
+                - /var/log/openshell/openshell.*.log
+                - /var/log/openshell/openshell-ocsf.*.log
+              start_at: beginning
+              include_file_name: true
+              include_file_path: true
+
+          processors:
+            batch: {}
+            resource:
+              attributes:
+                - key: service.name
+                  value: openshell-sandbox
+                  action: upsert
+                - key: service.namespace
+                  value: openshell
+                  action: upsert
+                - key: openshell.log.source
+                  value: file
+                  action: upsert
+
+          exporters:
+            otlp:
+              endpoint: opentelemetry-collector.observability.svc.cluster.local:4317
+              tls:
+                insecure: true
+
+          service:
+            pipelines:
+              logs:
+                receivers: [filelog]
+                processors: [resource, batch]
+                exporters: [otlp]
+      resources:
+        requests:
+          cpu: 25m
+          memory: 96Mi
+        limits:
+          memory: 256Mi

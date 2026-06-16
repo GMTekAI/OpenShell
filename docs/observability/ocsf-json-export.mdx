@@ -35,7 +35,9 @@ openshell settings set --global --key ocsf_json_enabled --value false
 
 ## Output Location
 
-When enabled, OCSF JSON records are written to `/var/log/openshell-ocsf.YYYY-MM-DD.log` inside the sandbox. The file rotates daily and retains the 3 most recent files, matching the main log file rotation.
+When enabled, OCSF JSON records are written to `${OPENSHELL_LOG_DIR}/openshell-ocsf.YYYY-MM-DD.log` inside the sandbox. `OPENSHELL_LOG_DIR` defaults to `/var/log`, so the default path is `/var/log/openshell-ocsf.YYYY-MM-DD.log`. The file rotates daily and retains the 3 most recent files, matching the main log file rotation.
+
+Kubernetes log collection sets `OPENSHELL_LOG_DIR` to `/var/log/openshell` so an operator-managed sidecar can read the JSONL file from a shared volume.
 
 ## JSON Record Structure
 

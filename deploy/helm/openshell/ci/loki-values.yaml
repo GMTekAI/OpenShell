@@ -1,0 +1,54 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Local Loki values for Skaffold observability testing.
+
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false
+  useTestSchema: true
+  commonConfig:
+    replication_factor: 1
+  limits_config:
+    allow_structured_metadata: true
+    reject_old_samples: false
+    volume_enabled: true
+  storage:
+    type: filesystem
+
+singleBinary:
+  replicas: 1
+  persistence:
+    enabled: true
+    size: 1Gi
+
+read:
+  replicas: 0
+write:
+  replicas: 0
+backend:
+  replicas: 0
+
+gateway:
+  enabled: true
+
+chunksCache:
+  enabled: false
+
+resultsCache:
+  enabled: false
+
+lokiCanary:
+  enabled: false
+
+test:
+  enabled: false
+
+monitoring:
+  dashboards:
+    enabled: false
+  rules:
+    enabled: false
+  selfMonitoring:
+    enabled: false

@@ -102,8 +102,15 @@ sandbox workload directly. The relay supports:
 - Port forwarding where supported by the CLI/TUI surface.
 
 Sandbox logs are emitted locally and can also be pushed back to the gateway.
-Security-relevant sandbox behavior uses OCSF structured events; internal
-diagnostics use ordinary tracing.
+The local files are the durable record. The gateway push path is a bounded,
+best-effort diagnostic stream for CLI/TUI views and can drop or lose records
+when the gateway rotates.
+
+The supervisor writes files under `OPENSHELL_LOG_DIR`, defaulting to
+`/var/log`. Kubernetes deployments can mount that directory from a shared
+volume and attach an operator-owned collector sidecar. Security-relevant
+sandbox behavior uses OCSF structured events; internal diagnostics use ordinary
+tracing.
 
 ## Policy Proposals
 

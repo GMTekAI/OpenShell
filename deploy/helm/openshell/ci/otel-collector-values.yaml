@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Local OpenTelemetry Collector pipeline for Skaffold observability testing.
+# Receives OTLP logs from sandbox sidecar collectors and exports them to Loki's
+# native OTLP ingestion endpoint.
+
+mode: deployment
+
+image:
+  repository: otel/opentelemetry-collector-contrib
+
+command:
+  name: otelcol-contrib
+
+ports:
+  jaeger-compact:
+    enabled: false
+  jaeger-thrift:
+    enabled: false
+  jaeger-grpc:
+    enabled: false
+  zipkin:
+    enabled: false
+  metrics:
+    enabled: false
+
+alternateConfig:
+  extensions:
+    health_check:
+      endpoint: ${env:MY_POD_IP}:13133
+
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: ${env:MY_POD_IP}:4317
+        http:
+          endpoint: ${env:MY_POD_IP}:4318
+
+  processors:
+    batch: {}
+    memory_limiter:
+      check_interval: 5s
+      limit_percentage: 80
+      spike_limit_percentage: 25
+    resource:
+      attributes:
+        - key: deployment.environment.name
+          value: local-skaffold
+          action: upsert
+
+  exporters:
+    otlphttp/loki:
+      endpoint: http://loki-gateway.observability.svc.cluster.local/otlp
+
+  service:
+    extensions: [health_check]
+    pipelines:
+      logs:
+        receivers: [otlp]
+        processors: [memory_limiter, resource, batch]
+        exporters: [otlphttp/loki]
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

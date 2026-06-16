@@ -11,7 +11,8 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, SupervisorSideloadMethod,
+    KubernetesComputeConfig, KubernetesComputeDriver, KubernetesLogCollectionConfig,
+    KubernetesPodExtensionsConfig, SupervisorSideloadMethod,
 };
 
 #[derive(Parser, Debug)]
@@ -135,6 +136,8 @@ async fn main() -> Result<()> {
         provider_spiffe_workload_api_socket_path: args
             .provider_spiffe_workload_api_socket_path
             .unwrap_or_default(),
+        pod_extensions: KubernetesPodExtensionsConfig::default(),
+        log_collection: KubernetesLogCollectionConfig::default(),
     })
     .await
     .into_diagnostic()?;

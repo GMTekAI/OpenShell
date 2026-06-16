@@ -196,6 +196,28 @@ label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET`, plus both the projected
 `openshell-sa-token` volume and the `spiffe-workload-api` CSI volume.
 
+If sandbox log collection is enabled, verify that the rendered gateway config
+contains the Kubernetes log collection tables and that the collector ConfigMap
+exists in the sandbox namespace:
+
+```bash
+helm -n openshell get values openshell | grep -E 'sandboxLogCollection|sandboxPodExtensions'
+kubectl -n openshell get configmap openshell-config -o yaml | grep -E 'log_collection|pod_extensions|OPENSHELL_LOG_DIR'
+kubectl -n <sandbox-namespace> get configmap openshell-sandbox-log-collector -o yaml
+```
+
+Sandbox pods with log collection should have `OPENSHELL_LOG_DIR` set to the
+shared mount path, an `openshell-logs` volume, an agent mount at that path, and
+the `openshell-log-collector` sidecar mounted read-only on the same volume. If
+the sidecar is crash-looping, inspect the sidecar logs and the mounted collector
+config:
+
+```bash
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{.spec.containers[*].name}{"\n"}'
+kubectl -n <sandbox-namespace> get pod <sandbox-pod> -o jsonpath='{.spec.containers[?(@.name=="agent")].env[?(@.name=="OPENSHELL_LOG_DIR")].value}{"\n"}'
+kubectl -n <sandbox-namespace> logs <sandbox-pod> -c openshell-log-collector --tail=200
+```
+
 Check the image references currently used by the gateway deployment:
 
 ```bash

@@ -101,6 +101,36 @@ deploy:
       #  valuesFiles:
       #    - ci/values-spire-stack.yaml
       #  wait: true
+      # Local observability stack — Loki, OpenTelemetry Collector, and Grafana.
+      # Uncomment these releases and ci/values-observability.yaml below to
+      # collect sandbox file-backed logs into Loki for local validation.
+      #- name: loki
+      #  repo: https://grafana.github.io/helm-charts
+      #  remoteChart: loki
+      #  version: 7.0.0
+      #  namespace: observability
+      #  createNamespace: true
+      #  valuesFiles:
+      #    - ci/loki-values.yaml
+      #  wait: true
+      #- name: opentelemetry-collector
+      #  repo: https://open-telemetry.github.io/opentelemetry-helm-charts
+      #  remoteChart: opentelemetry-collector
+      #  version: 0.158.1
+      #  namespace: observability
+      #  createNamespace: true
+      #  valuesFiles:
+      #    - ci/otel-collector-values.yaml
+      #  wait: true
+      #- name: grafana
+      #  repo: https://grafana.github.io/helm-charts
+      #  remoteChart: grafana
+      #  version: 10.5.15
+      #  namespace: observability
+      #  createNamespace: true
+      #  valuesFiles:
+      #    - ci/grafana-values.yaml
+      #  wait: true
       - name: openshell
         chartPath: .
         namespace: openshell
@@ -122,6 +152,9 @@ deploy:
           #- ci/values-spire.yaml
           # To test multi-replica external PostgreSQL behavior:
           #- ci/values-high-availability.yaml
+          # To collect sandbox file-backed logs through the local Loki,
+          # OpenTelemetry Collector, and Grafana stack above:
+          #- ci/values-observability.yaml
         setValueTemplates:
           image.repository: '{{.IMAGE_REPO_openshell_gateway}}'
           image.tag: '{{.IMAGE_TAG_openshell_gateway}}'

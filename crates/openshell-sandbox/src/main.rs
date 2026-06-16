@@ -3,7 +3,7 @@
 
 //! `OpenShell` Sandbox - process sandbox and monitor.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -35,6 +35,9 @@ const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
+
+/// Default directory for local sandbox supervisor log files.
+const DEFAULT_LOG_DIR: &str = "/var/log";
 
 /// Which supervisor leaves are enabled in this process.
 ///
@@ -125,6 +128,10 @@ struct Args {
     #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
+    /// Directory for local rolling log files.
+    #[arg(long, default_value = DEFAULT_LOG_DIR, env = openshell_core::sandbox_env::LOG_DIR)]
+    log_dir: PathBuf,
+
     /// Filesystem path to the Unix socket the embedded SSH daemon binds.
     /// The supervisor bridges `RelayStream` traffic from the gateway onto
     /// this socket; nothing else should connect to it.
@@ -194,6 +201,24 @@ fn copy_self(dest: &str) -> Result<()> {
     Ok(())
 }
 
+fn rolling_log_writer(
+    log_dir: &Path,
+    prefix: &str,
+) -> Option<(
+    tracing_appender::non_blocking::NonBlocking,
+    tracing_appender::non_blocking::WorkerGuard,
+)> {
+    std::fs::create_dir_all(log_dir).ok()?;
+    tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(prefix)
+        .filename_suffix("log")
+        .max_log_files(3)
+        .build(log_dir)
+        .ok()
+        .map(tracing_appender::non_blocking)
+}
+
 fn main() -> Result<()> {
     // Handle `copy-self <DEST>` before clap so it works without any of the
     // sandbox flags. Kubernetes init containers invoke this path to seed an
@@ -225,17 +250,7 @@ fn main() -> Result<()> {
     // Try to open a rolling log file; fall back to stderr-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
     // Rotates daily, keeps the 3 most recent files to bound disk usage.
-    let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
-        .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("openshell")
-        .filename_suffix("log")
-        .max_log_files(3)
-        .build("/var/log")
-        .ok()
-        .map(|roller| {
-            let (writer, guard) = tracing_appender::non_blocking(roller);
-            (writer, guard)
-        });
+    let file_logging = rolling_log_writer(&args.log_dir, "openshell");
 
     let console_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
@@ -279,15 +294,8 @@ fn main() -> Result<()> {
             // OCSF JSONL file: rolling appender matching the main log file
             // (daily rotation, 3 files max). Created eagerly but gated by the
             // enabled flag — no JSONL is written until ocsf_json_enabled is set.
-            let jsonl_logging = tracing_appender::rolling::RollingFileAppender::builder()
-                .rotation(tracing_appender::rolling::Rotation::DAILY)
-                .filename_prefix("openshell-ocsf")
-                .filename_suffix("log")
-                .max_log_files(3)
-                .build("/var/log")
-                .ok()
-                .map(|roller| {
-                    let (writer, guard) = tracing_appender::non_blocking(roller);
+            let jsonl_logging =
+                rolling_log_writer(&args.log_dir, "openshell-ocsf").map(|(writer, guard)| {
                     let layer = OcsfJsonlLayer::new(writer).with_enabled_flag(ocsf_enabled.clone());
                     (layer, guard)
                 });
@@ -321,7 +329,10 @@ fn main() -> Result<()> {
                 .with(push_layer)
                 .init();
             // Log the warning after the subscriber is initialized
-            warn!("Could not open /var/log for log rotation; using stderr-only logging");
+            warn!(
+                log_dir = %args.log_dir.display(),
+                "Could not open sandbox log directory for log rotation; using stderr-only logging"
+            );
             (None, None)
         };
 
@@ -389,6 +400,30 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&final_path, perms).into_diagnostic()?;
         Ok(())
+    }
+
+    #[test]
+    fn default_log_dir_is_var_log() {
+        let args = Args::try_parse_from(["openshell-sandbox"]).unwrap();
+        assert_eq!(args.log_dir, PathBuf::from(DEFAULT_LOG_DIR));
+    }
+
+    #[test]
+    fn log_dir_can_be_overridden_by_flag() {
+        let args = Args::try_parse_from(["openshell-sandbox", "--log-dir", "/tmp/openshell-logs"])
+            .unwrap();
+        assert_eq!(args.log_dir, PathBuf::from("/tmp/openshell-logs"));
+    }
+
+    #[test]
+    fn rolling_log_writer_creates_log_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_dir = tmp.path().join("logs");
+
+        let writer = rolling_log_writer(&log_dir, "openshell-test");
+
+        assert!(writer.is_some());
+        assert!(log_dir.is_dir());
     }
 
     #[test]

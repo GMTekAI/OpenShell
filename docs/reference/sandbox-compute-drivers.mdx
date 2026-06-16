@@ -307,6 +307,8 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `app_armor_profile` | `server.appArmorProfile` | Set the sandbox agent container's AppArmor profile. Helm defaults this to `Unconfined` so AppArmor-enabled nodes do not block supervisor network namespace setup. Set the Helm value to an empty string to omit the field, or use `RuntimeDefault` or `Localhost/<profile-name>` for operator-managed profiles. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
+| `pod_extensions` | `server.sandboxPodExtensions` | Add operator-owned volumes, agent volume mounts, and sidecars to every sandbox pod. Volumes support `emptyDir`, `configMapName`, or `secretName`; mounts cannot target reserved OpenShell control paths. |
+| `log_collection` | `server.sandboxLogCollection` | Mount a shared log volume, set `OPENSHELL_LOG_DIR`, and optionally add a collector sidecar that reads file-backed sandbox logs. |
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
 

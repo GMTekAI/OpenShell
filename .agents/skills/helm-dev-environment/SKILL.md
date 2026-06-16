@@ -1,6 +1,6 @@
 ---
 name: helm-dev-environment
-description: Start up, tear down, and configure the local Kubernetes development environment for OpenShell. Uses k3d (Docker-backed k3s) + Skaffold + Helm. Covers cluster lifecycle, optional add-ons (Keycloak OIDC, Envoy Gateway), HA testing, and port mappings. Trigger keywords - local k8s, local cluster, k3d, skaffold, helm dev, start cluster, stop cluster, tear down cluster, delete cluster, create cluster, helm:k3s, helm:skaffold, local dev environment, dev cluster, k8s dev, envoy gateway local, keycloak local, high availability, HA.
+description: Start up, tear down, and configure the local Kubernetes development environment for OpenShell. Uses k3d (Docker-backed k3s) + Skaffold + Helm. Covers cluster lifecycle, optional add-ons (Keycloak OIDC, Envoy Gateway, local observability), HA testing, and port mappings. Trigger keywords - local k8s, local cluster, k3d, skaffold, helm dev, start cluster, stop cluster, tear down cluster, delete cluster, create cluster, helm:k3s, helm:skaffold, local dev environment, dev cluster, k8s dev, envoy gateway local, keycloak local, observability, high availability, HA.
 ---
 
 # Helm Dev Environment
@@ -195,6 +195,22 @@ OpenShell mounts the SPIFFE CSI Workload API socket at
 grants. Supervisor-to-gateway authentication remains on the Kubernetes
 ServiceAccount bootstrap and gateway-minted sandbox JWT path.
 
+### Local Observability
+
+Skaffold can install Loki, OpenTelemetry Collector, and Grafana for file-backed
+sandbox log collection. To activate:
+
+1. Uncomment the `loki`, `opentelemetry-collector`, and `grafana` releases in
+   `deploy/helm/openshell/skaffold.yaml`
+2. Uncomment `#- ci/values-observability.yaml` in the OpenShell release values files
+3. Redeploy: `mise run helm:skaffold:run`
+
+`ci/values-observability.yaml` enables runtime OCSF JSONL, mounts
+`/var/log/openshell` as the sandbox log directory, and adds an OpenTelemetry
+Collector sidecar to sandbox pods. The sidecar tails `openshell.*.log` and
+`openshell-ocsf.*.log`, sends OTLP logs to the central collector in the
+`observability` namespace, and the central collector exports to Loki.
+
 ---
 
 ## Cluster Lifecycle (suspend/resume)
@@ -250,6 +266,10 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
+| `deploy/helm/openshell/ci/values-observability.yaml` | OpenShell overlay for sandbox log sidecar collection |
+| `deploy/helm/openshell/ci/loki-values.yaml` | Local Loki chart values |
+| `deploy/helm/openshell/ci/otel-collector-values.yaml` | Local OpenTelemetry Collector chart values |
+| `deploy/helm/openshell/ci/grafana-values.yaml` | Local Grafana chart values |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |

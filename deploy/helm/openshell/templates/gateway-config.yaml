@@ -144,3 +144,135 @@ data:
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
+    {{- $extensions := .Values.server.sandboxPodExtensions | default dict }}
+    {{- $logCollection := .Values.server.sandboxLogCollection | default dict }}
+    {{- $logSidecar := $logCollection.sidecar | default dict }}
+    {{- $logSidecarConfigMap := $logSidecar.configMap | default dict }}
+    {{- $logSidecarConfigMapEnabled := and ($logCollection.enabled | default false) ($logSidecar.enabled | default false) (or ($logSidecarConfigMap.create | default false) $logSidecarConfigMap.name) }}
+    {{- if $logSidecarConfigMapEnabled }}
+
+    [[openshell.drivers.kubernetes.pod_extensions.volumes]]
+    name = "openshell-log-collector-config"
+    config_map_name = {{ include "openshell.sandboxLogCollectorConfigMapName" . | quote }}
+    {{- end }}
+    {{- range $volume := ($extensions.volumes | default list) }}
+
+    [[openshell.drivers.kubernetes.pod_extensions.volumes]]
+    name = {{ $volume.name | quote }}
+    {{- if $volume.emptyDir }}
+    empty_dir = true
+    {{- end }}
+    {{- if $volume.configMapName }}
+    config_map_name = {{ $volume.configMapName | quote }}
+    {{- end }}
+    {{- if $volume.secretName }}
+    secret_name = {{ $volume.secretName | quote }}
+    {{- end }}
+    {{- end }}
+    {{- range $mount := ($extensions.agentVolumeMounts | default list) }}
+
+    [[openshell.drivers.kubernetes.pod_extensions.agent_volume_mounts]]
+    name       = {{ $mount.name | quote }}
+    mount_path = {{ $mount.mountPath | quote }}
+    {{- if $mount.readOnly }}
+    read_only  = true
+    {{- end }}
+    {{- end }}
+    {{- range $sidecar := ($extensions.sidecars | default list) }}
+
+    [[openshell.drivers.kubernetes.pod_extensions.sidecars]]
+    name  = {{ $sidecar.name | quote }}
+    image = {{ $sidecar.image | quote }}
+    {{- if $sidecar.imagePullPolicy }}
+    image_pull_policy = {{ $sidecar.imagePullPolicy | quote }}
+    {{- end }}
+    {{- if $sidecar.command }}
+    command = {{ $sidecar.command | toJson }}
+    {{- end }}
+    {{- if $sidecar.args }}
+    args = {{ $sidecar.args | toJson }}
+    {{- end }}
+    {{- if $sidecar.env }}
+    [openshell.drivers.kubernetes.pod_extensions.sidecars.env]
+    {{- range $key, $value := $sidecar.env }}
+    {{ $key | quote }} = {{ $value | quote }}
+    {{- end }}
+    {{- end }}
+    {{- range $mount := ($sidecar.volumeMounts | default list) }}
+    [[openshell.drivers.kubernetes.pod_extensions.sidecars.volume_mounts]]
+    name       = {{ $mount.name | quote }}
+    mount_path = {{ $mount.mountPath | quote }}
+    {{- if $mount.readOnly }}
+    read_only  = true
+    {{- end }}
+    {{- end }}
+    {{- $sidecarResources := $sidecar.resources | default dict }}
+    {{- with $sidecarResources.requests }}
+    [openshell.drivers.kubernetes.pod_extensions.sidecars.resources.requests]
+    {{- range $key, $value := . }}
+    {{ $key | quote }} = {{ $value | quote }}
+    {{- end }}
+    {{- end }}
+    {{- with $sidecarResources.limits }}
+    [openshell.drivers.kubernetes.pod_extensions.sidecars.resources.limits]
+    {{- range $key, $value := . }}
+    {{ $key | quote }} = {{ $value | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- if ($logCollection.enabled | default false) }}
+
+    [openshell.drivers.kubernetes.log_collection]
+    enabled     = true
+    volume_name = {{ $logCollection.volumeName | default "openshell-logs" | quote }}
+    mount_path  = {{ $logCollection.mountPath | default "/var/log/openshell" | quote }}
+    {{- if ($logSidecar.enabled | default false) }}
+
+    [openshell.drivers.kubernetes.log_collection.sidecar]
+    enabled = true
+    name    = {{ $logSidecar.name | default "openshell-log-collector" | quote }}
+    image   = {{ $logSidecar.image | quote }}
+    {{- if $logSidecar.imagePullPolicy }}
+    image_pull_policy = {{ $logSidecar.imagePullPolicy | quote }}
+    {{- end }}
+    {{- if $logSidecar.command }}
+    command = {{ $logSidecar.command | toJson }}
+    {{- end }}
+    {{- if $logSidecar.args }}
+    args = {{ $logSidecar.args | toJson }}
+    {{- end }}
+    {{- if $logSidecar.env }}
+    [openshell.drivers.kubernetes.log_collection.sidecar.env]
+    {{- range $key, $value := $logSidecar.env }}
+    {{ $key | quote }} = {{ $value | quote }}
+    {{- end }}
+    {{- end }}
+    {{- if $logSidecarConfigMapEnabled }}
+    [[openshell.drivers.kubernetes.log_collection.sidecar.volume_mounts]]
+    name       = "openshell-log-collector-config"
+    mount_path = {{ $logSidecarConfigMap.mountPath | default "/etc/otelcol" | quote }}
+    read_only  = true
+    {{- end }}
+    {{- range $mount := ($logSidecar.volumeMounts | default list) }}
+    [[openshell.drivers.kubernetes.log_collection.sidecar.volume_mounts]]
+    name       = {{ $mount.name | quote }}
+    mount_path = {{ $mount.mountPath | quote }}
+    {{- if $mount.readOnly }}
+    read_only  = true
+    {{- end }}
+    {{- end }}
+    {{- $logSidecarResources := $logSidecar.resources | default dict }}
+    {{- with $logSidecarResources.requests }}
+    [openshell.drivers.kubernetes.log_collection.sidecar.resources.requests]
+    {{- range $key, $value := . }}
+    {{ $key | quote }} = {{ $value | quote }}
+    {{- end }}
+    {{- end }}
+    {{- with $logSidecarResources.limits }}
+    [openshell.drivers.kubernetes.log_collection.sidecar.resources.limits]
+    {{- range $key, $value := . }}
+    {{ $key | quote }} = {{ $value | quote }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    {{- end }}

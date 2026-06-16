@@ -4,6 +4,7 @@
 suite: gateway TOML config shape
 templates:
   - templates/gateway-config.yaml
+  - templates/sandbox-log-collector-config.yaml
   - templates/deployment.yaml
   - templates/statefulset.yaml
 release:
@@ -119,6 +120,101 @@ tests:
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: 'image_pull_secrets\s*='
+
+  - it: omits sandbox log collection config by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.drivers\.kubernetes\.log_collection\]'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.drivers\.kubernetes\.pod_extensions\]'
+
+  - it: renders sandbox pod extensions and log collection sidecar config
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxPodExtensions.volumes:
+        - name: otel-config
+          configMapName: openshell-otel-config
+      server.sandboxPodExtensions.sidecars:
+        - name: support-sidecar
+          image: busybox:1.36
+          args:
+            - sleep
+            - "3600"
+          env:
+            SUPPORT_MODE: test
+          volumeMounts:
+            - name: otel-config
+              mountPath: /etc/support
+              readOnly: true
+          resources:
+            requests:
+              cpu: 10m
+      server.sandboxLogCollection.enabled: true
+      server.sandboxLogCollection.sidecar.enabled: true
+      server.sandboxLogCollection.sidecar.image: otel/opentelemetry-collector-contrib:latest
+      server.sandboxLogCollection.sidecar.args:
+        - --config=/etc/otelcol/config.yaml
+      server.sandboxLogCollection.sidecar.volumeMounts:
+        - name: otel-config
+          mountPath: /etc/otelcol
+          readOnly: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[\[openshell\.drivers\.kubernetes\.pod_extensions\.volumes\]\].*?name\s*=\s*"otel-config".*?config_map_name\s*=\s*"openshell-otel-config"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[\[openshell\.drivers\.kubernetes\.pod_extensions\.sidecars\]\].*?name\s*=\s*"support-sidecar".*?image\s*=\s*"busybox:1.36".*?"SUPPORT_MODE"\s*=\s*"test"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.log_collection\].*?enabled\s*=\s*true.*?mount_path\s*=\s*"/var/log/openshell"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\.log_collection\.sidecar\].*?image\s*=\s*"otel/opentelemetry-collector-contrib:latest".*?args\s*=\s*\["--config=/etc/otelcol/config.yaml"\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[\[openshell\.drivers\.kubernetes\.log_collection\.sidecar\.volume_mounts\]\].*?name\s*=\s*"otel-config".*?mount_path\s*=\s*"/etc/otelcol".*?read_only\s*=\s*true'
+
+  - it: renders managed sandbox log collector ConfigMap and mount
+    template: templates/sandbox-log-collector-config.yaml
+    set:
+      server.sandboxLogCollection.enabled: true
+      server.sandboxLogCollection.sidecar.enabled: true
+      server.sandboxLogCollection.sidecar.image: otel/opentelemetry-collector-contrib:latest
+      server.sandboxLogCollection.sidecar.configMap.create: true
+      server.sandboxLogCollection.sidecar.configMap.contents: |
+        receivers:
+          filelog:
+            include:
+              - /var/log/openshell/*.log
+    asserts:
+      - equal:
+          path: metadata.name
+          value: openshell-sandbox-log-collector
+      - equal:
+          path: metadata.namespace
+          value: my-namespace
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'filelog'
+
+  - it: mounts managed sandbox log collector ConfigMap into the log sidecar
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxLogCollection.enabled: true
+      server.sandboxLogCollection.sidecar.enabled: true
+      server.sandboxLogCollection.sidecar.image: otel/opentelemetry-collector-contrib:latest
+      server.sandboxLogCollection.sidecar.configMap.create: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[\[openshell\.drivers\.kubernetes\.pod_extensions\.volumes\]\].*?name\s*=\s*"openshell-log-collector-config".*?config_map_name\s*=\s*"openshell-sandbox-log-collector"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[\[openshell\.drivers\.kubernetes\.log_collection\.sidecar\.volume_mounts\]\].*?name\s*=\s*"openshell-log-collector-config".*?mount_path\s*=\s*"/etc/otelcol"'
 
   - it: does not render local mTLS user auth for Kubernetes deployments
     template: templates/gateway-config.yaml

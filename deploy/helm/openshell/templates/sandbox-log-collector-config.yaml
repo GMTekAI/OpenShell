@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+{{- $logCollection := .Values.server.sandboxLogCollection | default dict -}}
+{{- $sidecar := $logCollection.sidecar | default dict -}}
+{{- $configMap := $sidecar.configMap | default dict -}}
+{{- if and ($logCollection.enabled | default false) ($sidecar.enabled | default false) ($configMap.create | default false) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "openshell.sandboxLogCollectorConfigMapName" . }}
+  namespace: {{ include "openshell.sandboxNamespace" . }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+data:
+  {{ $configMap.key | default "config.yaml" }}: |
+    {{- $configMap.contents | default "" | nindent 4 }}
+{{- end }}

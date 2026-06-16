@@ -107,6 +107,11 @@ Domain objects use shared metadata: stable server-generated IDs, human-readable
 names, creation timestamps, and labels. Crate-level details live in
 `crates/openshell-core/README.md`.
 
+The gateway log bus is not the durable archive for sandbox logs. It stores a
+bounded in-memory tail for recent and live diagnostic views. Durable collection
+is file-backed at the sandbox and exposed through driver-specific mechanisms,
+such as the Kubernetes shared log volume and collector sidecar.
+
 ## Persistence
 
 The gateway persistence layer is a protobuf object store. Domain services store

@@ -228,7 +228,36 @@ sa_token_ttl_secs              = 3600
 # shared roots such as /run, /var, /tmp, and /etc are rejected.
 # Supervisor-to-gateway auth still uses gateway JWTs.
 provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
+
+[[openshell.drivers.kubernetes.pod_extensions.volumes]]
+name = "otel-config"
+config_map_name = "openshell-sandbox-log-collector"
+
+[[openshell.drivers.kubernetes.pod_extensions.sidecars]]
+name = "support-sidecar"
+image = "busybox:1.36"
+args = ["sleep", "3600"]
+
+[openshell.drivers.kubernetes.log_collection]
+enabled = true
+volume_name = "openshell-logs"
+mount_path = "/var/log/openshell"
+
+[openshell.drivers.kubernetes.log_collection.sidecar]
+enabled = true
+name = "openshell-log-collector"
+image = "otel/opentelemetry-collector-contrib:0.153.0"
+args = ["--config=/etc/otelcol/config.yaml"]
+
+[[openshell.drivers.kubernetes.log_collection.sidecar.volume_mounts]]
+name = "otel-config"
+mount_path = "/etc/otelcol"
+read_only = true
 ```
+
+`pod_extensions` is an operator-owned Kubernetes-only pod extension surface. It supports named `empty_dir`, `config_map_name`, or `secret_name` volumes; agent volume mounts; and sidecar containers with env, command, args, image pull policy, resources, and volume mounts. Extension mounts cannot use reserved OpenShell control paths such as `/opt/openshell`, `/etc/openshell`, `/etc/openshell-tls`, `/run/netns`, `/var/run/secrets/openshell`, or `/sandbox`.
+
+`log_collection` creates a shared log volume, mounts it into the agent, sets `OPENSHELL_LOG_DIR`, and optionally adds a collector sidecar mounted read-only on that log volume. The log collector sidecar can mount additional `pod_extensions.volumes`, for example a ConfigMap containing collector configuration.
 
 ### Docker
 

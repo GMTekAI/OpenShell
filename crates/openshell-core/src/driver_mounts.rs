@@ -10,6 +10,7 @@ const RESERVED_MOUNT_TARGETS: &[&str] = &[
     "/etc/openshell",
     "/etc/openshell-tls",
     "/run/netns",
+    "/var/run/secrets/openshell",
 ];
 
 /// Validate a non-empty driver mount source.
@@ -134,6 +135,13 @@ mod tests {
         let err = validate_container_mount_target("/etc/openshell/tls/client").unwrap_err();
 
         assert!(err.contains("/etc/openshell"));
+    }
+
+    #[test]
+    fn container_target_rejects_reserved_kubernetes_bootstrap_token_path() {
+        let err = validate_container_mount_target("/var/run/secrets/openshell/token").unwrap_err();
+
+        assert!(err.contains("/var/run/secrets/openshell"));
     }
 
     #[test]

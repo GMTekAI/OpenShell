@@ -23,6 +23,9 @@ pub const SSH_SOCKET_PATH: &str = "OPENSHELL_SSH_SOCKET_PATH";
 /// Log level for the sandbox supervisor (e.g. `"debug"`, `"info"`, `"warn"`).
 pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 
+/// Directory where the sandbox supervisor writes local log files.
+pub const LOG_DIR: &str = "OPENSHELL_LOG_DIR";
+
 /// Shell command to run inside the sandbox.
 pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
 

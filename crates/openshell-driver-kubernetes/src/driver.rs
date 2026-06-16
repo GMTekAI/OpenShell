@@ -5,7 +5,9 @@
 
 use crate::config::{
     AppArmorProfile, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, SupervisorSideloadMethod,
+    KubernetesComputeConfig, KubernetesLogCollectionConfig, KubernetesPodExtensionSidecar,
+    KubernetesPodExtensionVolume, KubernetesPodExtensionVolumeMount, KubernetesPodExtensionsConfig,
+    KubernetesResourceConfig, SupervisorSideloadMethod,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
@@ -206,7 +208,7 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 impl KubernetesComputeDriver {
     pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubernetesDriverError> {
         config
-            .validate_provider_spiffe_workload_api_socket_path()
+            .validate()
             .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
@@ -428,6 +430,8 @@ impl KubernetesComputeDriver {
             provider_spiffe_workload_api_socket_path: &self
                 .config
                 .provider_spiffe_workload_api_socket_path,
+            pod_extensions: self.config.pod_extensions.clone(),
+            log_collection: self.config.log_collection.clone(),
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
@@ -1154,6 +1158,8 @@ struct SandboxPodParams<'a> {
     sa_token_ttl_secs: i64,
     provider_spiffe_enabled: bool,
     provider_spiffe_workload_api_socket_path: &'a str,
+    pod_extensions: KubernetesPodExtensionsConfig,
+    log_collection: KubernetesLogCollectionConfig,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -1179,6 +1185,8 @@ impl Default for SandboxPodParams<'_> {
             sa_token_ttl_secs: 3600,
             provider_spiffe_enabled: false,
             provider_spiffe_workload_api_socket_path: "",
+            pod_extensions: KubernetesPodExtensionsConfig::default(),
+            log_collection: KubernetesLogCollectionConfig::default(),
         }
     }
 }
@@ -1424,7 +1432,7 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
     }
 
     // Build environment variables - start with OpenShell-required vars
-    let env = build_env_list(
+    let mut env = build_env_list(
         None,
         &template.environment,
         spec_environment,
@@ -1435,6 +1443,13 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         !params.client_tls_secret_name.is_empty(),
         provider_spiffe_socket_path(params),
     );
+    if params.log_collection.enabled {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::LOG_DIR,
+            &params.log_collection.mount_path,
+        );
+    }
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
@@ -1479,6 +1494,19 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         "mountPath": "/var/run/secrets/openshell",
         "readOnly": true,
     }));
+    if params.log_collection.enabled {
+        volume_mounts.push(serde_json::json!({
+            "name": &params.log_collection.volume_name,
+            "mountPath": &params.log_collection.mount_path,
+        }));
+    }
+    volume_mounts.extend(
+        params
+            .pod_extensions
+            .agent_volume_mounts
+            .iter()
+            .map(render_extension_volume_mount),
+    );
     container.insert(
         "volumeMounts".to_string(),
         serde_json::Value::Array(volume_mounts),
@@ -1488,9 +1516,20 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
         container.insert("resources".to_string(), resources);
     }
     apply_agent_driver_resources(&mut container, &driver_config.containers.agent.resources);
+    let mut containers = vec![serde_json::Value::Object(container)];
+    containers.extend(
+        params
+            .pod_extensions
+            .sidecars
+            .iter()
+            .map(render_extension_sidecar),
+    );
+    if let Some(sidecar) = render_log_collection_sidecar(&params.log_collection) {
+        containers.push(sidecar);
+    }
     spec.insert(
         "containers".to_string(),
-        serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
+        serde_json::Value::Array(containers),
     );
 
     // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
@@ -1528,6 +1567,19 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
             "defaultMode": 256
         }
     }));
+    if params.log_collection.enabled {
+        volumes.push(serde_json::json!({
+            "name": &params.log_collection.volume_name,
+            "emptyDir": {}
+        }));
+    }
+    volumes.extend(
+        params
+            .pod_extensions
+            .volumes
+            .iter()
+            .map(render_extension_volume),
+    );
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
@@ -1607,6 +1659,138 @@ fn apply_agent_driver_resources(
         .or_insert_with(|| serde_json::json!({}));
     apply_resource_quantity_map(target, "requests", &resources.requests);
     apply_resource_quantity_map(target, "limits", &resources.limits);
+}
+
+fn render_extension_sidecar(sidecar: &KubernetesPodExtensionSidecar) -> serde_json::Value {
+    let mut container = serde_json::Map::new();
+    container.insert("name".to_string(), serde_json::json!(&sidecar.name));
+    container.insert("image".to_string(), serde_json::json!(&sidecar.image));
+    if !sidecar.image_pull_policy.is_empty() {
+        container.insert(
+            "imagePullPolicy".to_string(),
+            serde_json::json!(&sidecar.image_pull_policy),
+        );
+    }
+    if !sidecar.command.is_empty() {
+        container.insert("command".to_string(), serde_json::json!(&sidecar.command));
+    }
+    if !sidecar.args.is_empty() {
+        container.insert("args".to_string(), serde_json::json!(&sidecar.args));
+    }
+    if !sidecar.env.is_empty() {
+        container.insert(
+            "env".to_string(),
+            serde_json::Value::Array(render_env_map(&sidecar.env)),
+        );
+    }
+    if !sidecar.volume_mounts.is_empty() {
+        container.insert(
+            "volumeMounts".to_string(),
+            serde_json::Value::Array(
+                sidecar
+                    .volume_mounts
+                    .iter()
+                    .map(render_extension_volume_mount)
+                    .collect(),
+            ),
+        );
+    }
+    if let Some(resources) = render_resource_config(&sidecar.resources) {
+        container.insert("resources".to_string(), resources);
+    }
+    serde_json::Value::Object(container)
+}
+
+fn render_log_collection_sidecar(
+    log_collection: &KubernetesLogCollectionConfig,
+) -> Option<serde_json::Value> {
+    if !log_collection.enabled || !log_collection.sidecar.enabled {
+        return None;
+    }
+
+    let sidecar = &log_collection.sidecar;
+    let mut container = serde_json::Map::new();
+    container.insert("name".to_string(), serde_json::json!(&sidecar.name));
+    container.insert("image".to_string(), serde_json::json!(&sidecar.image));
+    if !sidecar.image_pull_policy.is_empty() {
+        container.insert(
+            "imagePullPolicy".to_string(),
+            serde_json::json!(&sidecar.image_pull_policy),
+        );
+    }
+    if !sidecar.command.is_empty() {
+        container.insert("command".to_string(), serde_json::json!(&sidecar.command));
+    }
+    if !sidecar.args.is_empty() {
+        container.insert("args".to_string(), serde_json::json!(&sidecar.args));
+    }
+    if !sidecar.env.is_empty() {
+        container.insert(
+            "env".to_string(),
+            serde_json::Value::Array(render_env_map(&sidecar.env)),
+        );
+    }
+
+    let mut volume_mounts = vec![serde_json::json!({
+        "name": &log_collection.volume_name,
+        "mountPath": &log_collection.mount_path,
+        "readOnly": true,
+    })];
+    volume_mounts.extend(
+        sidecar
+            .volume_mounts
+            .iter()
+            .map(render_extension_volume_mount),
+    );
+    container.insert(
+        "volumeMounts".to_string(),
+        serde_json::Value::Array(volume_mounts),
+    );
+
+    if let Some(resources) = render_resource_config(&sidecar.resources) {
+        container.insert("resources".to_string(), resources);
+    }
+    Some(serde_json::Value::Object(container))
+}
+
+fn render_env_map(values: &BTreeMap<String, String>) -> Vec<serde_json::Value> {
+    values
+        .iter()
+        .map(|(name, value)| serde_json::json!({ "name": name, "value": value }))
+        .collect()
+}
+
+fn render_extension_volume_mount(mount: &KubernetesPodExtensionVolumeMount) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "name": &mount.name,
+        "mountPath": &mount.mount_path,
+    });
+    if mount.read_only {
+        value["readOnly"] = serde_json::json!(true);
+    }
+    value
+}
+
+fn render_extension_volume(volume: &KubernetesPodExtensionVolume) -> serde_json::Value {
+    let mut value = serde_json::json!({ "name": &volume.name });
+    if volume.empty_dir {
+        value["emptyDir"] = serde_json::json!({});
+    } else if !volume.config_map_name.is_empty() {
+        value["configMap"] = serde_json::json!({ "name": &volume.config_map_name });
+    } else {
+        value["secret"] = serde_json::json!({ "secretName": &volume.secret_name });
+    }
+    value
+}
+
+fn render_resource_config(resources: &KubernetesResourceConfig) -> Option<serde_json::Value> {
+    if resources.is_empty() {
+        return None;
+    }
+    let mut value = serde_json::json!({});
+    apply_resource_quantity_map(&mut value, "requests", &resources.requests);
+    apply_resource_quantity_map(&mut value, "limits", &resources.limits);
+    Some(value)
 }
 
 fn merge_string_map(target: &mut serde_json::Value, values: &BTreeMap<String, String>) {
@@ -2011,6 +2195,35 @@ mod tests {
                 })),
             },
         }
+    }
+
+    fn container_by_name<'a>(
+        pod_template: &'a serde_json::Value,
+        name: &str,
+    ) -> &'a serde_json::Value {
+        pod_template["spec"]["containers"]
+            .as_array()
+            .expect("containers")
+            .iter()
+            .find(|container| container["name"] == name)
+            .unwrap_or_else(|| panic!("container {name} should exist"))
+    }
+
+    fn array_contains_named_value(items: &serde_json::Value, name: &str) -> bool {
+        items
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|item| item["name"] == name)
+    }
+
+    fn env_value<'a>(container: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+        container["env"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|env| env["name"] == name)
+            .and_then(|env| env["value"].as_str())
     }
 
     #[test]
@@ -3305,6 +3518,200 @@ mod tests {
         assert_eq!(
             pod_template["metadata"]["labels"][LABEL_MANAGED_BY],
             serde_json::json!(LABEL_MANAGED_BY_VALUE)
+        );
+    }
+
+    #[test]
+    fn log_collection_disabled_omits_log_dir_volume_and_sidecar() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+        let agent = container_by_name(&pod_template, "agent");
+
+        assert_eq!(
+            pod_template["spec"]["containers"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(env_value(agent, openshell_core::sandbox_env::LOG_DIR), None);
+        assert!(
+            !array_contains_named_value(&agent["volumeMounts"], "openshell-logs"),
+            "agent must not get the log volume by default"
+        );
+        assert!(
+            !array_contains_named_value(&pod_template["spec"]["volumes"], "openshell-logs"),
+            "pod must not get the log volume by default"
+        );
+    }
+
+    #[test]
+    fn log_collection_mounts_shared_log_volume_on_agent() {
+        let params = SandboxPodParams {
+            log_collection: KubernetesLogCollectionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let agent = container_by_name(&pod_template, "agent");
+
+        assert_eq!(
+            env_value(agent, openshell_core::sandbox_env::LOG_DIR),
+            Some("/var/log/openshell")
+        );
+        assert!(
+            agent["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["name"] == "openshell-logs" && mount["mountPath"] == "/var/log/openshell"
+                })
+        );
+        assert!(
+            pod_template["spec"]["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|volume| {
+                    volume["name"] == "openshell-logs" && volume["emptyDir"].is_object()
+                })
+        );
+    }
+
+    #[test]
+    fn log_collection_sidecar_reads_shared_log_volume_read_only() {
+        let params = SandboxPodParams {
+            log_collection: KubernetesLogCollectionConfig {
+                enabled: true,
+                sidecar: crate::config::KubernetesLogCollectionSidecarConfig {
+                    enabled: true,
+                    image: "otel/opentelemetry-collector-contrib:latest".to_string(),
+                    image_pull_policy: "IfNotPresent".to_string(),
+                    args: vec!["--config=/etc/otelcol/config.yaml".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let sidecar = container_by_name(&pod_template, "openshell-log-collector");
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["name"],
+            serde_json::json!("agent"),
+            "agent container must remain first"
+        );
+        assert_eq!(
+            sidecar["image"],
+            serde_json::json!("otel/opentelemetry-collector-contrib:latest")
+        );
+        assert!(
+            sidecar["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["name"] == "openshell-logs"
+                        && mount["mountPath"] == "/var/log/openshell"
+                        && mount["readOnly"] == true
+                })
+        );
+    }
+
+    #[test]
+    fn pod_extensions_render_agent_mount_volume_and_sidecar() {
+        let mut sidecar_env = BTreeMap::new();
+        sidecar_env.insert("COLLECTOR_MODE".to_string(), "test".to_string());
+        let params = SandboxPodParams {
+            pod_extensions: KubernetesPodExtensionsConfig {
+                volumes: vec![KubernetesPodExtensionVolume {
+                    name: "otel-config".to_string(),
+                    config_map_name: "openshell-otel-config".to_string(),
+                    ..Default::default()
+                }],
+                agent_volume_mounts: vec![KubernetesPodExtensionVolumeMount {
+                    name: "otel-config".to_string(),
+                    mount_path: "/etc/collector-agent-view".to_string(),
+                    read_only: true,
+                }],
+                sidecars: vec![KubernetesPodExtensionSidecar {
+                    name: "custom-sidecar".to_string(),
+                    image: "busybox:1.36".to_string(),
+                    command: vec!["/bin/sh".to_string(), "-c".to_string()],
+                    args: vec!["sleep 3600".to_string()],
+                    env: sidecar_env,
+                    volume_mounts: vec![KubernetesPodExtensionVolumeMount {
+                        name: "otel-config".to_string(),
+                        mount_path: "/etc/otelcol".to_string(),
+                        read_only: true,
+                    }],
+                    resources: KubernetesResourceConfig {
+                        requests: std::iter::once(("cpu".to_string(), "10m".to_string())).collect(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }],
+            },
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let agent = container_by_name(&pod_template, "agent");
+        let sidecar = container_by_name(&pod_template, "custom-sidecar");
+
+        assert!(
+            agent["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|mount| {
+                    mount["name"] == "otel-config"
+                        && mount["mountPath"] == "/etc/collector-agent-view"
+                        && mount["readOnly"] == true
+                })
+        );
+        assert!(
+            pod_template["spec"]["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|volume| {
+                    volume["name"] == "otel-config"
+                        && volume["configMap"]["name"] == "openshell-otel-config"
+                })
+        );
+        assert_eq!(sidecar["command"], serde_json::json!(["/bin/sh", "-c"]));
+        assert_eq!(
+            env_value(sidecar, "COLLECTOR_MODE"),
+            Some("test"),
+            "sidecar env should render as name/value pairs"
+        );
+        assert_eq!(
+            sidecar["resources"]["requests"]["cpu"],
+            serde_json::json!("10m")
         );
     }
 

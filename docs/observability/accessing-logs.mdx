@@ -39,6 +39,8 @@ The sandbox pushes logs to the gateway over gRPC in real time. The gateway store
 
 For durable log storage, use the log files inside the sandbox or enable [OCSF JSON export](/observability/ocsf-json-export) and ship the JSONL files to an external log aggregator.
 
+`openshell logs` is a diagnostic view of the gateway buffer. It is not the archival export path for Kubernetes operators.
+
 ## Direct Filesystem Access
 
 Use `openshell sandbox connect` to open a shell inside the sandbox and read the log files directly:
@@ -55,6 +57,41 @@ openshell sandbox connect my-sandbox -- cat /var/log/openshell.2026-04-01.log
 ```
 
 The log files inside the sandbox contain the complete record, including events that the gRPC push channel can drop under load. The push channel is bounded and drops events rather than blocking.
+
+The supervisor writes logs under `OPENSHELL_LOG_DIR`, defaulting to `/var/log`. Kubernetes log collection can set this to `/var/log/openshell` so the directory is backed by a shared volume.
+
+## Kubernetes Log Collection
+
+The Kubernetes driver can mount a shared log volume into each sandbox agent container, set `OPENSHELL_LOG_DIR`, and add an operator-configured collector sidecar that reads the same volume. The sidecar only receives the shared log volume and any volumes explicitly configured through `server.sandboxPodExtensions`.
+
+Enable the Helm convenience block to collect file-backed logs:
+
+```yaml
+server:
+  sandboxLogCollection:
+    enabled: true
+    sidecar:
+      enabled: true
+      image: otel/opentelemetry-collector-contrib:0.153.0
+      args:
+        - --config=/etc/otelcol/config.yaml
+      configMap:
+        create: true
+        contents: |
+          receivers:
+            filelog:
+              include:
+                - /var/log/openshell/openshell.*.log
+                - /var/log/openshell/openshell-ocsf.*.log
+```
+
+For local validation, the Helm Skaffold example includes optional Loki, OpenTelemetry Collector, and Grafana releases. Uncomment those releases in `deploy/helm/openshell/skaffold.yaml`, add `ci/values-observability.yaml` to the OpenShell release values, and run:
+
+```shell
+mise run helm:skaffold:run
+```
+
+The local overlay enables `ocsf_json_enabled`, mounts the sandbox log directory, runs an OpenTelemetry Collector sidecar in each sandbox pod, forwards records to the central collector, and writes them to Loki.
 
 ## Filtering by Event Type
 

@@ -138,6 +138,16 @@ Runtime settings filename and mount path.
 {{- end }}
 
 {{/*
+Name of the optional sandbox log collector sidecar ConfigMap.
+*/}}
+{{- define "openshell.sandboxLogCollectorConfigMapName" -}}
+{{- $logCollection := .Values.server.sandboxLogCollection | default dict -}}
+{{- $sidecar := get $logCollection "sidecar" | default dict -}}
+{{- $configMap := get $sidecar "configMap" | default dict -}}
+{{- get $configMap "name" | default (printf "%s-sandbox-log-collector" (include "openshell.fullname" .)) -}}
+{{- end }}
+
+{{/*
 gRPC endpoint sandbox pods use to call back into the gateway. An explicit
 .Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
 the in-cluster Service DNS, release namespace, service port, and disableTls
@@ -211,6 +221,15 @@ Validate chart values that Helm would otherwise accept silently.
 {{- $filename := get $runtime "filename" | default "runtime.toml" -}}
 {{- if or (eq $filename "") (contains "/" $filename) -}}
 {{- fail "server.runtimeConfig.filename must be a non-empty filename, not a path." -}}
+{{- end -}}
+{{- end -}}
+{{- $logCollection := .Values.server.sandboxLogCollection | default dict -}}
+{{- $logSidecar := get $logCollection "sidecar" | default dict -}}
+{{- $logConfigMap := get $logSidecar "configMap" | default dict -}}
+{{- if and (get $logCollection "enabled" | default false) (get $logSidecar "enabled" | default false) (get $logConfigMap "create" | default false) -}}
+{{- $key := get $logConfigMap "key" | default "config.yaml" -}}
+{{- if or (eq $key "") (contains "/" $key) -}}
+{{- fail "server.sandboxLogCollection.sidecar.configMap.key must be a non-empty filename, not a path." -}}
 {{- end -}}
 {{- end -}}
 {{- end }}

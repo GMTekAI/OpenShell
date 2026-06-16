@@ -225,7 +225,27 @@ add `ci/values-spire.yaml` to the OpenShell release values files.
 | server.sandboxJwt.secretDefaultMode | string | `""` | File mode for the mounted JWT signing key Secret. Default 0400 (owner-read only). Override to 0440 or 0444 if the container UID does not match the volume file owner. |
 | server.sandboxJwt.signingSecretName | string | `""` | Name of the Opaque Secret holding the signing key material. Empty falls back to the chart fullname with "-jwt-keys" appended. |
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
+| server.sandboxLogCollection.enabled | bool | `false` | Mount a shared log volume into sandbox pods and set OPENSHELL_LOG_DIR. |
+| server.sandboxLogCollection.mountPath | string | `"/var/log/openshell"` | Agent and collector mount path for sandbox supervisor log files. |
+| server.sandboxLogCollection.sidecar.args | list | `[]` | Collector sidecar args. |
+| server.sandboxLogCollection.sidecar.command | list | `[]` | Collector sidecar command override. |
+| server.sandboxLogCollection.sidecar.configMap.contents | string | `""` | Collector config file contents when configMap.create=true. |
+| server.sandboxLogCollection.sidecar.configMap.create | bool | `false` | Create a ConfigMap in the sandbox namespace for collector sidecar config. |
+| server.sandboxLogCollection.sidecar.configMap.key | string | `"config.yaml"` | ConfigMap key containing the collector config file. |
+| server.sandboxLogCollection.sidecar.configMap.mountPath | string | `"/etc/otelcol"` | Mount path for the collector config ConfigMap. |
+| server.sandboxLogCollection.sidecar.configMap.name | string | `""` | Existing or generated collector ConfigMap name. |
+| server.sandboxLogCollection.sidecar.enabled | bool | `false` | Add a collector sidecar that reads the shared log volume. |
+| server.sandboxLogCollection.sidecar.env | object | `{}` | Collector sidecar environment variables. |
+| server.sandboxLogCollection.sidecar.image | string | `""` | Collector sidecar image. |
+| server.sandboxLogCollection.sidecar.imagePullPolicy | string | `""` | Collector sidecar Kubernetes imagePullPolicy. Empty uses the Kubernetes default. |
+| server.sandboxLogCollection.sidecar.name | string | `"openshell-log-collector"` | Collector sidecar container name. |
+| server.sandboxLogCollection.sidecar.resources | object | `{}` | Collector sidecar resource requests and limits. |
+| server.sandboxLogCollection.sidecar.volumeMounts | list | `[]` | Additional collector sidecar mounts from sandboxPodExtensions.volumes. |
+| server.sandboxLogCollection.volumeName | string | `"openshell-logs"` | Shared volume name for sandbox supervisor log files. |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
+| server.sandboxPodExtensions.agentVolumeMounts | list | `[]` | Operator-owned volume mounts added to the sandbox agent container. Mounts may only reference sandboxPodExtensions.volumes. |
+| server.sandboxPodExtensions.sidecars | list | `[]` | Operator-owned sidecar containers added to every sandbox pod. Sidecars may only mount sandboxPodExtensions.volumes. |
+| server.sandboxPodExtensions.volumes | list | `[]` | Operator-owned volumes added to every sandbox pod. Each entry must set exactly one source: emptyDir, configMapName, or secretName. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |

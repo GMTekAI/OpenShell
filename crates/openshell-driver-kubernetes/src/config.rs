@@ -3,6 +3,7 @@
 
 use openshell_core::config::DEFAULT_SUPERVISOR_IMAGE;
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -14,6 +15,26 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
+
+/// Default shared volume name for sandbox log collection.
+pub const DEFAULT_SANDBOX_LOG_VOLUME_NAME: &str = "openshell-logs";
+
+/// Default agent mount path for sandbox log collection.
+pub const DEFAULT_SANDBOX_LOG_MOUNT_PATH: &str = "/var/log/openshell";
+
+/// Default Kubernetes sidecar name for sandbox log collection.
+pub const DEFAULT_LOG_COLLECTION_SIDECAR_NAME: &str = "openshell-log-collector";
+
+const GENERATED_VOLUME_NAMES: &[&str] = &[
+    "openshell-client-tls",
+    "openshell-sa-token",
+    "spiffe-workload-api",
+    "workspace",
+    "openshell-supervisor-bin",
+];
+
+const GENERATED_CONTAINER_NAMES: &[&str] =
+    &["agent", "openshell-supervisor-install", "workspace-init"];
 
 /// How the supervisor binary is delivered into sandbox pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -156,6 +177,278 @@ where
     Ok(value)
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesPodExtensionsConfig {
+    /// Operator-owned volumes made available to agent mounts and sidecars.
+    pub volumes: Vec<KubernetesPodExtensionVolume>,
+    /// Operator-owned volume mounts added to the agent container.
+    pub agent_volume_mounts: Vec<KubernetesPodExtensionVolumeMount>,
+    /// Operator-owned sidecar containers added to every sandbox pod.
+    pub sidecars: Vec<KubernetesPodExtensionSidecar>,
+}
+
+impl KubernetesPodExtensionsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        let mut volume_names = BTreeSet::new();
+        for (idx, volume) in self.volumes.iter().enumerate() {
+            volume.validate(idx)?;
+            if GENERATED_VOLUME_NAMES.contains(&volume.name.as_str()) {
+                return Err(format!(
+                    "pod_extensions.volumes[{idx}].name '{}' conflicts with generated OpenShell volume",
+                    volume.name
+                ));
+            }
+            if !volume_names.insert(volume.name.clone()) {
+                return Err(format!(
+                    "pod_extensions.volumes[{idx}].name '{}' is duplicated",
+                    volume.name
+                ));
+            }
+        }
+
+        for (idx, mount) in self.agent_volume_mounts.iter().enumerate() {
+            mount.validate(&format!("pod_extensions.agent_volume_mounts[{idx}]"))?;
+            if !volume_names.contains(&mount.name) {
+                return Err(format!(
+                    "pod_extensions.agent_volume_mounts[{idx}].name '{}' does not reference a pod_extensions volume",
+                    mount.name
+                ));
+            }
+        }
+
+        let mut container_names = BTreeSet::new();
+        for (idx, sidecar) in self.sidecars.iter().enumerate() {
+            sidecar.validate(idx, &volume_names)?;
+            if GENERATED_CONTAINER_NAMES.contains(&sidecar.name.as_str()) {
+                return Err(format!(
+                    "pod_extensions.sidecars[{idx}].name '{}' conflicts with generated OpenShell container",
+                    sidecar.name
+                ));
+            }
+            if !container_names.insert(sidecar.name.clone()) {
+                return Err(format!(
+                    "pod_extensions.sidecars[{idx}].name '{}' is duplicated",
+                    sidecar.name
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesPodExtensionVolume {
+    pub name: String,
+    /// Render an emptyDir volume. Exactly one volume source must be set.
+    pub empty_dir: bool,
+    /// Render a `ConfigMap` volume with this `ConfigMap` name.
+    pub config_map_name: String,
+    /// Render a `Secret` volume with this `Secret` name.
+    pub secret_name: String,
+}
+
+impl KubernetesPodExtensionVolume {
+    fn validate(&self, idx: usize) -> Result<(), String> {
+        validate_k8s_name(&self.name, &format!("pod_extensions.volumes[{idx}].name"))?;
+        let source_count = usize::from(self.empty_dir)
+            + usize::from(!self.config_map_name.trim().is_empty())
+            + usize::from(!self.secret_name.trim().is_empty());
+        if source_count != 1 {
+            return Err(format!(
+                "pod_extensions.volumes[{idx}] must set exactly one of empty_dir, config_map_name, or secret_name"
+            ));
+        }
+        if !self.config_map_name.trim().is_empty() {
+            validate_k8s_name(
+                &self.config_map_name,
+                &format!("pod_extensions.volumes[{idx}].config_map_name"),
+            )?;
+        }
+        if !self.secret_name.trim().is_empty() {
+            validate_k8s_name(
+                &self.secret_name,
+                &format!("pod_extensions.volumes[{idx}].secret_name"),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesPodExtensionVolumeMount {
+    pub name: String,
+    pub mount_path: String,
+    pub read_only: bool,
+}
+
+impl KubernetesPodExtensionVolumeMount {
+    fn validate(&self, field: &str) -> Result<(), String> {
+        validate_k8s_name(&self.name, &format!("{field}.name"))?;
+        openshell_core::driver_mounts::validate_container_mount_target(&self.mount_path)
+            .map_err(|err| format!("{field}.mount_path invalid: {err}"))?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesPodExtensionSidecar {
+    pub name: String,
+    pub image: String,
+    pub image_pull_policy: String,
+    pub command: Vec<String>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub volume_mounts: Vec<KubernetesPodExtensionVolumeMount>,
+    pub resources: KubernetesResourceConfig,
+}
+
+impl KubernetesPodExtensionSidecar {
+    fn validate(&self, idx: usize, volume_names: &BTreeSet<String>) -> Result<(), String> {
+        let field = format!("pod_extensions.sidecars[{idx}]");
+        validate_k8s_name(&self.name, &format!("{field}.name"))?;
+        validate_nonempty_string(&self.image, &format!("{field}.image"))?;
+        validate_image_pull_policy(
+            &self.image_pull_policy,
+            &format!("{field}.image_pull_policy"),
+        )?;
+        validate_resource_config(&self.resources, &format!("{field}.resources"))?;
+        for (mount_idx, mount) in self.volume_mounts.iter().enumerate() {
+            let mount_field = format!("{field}.volume_mounts[{mount_idx}]");
+            mount.validate(&mount_field)?;
+            if !volume_names.contains(&mount.name) {
+                return Err(format!(
+                    "{mount_field}.name '{}' does not reference a pod_extensions volume",
+                    mount.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesResourceConfig {
+    pub requests: BTreeMap<String, String>,
+    pub limits: BTreeMap<String, String>,
+}
+
+impl KubernetesResourceConfig {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.requests.is_empty() && self.limits.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesLogCollectionConfig {
+    /// Enable the shared log volume and set `OPENSHELL_LOG_DIR` on the agent.
+    pub enabled: bool,
+    /// Shared volume name used for sandbox log files.
+    pub volume_name: String,
+    /// Mount path used by the agent and collector sidecar.
+    pub mount_path: String,
+    /// Optional collector sidecar mounted read-only at `mount_path`.
+    pub sidecar: KubernetesLogCollectionSidecarConfig,
+}
+
+impl Default for KubernetesLogCollectionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            volume_name: DEFAULT_SANDBOX_LOG_VOLUME_NAME.to_string(),
+            mount_path: DEFAULT_SANDBOX_LOG_MOUNT_PATH.to_string(),
+            sidecar: KubernetesLogCollectionSidecarConfig::default(),
+        }
+    }
+}
+
+impl KubernetesLogCollectionConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled && !self.sidecar.enabled {
+            return Ok(());
+        }
+        if self.sidecar.enabled && !self.enabled {
+            return Err(
+                "log_collection.sidecar.enabled requires log_collection.enabled".to_string(),
+            );
+        }
+        validate_k8s_name(&self.volume_name, "log_collection.volume_name")?;
+        if GENERATED_VOLUME_NAMES.contains(&self.volume_name.as_str()) {
+            return Err(format!(
+                "log_collection.volume_name '{}' conflicts with generated OpenShell volume",
+                self.volume_name
+            ));
+        }
+        openshell_core::driver_mounts::validate_container_mount_target(&self.mount_path)
+            .map_err(|err| format!("log_collection.mount_path invalid: {err}"))?;
+        self.sidecar.validate()?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KubernetesLogCollectionSidecarConfig {
+    pub enabled: bool,
+    pub name: String,
+    pub image: String,
+    pub image_pull_policy: String,
+    pub command: Vec<String>,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    /// Additional mounts for operator-owned `pod_extensions` volumes.
+    pub volume_mounts: Vec<KubernetesPodExtensionVolumeMount>,
+    pub resources: KubernetesResourceConfig,
+}
+
+impl Default for KubernetesLogCollectionSidecarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            name: DEFAULT_LOG_COLLECTION_SIDECAR_NAME.to_string(),
+            image: String::new(),
+            image_pull_policy: String::new(),
+            command: Vec::new(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            volume_mounts: Vec::new(),
+            resources: KubernetesResourceConfig::default(),
+        }
+    }
+}
+
+impl KubernetesLogCollectionSidecarConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        validate_k8s_name(&self.name, "log_collection.sidecar.name")?;
+        if GENERATED_CONTAINER_NAMES.contains(&self.name.as_str()) {
+            return Err(format!(
+                "log_collection.sidecar.name '{}' conflicts with generated OpenShell container",
+                self.name
+            ));
+        }
+        validate_nonempty_string(&self.image, "log_collection.sidecar.image")?;
+        validate_image_pull_policy(
+            &self.image_pull_policy,
+            "log_collection.sidecar.image_pull_policy",
+        )?;
+        for (idx, mount) in self.volume_mounts.iter().enumerate() {
+            mount.validate(&format!("log_collection.sidecar.volume_mounts[{idx}]"))?;
+        }
+        validate_resource_config(&self.resources, "log_collection.sidecar.resources")?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
@@ -211,6 +504,10 @@ pub struct KubernetesComputeConfig {
         deserialize_with = "deserialize_provider_spiffe_workload_api_socket_path"
     )]
     pub provider_spiffe_workload_api_socket_path: String,
+    /// Operator-owned sandbox pod extensions.
+    pub pod_extensions: KubernetesPodExtensionsConfig,
+    /// File-backed sandbox log collection settings.
+    pub log_collection: KubernetesLogCollectionConfig,
 }
 
 /// Lower bound enforced by kubelet for projected SA tokens.
@@ -246,6 +543,8 @@ impl Default for KubernetesComputeConfig {
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
+            pod_extensions: KubernetesPodExtensionsConfig::default(),
+            log_collection: KubernetesLogCollectionConfig::default(),
         }
     }
 }
@@ -276,6 +575,13 @@ impl KubernetesComputeConfig {
         validate_provider_spiffe_workload_api_socket_path_value(
             &self.provider_spiffe_workload_api_socket_path,
         )
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_provider_spiffe_workload_api_socket_path()?;
+        self.pod_extensions.validate()?;
+        self.log_collection.validate()?;
+        validate_extension_log_collection_conflicts(&self.pod_extensions, &self.log_collection)
     }
 }
 
@@ -309,6 +615,138 @@ fn validate_provider_spiffe_workload_api_socket_path_value(
         );
     }
     Ok(())
+}
+
+fn validate_extension_log_collection_conflicts(
+    extensions: &KubernetesPodExtensionsConfig,
+    log_collection: &KubernetesLogCollectionConfig,
+) -> Result<(), String> {
+    if !log_collection.enabled {
+        return Ok(());
+    }
+    for (idx, volume) in extensions.volumes.iter().enumerate() {
+        if volume.name == log_collection.volume_name {
+            return Err(format!(
+                "pod_extensions.volumes[{idx}].name '{}' conflicts with log_collection.volume_name",
+                volume.name
+            ));
+        }
+    }
+    for (idx, sidecar) in extensions.sidecars.iter().enumerate() {
+        if log_collection.sidecar.enabled && sidecar.name == log_collection.sidecar.name {
+            return Err(format!(
+                "pod_extensions.sidecars[{idx}].name '{}' conflicts with log_collection.sidecar.name",
+                sidecar.name
+            ));
+        }
+    }
+    for (idx, mount) in extensions.agent_volume_mounts.iter().enumerate() {
+        if mount_paths_overlap(&mount.mount_path, &log_collection.mount_path) {
+            return Err(format!(
+                "pod_extensions.agent_volume_mounts[{idx}].mount_path '{}' overlaps log_collection.mount_path '{}'",
+                mount.mount_path, log_collection.mount_path
+            ));
+        }
+    }
+    let extension_volume_names = extensions
+        .volumes
+        .iter()
+        .map(|volume| volume.name.clone())
+        .collect::<BTreeSet<_>>();
+    for (idx, mount) in log_collection.sidecar.volume_mounts.iter().enumerate() {
+        if !extension_volume_names.contains(&mount.name) {
+            return Err(format!(
+                "log_collection.sidecar.volume_mounts[{idx}].name '{}' does not reference a pod_extensions volume",
+                mount.name
+            ));
+        }
+        if mount_paths_overlap(&mount.mount_path, &log_collection.mount_path) {
+            return Err(format!(
+                "log_collection.sidecar.volume_mounts[{idx}].mount_path '{}' overlaps log_collection.mount_path '{}'",
+                mount.mount_path, log_collection.mount_path
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_k8s_name(value: &str, field: &str) -> Result<(), String> {
+    validate_nonempty_string(value, field)?;
+    if value != value.trim() {
+        return Err(format!(
+            "{field} must not contain leading or trailing whitespace"
+        ));
+    }
+    if value.len() > 63 {
+        return Err(format!("{field} must be 63 characters or less"));
+    }
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return Err(format!("{field} must not be empty"));
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return Err(format!(
+            "{field} must start with a lowercase letter or digit"
+        ));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Err(format!(
+            "{field} must contain only lowercase letters, digits, or '-'"
+        ));
+    }
+    if value.ends_with('-') {
+        return Err(format!("{field} must end with a lowercase letter or digit"));
+    }
+    Ok(())
+}
+
+fn validate_nonempty_string(value: &str, field: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if value.as_bytes().contains(&0) {
+        return Err(format!("{field} must not contain NUL bytes"));
+    }
+    Ok(())
+}
+
+fn validate_image_pull_policy(value: &str, field: &str) -> Result<(), String> {
+    if value.is_empty() || matches!(value, "Always" | "IfNotPresent" | "Never") {
+        return Ok(());
+    }
+    Err(format!(
+        "{field} must be one of Always, IfNotPresent, Never, or empty"
+    ))
+}
+
+fn validate_resource_config(
+    resources: &KubernetesResourceConfig,
+    field: &str,
+) -> Result<(), String> {
+    for (section, values) in [
+        ("requests", &resources.requests),
+        ("limits", &resources.limits),
+    ] {
+        for (key, value) in values {
+            validate_nonempty_string(key, &format!("{field}.{section} key"))?;
+            validate_nonempty_string(value, &format!("{field}.{section}.{key}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn mount_paths_overlap(left: &str, right: &str) -> bool {
+    path_is_or_under(left, right) || path_is_or_under(right, left)
+}
+
+fn path_is_or_under(path: &str, parent: &str) -> bool {
+    path == parent
+        || path
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 #[cfg(test)]
@@ -458,5 +896,148 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.image_pull_secrets, ["regcred", "backup-regcred"]);
+    }
+
+    #[test]
+    fn default_log_collection_is_disabled_with_dedicated_path() {
+        let cfg = KubernetesComputeConfig::default();
+
+        assert!(!cfg.log_collection.enabled);
+        assert_eq!(
+            cfg.log_collection.volume_name,
+            DEFAULT_SANDBOX_LOG_VOLUME_NAME
+        );
+        assert_eq!(
+            cfg.log_collection.mount_path,
+            DEFAULT_SANDBOX_LOG_MOUNT_PATH
+        );
+    }
+
+    #[test]
+    fn serde_accepts_log_collection_sidecar_with_extension_config_mount() {
+        let json = serde_json::json!({
+            "pod_extensions": {
+                "volumes": [{
+                    "name": "otel-config",
+                    "config_map_name": "openshell-otel-config"
+                }]
+            },
+            "log_collection": {
+                "enabled": true,
+                "sidecar": {
+                    "enabled": true,
+                    "name": "sandbox-log-collector",
+                    "image": "otel/opentelemetry-collector-contrib:latest",
+                    "image_pull_policy": "IfNotPresent",
+                    "args": ["--config=/etc/otelcol/config.yaml"],
+                    "volume_mounts": [{
+                        "name": "otel-config",
+                        "mount_path": "/etc/otelcol",
+                        "read_only": true
+                    }]
+                }
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+
+        cfg.validate().unwrap();
+        assert!(cfg.log_collection.enabled);
+        assert!(cfg.log_collection.sidecar.enabled);
+        assert_eq!(cfg.pod_extensions.volumes[0].name, "otel-config");
+    }
+
+    #[test]
+    fn log_collection_sidecar_requires_log_collection() {
+        let json = serde_json::json!({
+            "log_collection": {
+                "enabled": false,
+                "sidecar": {
+                    "enabled": true,
+                    "image": "otel/opentelemetry-collector-contrib:latest"
+                }
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(err.contains("log_collection.sidecar.enabled requires log_collection.enabled"));
+    }
+
+    #[test]
+    fn log_collection_sidecar_requires_image() {
+        let json = serde_json::json!({
+            "log_collection": {
+                "enabled": true,
+                "sidecar": {
+                    "enabled": true
+                }
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(err.contains("log_collection.sidecar.image"));
+    }
+
+    #[test]
+    fn pod_extensions_reject_generated_volume_name_conflict() {
+        let json = serde_json::json!({
+            "pod_extensions": {
+                "volumes": [{
+                    "name": "openshell-sa-token",
+                    "empty_dir": true
+                }]
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(err.contains("generated OpenShell volume"));
+    }
+
+    #[test]
+    fn pod_extensions_reject_agent_mount_of_reserved_control_path() {
+        let json = serde_json::json!({
+            "pod_extensions": {
+                "volumes": [{
+                    "name": "bad",
+                    "empty_dir": true
+                }],
+                "agent_volume_mounts": [{
+                    "name": "bad",
+                    "mount_path": "/var/run/secrets/openshell"
+                }]
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(err.contains("/var/run/secrets/openshell"));
+    }
+
+    #[test]
+    fn log_sidecar_mounts_must_reference_extension_volumes() {
+        let json = serde_json::json!({
+            "log_collection": {
+                "enabled": true,
+                "sidecar": {
+                    "enabled": true,
+                    "image": "otel/opentelemetry-collector-contrib:latest",
+                    "volume_mounts": [{
+                        "name": "missing-config",
+                        "mount_path": "/etc/otelcol"
+                    }]
+                }
+            }
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+
+        let err = cfg.validate().unwrap_err();
+
+        assert!(err.contains("does not reference a pod_extensions volume"));
     }
 }
