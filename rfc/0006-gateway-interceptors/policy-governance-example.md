@@ -4,7 +4,7 @@ This companion note is non-normative. It shows how one organization policy
 interceptor service could expose several bindings through its manifest, so a
 gateway operator can configure one service and selectively override behavior.
 
-The service is not special gateway integration. It uses the same
+The service is not a special gateway integration. It uses the same
 gRPC-over-TCP or gRPC-over-UDS contract available to external users.
 
 ## Example Service Bindings

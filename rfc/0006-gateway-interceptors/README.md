@@ -40,7 +40,8 @@ systems during lookup.
 
 ## Motivation
 
-OpenShell already has several centralized control-plane choke points:
+OpenShell already has several centralized control-plane paths where the gateway
+has enough context to enforce deployment-specific policy:
 
 - Sandbox creation validates requests, defaults images, validates policy
   safety, persists a sandbox object, and provisions through the selected driver.
@@ -52,10 +53,10 @@ OpenShell already has several centralized control-plane choke points:
   before the translated `DriverSandbox` reaches the compute driver.
 
 These are the right places for operator-specific control, but today those
-controls must be implemented directly in OpenShell code. That does not scale to
-organizational requirements such as:
+controls must be implemented directly in OpenShell code. That does not scale
+for organizational requirements such as:
 
-- Vend policies and providers from an external source by writing them through
+- Sync policies and providers from an external source by writing them through
   existing provider, provider profile, and config APIs.
 - Enforce one system-wide sandbox policy and reject custom sandbox policies.
 - Verify policy writes against an external authority before accepting them.
@@ -87,11 +88,25 @@ business logic around resource operations: defaulting, validation, rejection,
 and audit. Replacing how core functionality is implemented remains the role of
 drivers and other provider-style interfaces.
 
+The design keeps three boundaries intact:
+
+- The gateway database remains the system of record for gateway-owned state.
+- Existing gateway and driver validation still run after interceptor
+  modification.
+- External systems integrate through writes to OpenShell APIs, not live lookup
+  calls on runtime paths.
+
 ### Operation interceptors
 
-Operation interceptors run in request handling paths. They may modify a request or
-object only in modification phases. They may reject in validation phases. They may
+An operation interceptor runs during a gateway operation, such as creating a
+sandbox, importing provider profiles, updating policy, or translating a
+sandbox request into driver-facing configuration. It may modify a request or
+object only in modification phases. It may reject in validation phases. It may
 attach warnings and audit annotations in all phases.
+
+Interceptor services expose one or more bindings. A binding is a
+service-declared rule that maps the service to phases, resources, operations,
+and selectors. The gateway uses bindings to decide when to call the service.
 
 Operation interceptors should work for all gateway operations, not a
 hand-maintained subset. Each operation exposes stable interceptor metadata:
@@ -130,6 +145,32 @@ Gateway runtime paths read this state from the gateway store. If an external
 catalog or controller is unavailable, the gateway continues using the last
 accepted state already persisted in the DB.
 
+External systems integrate by reconciling desired state through existing
+OpenShell APIs. The gateway validates and persists those writes, then runtime
+paths read the persisted state.
+
+```mermaid
+flowchart LR
+    External[External catalog/controller] --> API[Existing OpenShell API]
+    API --> Interceptors[Operation interceptors]
+    Interceptors --> Validate[OpenShell validation]
+    Validate --> Store[Gateway DB]
+    Store --> Runtime[Gateway runtime reads]
+```
+
+Provider profile sync should use the existing provider profile import API.
+Provider sync should use the existing provider create/update APIs.
+
+Policy sync should use the existing global and sandbox-scoped config APIs.
+Managed deployments that want an authoritative global policy can set the global
+policy through `UpdateConfig --global` and use operation interceptors to reject
+sandbox-scoped policy changes.
+
+Ownership and provenance should use existing metadata surfaces where available,
+such as labels on objects and config fields on provider records. The gateway DB
+record is still authoritative; provenance explains how the current desired
+state arrived.
+
 This RFC does not introduce new gateway resource kinds for quotas, name
 policies, policy bundles, or driver config policy. Those concerns can be
 enforced by interceptor services and normal gateway configuration. If
@@ -147,6 +188,25 @@ Operation phases are ordered. Later phases see the result of earlier phases.
 | `validate_object` | no | Enforce object-level policy before persistence. |
 | `validate_driver` | no | Enforce driver-facing policy after translation to `DriverSandbox`. |
 | `post_commit` | no | Emit audit or notify external systems after successful persistence or provisioning. |
+
+For `CreateSandbox`, the phases fit into the existing gateway flow like this:
+
+```text
+authenticate request
+validate raw field sizes and labels
+pre_request interceptors
+load gateway-owned providers, policy, and settings
+gateway defaulting from stored state
+modify_object interceptors
+gateway invariant validation
+validate_object interceptors
+translate to DriverSandbox
+validate_driver interceptors
+compute driver validation
+persist sandbox
+driver create
+post_commit interceptors
+```
 
 Gateway invariants run after modification so interceptors cannot leave invalid
 objects in the system. Driver validation still runs after interceptors so
@@ -190,7 +250,7 @@ message InterceptorRequestContext {
 ```
 
 The interceptor response returns an allow/deny decision, optional patches, and
-operator-visible metadata for operation interceptors.
+diagnostic metadata for operation interceptors.
 
 ```proto
 message InterceptorDecision {
@@ -250,6 +310,14 @@ message InterceptorBinding {
   int32 order = 5;
   bool modifies = 6;
   string default_failure_policy = 7;
+  InterceptorSelector selector = 8;
+}
+
+message InterceptorSelector {
+  repeated string principal_kinds = 1;
+  repeated string principal_groups = 2;
+  map<string, string> labels = 3;
+  repeated string compute_drivers = 4;
 }
 ```
 
@@ -258,6 +326,10 @@ Operators can configure the service once, then optionally override specific
 bindings when they need to disable, narrow, or reorder behavior. Overrides
 should only narrow service-declared selectors unless a future RFC explicitly
 allows expansion.
+
+Empty selector fields match all values. For example, a binding with no
+`compute_drivers` selector can run for all drivers, while a gateway override can
+narrow it to only `kubernetes`.
 
 Example:
 
@@ -286,7 +358,7 @@ enabled = false
 [[interceptors.overrides]]
 binding = "driver-config-validation"
 failure_policy = "fail_closed"
-match = { compute_driver = "kubernetes" }
+match = { compute_drivers = ["kubernetes"] }
 
 [[interceptors.overrides]]
 binding = "policy-authority"
@@ -333,40 +405,6 @@ Defaults:
 Every interceptor service has a timeout and response size limit. Operation
 interceptor bindings also have a maximum patch count.
 
-### Worked examples
-
-See [policy-governance-example.md](policy-governance-example.md) for a
-non-normative example of an organization policy interceptor service with
-multiple service-declared bindings and gateway-side overrides.
-
-### External reconciliation through existing APIs
-
-External systems integrate by reconciling desired state through existing
-OpenShell APIs. The gateway validates and persists those writes, then runtime
-paths read the persisted state.
-
-```mermaid
-flowchart LR
-    External[External catalog/controller] --> API[Existing OpenShell API]
-    API --> Interceptors[Operation interceptors]
-    Interceptors --> Validate[OpenShell validation]
-    Validate --> Store[Gateway DB]
-    Store --> Runtime[Gateway runtime reads]
-```
-
-Provider profile sync should use the existing provider profile import API.
-Provider sync should use the existing provider create/update APIs.
-
-Policy sync should use the existing global and sandbox-scoped config APIs.
-Managed deployments that want an authoritative global policy can set the global
-policy through `UpdateConfig --global` and use operation interceptors to reject
-sandbox-scoped policy changes.
-
-Ownership and provenance should use existing metadata surfaces where available,
-such as labels on objects and config fields on provider records. The gateway DB
-record is still authoritative; provenance explains how the current desired
-state arrived.
-
 ### Gateway info surface
 
 The first version should not add a dedicated interceptor management API or CLI.
@@ -374,7 +412,7 @@ Interceptor configuration remains gateway-local configuration.
 
 The existing gateway info command may expose a read-only summary of configured
 interceptor services, enabled bindings, effective failure policies, and last
-observed health. That is sufficient for operator visibility in this RFC.
+observed health. That is sufficient for operational visibility in this RFC.
 
 ### Observability and audit
 
@@ -413,6 +451,12 @@ Rules:
   Operation interceptor patches are also bounded by patch count.
 - Interceptor services cannot replace built-in validation. Imported profiles and
   policies are validated before use.
+
+### Worked examples
+
+See [policy-governance-example.md](policy-governance-example.md) for a
+non-normative example of an organization policy interceptor service with
+multiple service-declared bindings and gateway-side overrides.
 
 ## Implementation plan
 
