@@ -69,6 +69,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Getting Started | `debug-openshell-cluster` | Diagnose gateway deployment and health issues                                                       |
 | Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
+| Contributing    | `create-rfc`              | Create RFC proposals from the repository template                                                   |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
 | Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
 | Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
@@ -78,6 +79,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
 | Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
+| Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
 | Documentation   | `update-docs`             | Scan recent commits and draft doc updates for user-facing changes                                   |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
@@ -94,6 +96,7 @@ Skills connect into pipelines. Individual skill files don't describe these relat
 
 Workflow state labels use the `state:*` prefix, and security work uses `topic:security`. GitHub issue templates assign built-in issue types where applicable, and agent-created issues should use issue types or manual follow-up rather than type labels.
 New issues opened by users without `write`, `maintain`, or `admin` repository permission are automatically labeled `state:triage-needed` by the issue triage workflow.
+Inactive issues and pull requests are automatically labeled `state:stale` after 14 days without activity and may be closed after 7 more days without activity. Comment on the item or remove `state:stale` to keep it open. Issues labeled `state:triage-needed` or `roadmap` are exempt from stale handling.
 
 ## Prerequisites
 
@@ -222,7 +225,7 @@ These are the primary `mise` tasks for day-to-day development:
 
 ## RFCs
 
-For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, use the RFC process. RFCs live in `rfc/` — copy the template, fill it in, and open a PR for discussion. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines on when to write an RFC versus a spike issue or architecture doc.
+New features always start as GitHub issues using the feature request template. For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, maintainers may ask for an RFC from the issue and assign an RFC number there. RFCs live in `rfc/`. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines.
 
 ## Documentation
 

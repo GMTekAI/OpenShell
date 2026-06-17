@@ -768,7 +768,21 @@ fn build_provider_url(
 
 fn build_backend_url(endpoint: &str, path: &str) -> String {
     let base = endpoint.trim_end_matches('/');
-    if base.ends_with("/v1") && (path == "/v1" || path.starts_with("/v1/")) {
+    // Strip the /v1 prefix from the request path when the base URL's path
+    // component has /v1 as its first segment (e.g. openai/nvidia: "/v1",
+    // deepinfra: "/v1/openai") or its final segment (e.g. groq:
+    // "/openai/v1"). This covers all known provider shapes while preserving
+    // the full path for proxy endpoints where /v1 is buried in the middle
+    // (e.g. "https://proxy.example/api/v1/openai" → path "/api/v1/openai",
+    // neither first nor last segment).
+    let base_path_has_v1_edge_segment = base
+        .find("://")
+        .and_then(|i| base[i + 3..].find('/').map(|j| i + 3 + j))
+        .is_some_and(|path_start| {
+            let base_path = &base[path_start..];
+            base_path.starts_with("/v1/") || base_path.ends_with("/v1")
+        });
+    if base_path_has_v1_edge_segment && (path == "/v1" || path.starts_with("/v1/")) {
         return format!("{base}{}", &path[3..]);
     }
 
@@ -828,6 +842,44 @@ mod tests {
         assert_eq!(
             build_backend_url("https://api.openai.com/v1", "/v1"),
             "https://api.openai.com/v1"
+        );
+    }
+
+    #[test]
+    fn build_backend_url_dedupes_v1_for_base_with_v1_subpath() {
+        // DeepInfra base URL contains /v1/ internally — /v1 in the request
+        // path must still be stripped so chat/completions is not doubled.
+        assert_eq!(
+            build_backend_url(
+                "https://api.deepinfra.com/v1/openai",
+                "/v1/chat/completions"
+            ),
+            "https://api.deepinfra.com/v1/openai/chat/completions"
+        );
+    }
+
+    #[test]
+    fn build_backend_url_dedupes_v1_for_base_ending_with_v1() {
+        // Providers like Groq use a base URL where /v1 is the final segment
+        // below a non-root prefix (e.g. /openai/v1). The /v1 in the request
+        // path must still be stripped so it is not doubled.
+        assert_eq!(
+            build_backend_url("https://api.groq.com/openai/v1", "/v1/chat/completions"),
+            "https://api.groq.com/openai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn build_backend_url_preserves_v1_for_nested_proxy_path() {
+        // A proxy whose base path has /v1 buried in the middle (neither first
+        // nor last segment) must NOT have /v1 stripped — the full request
+        // path must be appended so the upstream receives the correct prefix.
+        assert_eq!(
+            build_backend_url(
+                "https://proxy.example/api/v1/openai",
+                "/v1/chat/completions"
+            ),
+            "https://proxy.example/api/v1/openai/v1/chat/completions"
         );
     }
 
