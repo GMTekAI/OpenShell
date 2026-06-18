@@ -8,7 +8,7 @@ links:
   - https://github.com/NVIDIA/OpenShell/issues/1734
 ---
 
-# RFC 0005 - Sandbox Egress Middleware
+# RFC 0009 - Sandbox Egress Middleware
 
 ## Summary
 
