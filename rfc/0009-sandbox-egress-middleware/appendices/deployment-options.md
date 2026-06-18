@@ -22,7 +22,7 @@ Tradeoffs:
 
 ## Future options
 
-These are recorded as directions, not committed designs.
+These are recorded as directions, not committed designs. They have no committed timeline in this RFC; sequencing depends on the initial external-service implementation, adoption feedback, and the availability of supporting primitives such as sandbox-to-sandbox communication.
 
 ### Middleware running inside its own sandbox
 
