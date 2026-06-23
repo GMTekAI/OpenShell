@@ -1738,9 +1738,9 @@ async fn profile_import_attached_sandbox_diagnostics(
                 diagnostics.push(ProfileValidationDiagnostic {
                     source: source.clone(),
                     profile_id: profile_id.clone(),
-                    field: "credentials.token_grant.audience_overrides".to_string(),
+                    field: "credentials".to_string(),
                     message: format!(
-                        "import would create ambiguous dynamic token grants on sandbox '{sandbox_name}': {}",
+                        "import would create ambiguous provider credential bindings on sandbox '{sandbox_name}': {}",
                         err.message()
                     ),
                     severity: "error".to_string(),
@@ -3042,7 +3042,7 @@ mod tests {
         assert!(response.diagnostics.iter().any(|diagnostic| {
             diagnostic
                 .message
-                .contains("import would create ambiguous dynamic token grants")
+                .contains("import would create ambiguous provider credential bindings")
         }));
     }
 
