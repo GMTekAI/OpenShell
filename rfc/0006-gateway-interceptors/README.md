@@ -268,6 +268,7 @@ Gateway config example for a remote policy provider:
 [[interceptors]]
 name = "policy-provider"
 endpoint = "grpcs://policy-provider.example.com:8443"
+order = 100
 failure_policy = "fail_closed"
 timeout = "500ms"
 ```
@@ -314,17 +315,17 @@ interceptor bindings also have a maximum patch count.
 
 Every interceptor decision should emit structured gateway logs with:
 
-- interceptor name.
-- binding ID.
-- phase.
-- RPC service and method.
-- principal.
-- decision.
-- reason.
-- latency.
-- failure policy.
-- patch count.
-- audit annotations.
+- interceptor name
+- binding ID
+- phase
+- RPC service and method
+- principal
+- decision
+- reason
+- latency
+- failure policy
+- patch count
+- audit annotations
 
 Security-relevant denials should be emitted as OCSF detection findings or
 configuration/security events, depending on the event class. Non-security
@@ -412,6 +413,7 @@ bindings:
 [[interceptors]]
 name = "policy-provider"
 endpoint = "grpcs://policy-provider.example.com:8443"
+order = 100
 failure_policy = "fail_closed"
 timeout = "500ms"
 ```
