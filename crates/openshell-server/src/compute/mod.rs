@@ -1123,6 +1123,7 @@ impl ComputeRuntime {
                     created_at_ms: now_ms,
                     labels: std::collections::HashMap::new(),
                     resource_version: 0,
+                    annotations: std::collections::HashMap::new(),
                 }),
                 spec: None,
                 status,
@@ -2312,6 +2313,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             ..Default::default()
         };
@@ -2327,6 +2329,7 @@ mod tests {
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
                 resource_version: 0,
+                annotations: HashMap::new(),
             }),
             sandbox_id: sandbox_id.to_string(),
             token: format!("token-{id}"),
@@ -3375,6 +3378,7 @@ mod tests {
             created_at_ms: 1_000_000,
             labels: HashMap::new(),
             resource_version: 0,
+            annotations: HashMap::new(),
         });
 
         let created = runtime.create_sandbox(sandbox, None).await.unwrap();
