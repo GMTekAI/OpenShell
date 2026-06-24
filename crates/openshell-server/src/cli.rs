@@ -365,6 +365,11 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
             args.grpc_rate_limit_requests,
             args.grpc_rate_limit_window_seconds,
         )
+        .with_gateway_interceptors(
+            file.as_ref()
+                .map(|f| f.openshell.gateway.interceptors.clone())
+                .unwrap_or_default(),
+        )
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
     validate_grpc_rate_limit_args(
