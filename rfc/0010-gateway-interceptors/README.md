@@ -101,9 +101,9 @@ The design keeps two boundaries intact:
 
 A gateway interceptor runs during a gateway API operation, such as creating a
 sandbox, importing provider profiles, updating policy, or applying sandbox
-configuration. It may modify an RPC request or operation input only in
-modification phases. It may reject in validation phases. It may attach warnings
-and audit annotations in all phases.
+configuration. It may modify a gateway-prepared operation only in
+`modify_operation`. It may reject in `modify_operation` or `validate`. It may
+attach warnings and audit annotations in all phases.
 
 Gateway interceptor services expose one or more bindings. A binding is a
 service-declared rule that maps the service to phases, gateway RPC methods, and
@@ -140,10 +140,13 @@ gateway interceptor authors and operators do not need per-RPC phase rules.
 
 | Phase | Modification allowed | Purpose | Examples |
 |---|---:|---|---|
-| `pre_request` | yes | Normalize or reject the RPC request after auth and basic size limits. | Normalize labels, require a sandbox name prefix, or reject requests with unsupported request fields. |
-| `modify_operation` | yes | Apply defaults or controlled changes after the gateway prepares the operation input. | Stamp a default sandbox policy, select a provider profile, or clamp resource limits to deployment defaults. |
+| `modify_operation` | yes | Apply deployment defaults or controlled changes after the gateway prepares the operation input. | Normalize labels, stamp a default sandbox policy, select a provider profile, or clamp resource limits to deployment defaults. |
 | `validate` | no | Enforce deployment-specific rules before persistence, provisioning, or other side effects. | Enforce tenant quotas, reject policy updates that allow internet egress, or verify driver config against an approved schema. |
 | `post_commit` | no | Emit audit or notify external systems after successful persistence or provisioning. | Send audit records, notify an inventory system, or trigger a reconciliation job after a successful write. |
+
+The gateway rejects malformed raw API requests before gateway interceptor
+execution. Gateway interceptors operate on valid gateway operations, not
+low-level request decoding or shape repair.
 
 Gateway invariants run after modification so gateway interceptors cannot leave
 invalid objects in the system. Operation-specific built-in validation, including
@@ -166,10 +169,9 @@ message DescribeRequest {}
 
 enum GatewayInterceptorPhase {
   GATEWAY_INTERCEPTOR_PHASE_UNSPECIFIED = 0;
-  GATEWAY_INTERCEPTOR_PHASE_PRE_REQUEST = 1;
-  GATEWAY_INTERCEPTOR_PHASE_MODIFY_OPERATION = 2;
-  GATEWAY_INTERCEPTOR_PHASE_VALIDATE = 3;
-  GATEWAY_INTERCEPTOR_PHASE_POST_COMMIT = 4;
+  GATEWAY_INTERCEPTOR_PHASE_MODIFY_OPERATION = 1;
+  GATEWAY_INTERCEPTOR_PHASE_VALIDATE = 2;
+  GATEWAY_INTERCEPTOR_PHASE_POST_COMMIT = 3;
 }
 ```
 
@@ -193,20 +195,13 @@ message InterceptorEvaluation {
   map<string, string> context = 6;
 
   oneof phase {
-    // Evaluation before the gateway prepares operation-specific input.
-    PreRequestEvaluation pre_request = 7;
     // Evaluation that may modify the prepared gateway operation.
-    ModifyOperationEvaluation modify_operation = 8;
+    ModifyOperationEvaluation modify_operation = 7;
     // Evaluation that may reject, but not mutate, the prepared operation.
-    ValidateEvaluation validate = 9;
+    ValidateEvaluation validate = 8;
     // Evaluation after the gateway operation has committed.
-    PostCommitEvaluation post_commit = 10;
+    PostCommitEvaluation post_commit = 9;
   }
-}
-
-message PreRequestEvaluation {
-  // Raw public gateway API request.
-  google.protobuf.Struct api_request = 1;
 }
 
 message ModifyOperationEvaluation {
@@ -239,7 +234,6 @@ qualified RPC selector used by bindings. For example,
 
 The gateway sets exactly one `phase` variant per evaluation. The active variant
 identifies the selected phase and determines which payload is available.
-`pre_request.api_request` is the raw public gateway API request.
 `proposed_operation` is the gateway-prepared operation after state loading,
 defaulting, and prior patches; it is present for `modify_operation`, `validate`,
 and `post_commit`. `current_state` accompanies prepared-operation phases as
@@ -261,16 +255,14 @@ message InterceptorResult {
 
 The gateway projects a valid `InterceptorResult` onto the gateway operation.
 `allowed = true` lets the operation continue. `allowed = false` rejects the
-gateway API operation in `pre_request`, `modify_operation`, or `validate`,
-using `status_code` and `reason`. Only modification phases accept patches:
-`pre_request` patches apply to `pre_request.api_request`, and
-`modify_operation` patches apply to
-`modify_operation.proposed_operation`. `current_state` is read-only context and
-is never patched. `warnings` and `audit_annotations` are projected into gateway
-response metadata and logs where applicable. `post_commit` runs after the
-gateway operation has committed, so it cannot reject or mutate the operation. A
-`post_commit` result with `allowed = false` or patches is a gateway interceptor
-contract violation.
+gateway API operation in `modify_operation` or `validate`, using `status_code`
+and `reason`. Only `modify_operation` accepts patches, and those patches apply
+to `modify_operation.proposed_operation`. `current_state` is read-only context
+and is never patched. `warnings` and `audit_annotations` are projected into
+gateway response metadata and logs where applicable. `post_commit` runs after
+the gateway operation has committed, so it cannot reject or mutate the
+operation. A `post_commit` result with `allowed = false` or patches is a gateway
+interceptor contract violation.
 
 The `binding_id` is owned by the gateway interceptor service. It identifies the
 service-declared binding that selected the evaluation.
@@ -326,8 +318,8 @@ allows expansion.
 Empty selector fields match all values. A gateway override can narrow a
 service-declared selector, such as limiting a binding to a specific RPC.
 Patch capability is derived from the selected phase, not from a separate binding
-flag. A binding in `pre_request` or `modify_operation` may return zero or more
-patches. A binding in `validate` or `post_commit` must not return patches.
+flag. A binding in `modify_operation` may return zero or more patches. A
+binding in `validate` or `post_commit` must not return patches.
 
 Gateway config example for a remote policy provider:
 
@@ -365,8 +357,8 @@ Failure policy is gateway control-plane behavior for cases where the gateway
 cannot obtain or apply a valid gateway interceptor result. Examples include
 timeout, transport failure, service error, invalid response, response-size
 violation, invalid phase behavior, or patch limit violation. A valid
-`allowed = false` result in `pre_request`, `modify_operation`, or `validate` is
-not an error-policy case; the gateway must project it as an operation rejection.
+`allowed = false` result in `modify_operation` or `validate` is not an
+error-policy case; the gateway must project it as an operation rejection.
 
 Each binding has an effective failure policy. The gateway starts with the
 service-declared binding `on_error` value, applies the gateway interceptor
@@ -380,8 +372,7 @@ service-level gateway config, then applies any binding override.
 
 Defaults:
 
-- `pre_request`, `modify_operation`, and `validate` bindings default to
-  `fail_closed`.
+- `modify_operation` and `validate` bindings default to `fail_closed`.
 - `post_commit` bindings default to `ignore`.
 
 The gateway enforces a timeout and response size limit for every gateway
@@ -523,8 +514,8 @@ This example illustrates the general gateway interceptor design loop:
 4. Build an execution plan from service manifests plus gateway-configured
    overrides.
 5. Wire gateway interceptor execution into the gateway API operation pipeline so
-   all gateway operations can pass through `pre_request`, `modify_operation`,
-   `validate`, and `post_commit` where applicable.
+   all gateway operations can pass through `modify_operation`, `validate`, and
+   `post_commit` where applicable.
 6. Audit existing gateway operations and route each resource-affecting path
    through the shared gateway interceptor pipeline.
 7. Add gateway interceptor result audit logging and metrics.
