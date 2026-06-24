@@ -182,27 +182,52 @@ message InterceptorEvaluation {
   string interceptor_name = 1;
   // Service-declared binding that selected this evaluation.
   string binding_id = 2;
-  // Gateway operation phase for this evaluation.
-  GatewayInterceptorPhase phase = 3;
   // Fully qualified public gateway gRPC service name.
-  string rpc_service = 4;
+  string rpc_service = 3;
   // Public gateway RPC method name.
-  string rpc_method = 5;
+  string rpc_method = 4;
 
   // Authenticated gateway principal for the API request.
-  string principal = 6;
+  string principal = 5;
   // Additional gateway-provided request context.
-  map<string, string> context = 7;
+  map<string, string> context = 6;
 
-  oneof payload {
-    // Raw public gateway API request. Present for pre_request.
-    google.protobuf.Struct api_request = 8;
-    // Gateway-prepared operation the gateway proposes to execute.
-    google.protobuf.Struct proposed_operation = 9;
+  oneof phase {
+    // Evaluation before the gateway prepares operation-specific input.
+    PreRequestEvaluation pre_request = 7;
+    // Evaluation that may modify the prepared gateway operation.
+    ModifyOperationEvaluation modify_operation = 8;
+    // Evaluation that may reject, but not mutate, the prepared operation.
+    ValidateEvaluation validate = 9;
+    // Evaluation after the gateway operation has committed.
+    PostCommitEvaluation post_commit = 10;
   }
+}
 
+message PreRequestEvaluation {
+  // Raw public gateway API request.
+  google.protobuf.Struct api_request = 1;
+}
+
+message ModifyOperationEvaluation {
+  // Gateway-prepared operation the gateway proposes to execute.
+  google.protobuf.Struct proposed_operation = 1;
   // Gateway-owned resource state loaded before applying the proposed operation.
-  google.protobuf.Struct current_state = 10;
+  google.protobuf.Struct current_state = 2;
+}
+
+message ValidateEvaluation {
+  // Gateway-prepared operation after defaulting and modification.
+  google.protobuf.Struct proposed_operation = 1;
+  // Gateway-owned resource state loaded before applying the proposed operation.
+  google.protobuf.Struct current_state = 2;
+}
+
+message PostCommitEvaluation {
+  // Gateway operation that was committed.
+  google.protobuf.Struct proposed_operation = 1;
+  // Gateway-owned resource state loaded before applying the committed operation.
+  google.protobuf.Struct current_state = 2;
 }
 ```
 
@@ -212,12 +237,13 @@ qualified RPC selector used by bindings. For example,
 `rpc_service = "openshell.v1.OpenShell"` and
 `rpc_method = "CreateSandbox"`.
 
-The gateway sets exactly one payload variant per evaluation. `api_request` is
-the raw public gateway API request available to `pre_request`.
+The gateway sets exactly one `phase` variant per evaluation. The active variant
+identifies the selected phase and determines which payload is available.
+`pre_request.api_request` is the raw public gateway API request.
 `proposed_operation` is the gateway-prepared operation after state loading,
-defaulting, and prior patches; it is the main payload for `modify_operation`,
-`validate`, and `post_commit`. `current_state` stays outside the `oneof` because
-it can accompany update-style operations as read-only context.
+defaulting, and prior patches; it is present for `modify_operation`, `validate`,
+and `post_commit`. `current_state` accompanies prepared-operation phases as
+read-only context when the gateway loaded prior gateway-owned state.
 
 The gateway interceptor response returns an allow/deny result, optional
 patches, and diagnostic metadata for selected gateway operations.
@@ -237,11 +263,12 @@ The gateway projects a valid `InterceptorResult` onto the gateway operation.
 `allowed = true` lets the operation continue. `allowed = false` rejects the
 gateway API operation in `pre_request`, `modify_operation`, or `validate`,
 using `status_code` and `reason`. Only modification phases accept patches:
-`pre_request` patches apply to `api_request`, and `modify_operation` patches
-apply to `proposed_operation`. `current_state` is read-only context and is never
-patched. `warnings` and `audit_annotations` are projected into gateway response
-metadata and logs where applicable. `post_commit` runs after the gateway
-operation has committed, so it cannot reject or mutate the operation. A
+`pre_request` patches apply to `pre_request.api_request`, and
+`modify_operation` patches apply to
+`modify_operation.proposed_operation`. `current_state` is read-only context and
+is never patched. `warnings` and `audit_annotations` are projected into gateway
+response metadata and logs where applicable. `post_commit` runs after the
+gateway operation has committed, so it cannot reject or mutate the operation. A
 `post_commit` result with `allowed = false` or patches is a gateway interceptor
 contract violation.
 
@@ -414,17 +441,22 @@ InterceptorManifest {
 }
 ```
 
-The handler can then focus on the phase and RPC method that selected the
-binding:
+The handler can then focus on the active phase variant and RPC method that
+selected the binding:
 
 ```rust
 // Toy implementation of the GatewayInterceptor Evaluate RPC.
 async fn evaluate(&self, req: InterceptorEvaluation) -> InterceptorResult {
-    match (req.rpc_method.as_str(), req.phase) {
+    use interceptor_evaluation::Phase;
+
+    match (req.rpc_method.as_str(), req.phase.as_ref()) {
         // CreateSandbox: ask the remote policy provider for the approved
         // initial policy and stamp it into the prepared operation input.
-        ("CreateSandbox", GatewayInterceptorPhase::ModifyOperation) => {
-            let approved_policy = self.policy_provider.initial_policy(&req).await;
+        ("CreateSandbox", Some(Phase::ModifyOperation(phase))) => {
+            let approved_policy = self
+                .policy_provider
+                .initial_policy(&phase.proposed_operation)
+                .await;
 
             InterceptorResult::allow().with_patch(JsonPatch::replace(
                 "/policy",
@@ -433,8 +465,11 @@ async fn evaluate(&self, req: InterceptorEvaluation) -> InterceptorResult {
         }
 
         // UpdateConfig: reject policy writes the remote provider does not approve.
-        ("UpdateConfig", GatewayInterceptorPhase::Validate) => {
-            let validation = self.policy_provider.validate_update(&req).await;
+        ("UpdateConfig", Some(Phase::Validate(phase))) => {
+            let validation = self
+                .policy_provider
+                .validate_update(&phase.proposed_operation, &phase.current_state)
+                .await;
             if !validation.allowed {
                 return InterceptorResult::reject(
                     "PERMISSION_DENIED",
