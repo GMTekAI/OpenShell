@@ -188,6 +188,18 @@ jobs:
           sudo snap connect openshell:ssh-keys
           sudo snap restart openshell.gateway
 
+      - name: Diagnose snap CLI environment
+        run: |
+          set -euo pipefail
+          snap version
+          snap debug confinement
+          snap connections openshell
+          type -a openshell
+          readlink -f "$(command -v openshell)"
+          snap run --shell openshell <<'EOF'
+          env | sort | grep -E '^(HOME|XDG_CONFIG_HOME|SNAP_USER_DATA|SNAP_USER_COMMON|SNAP_REAL_HOME)=' || true
+          EOF
+
       - name: Register snap gateway and check status
         run: |
           set -euo pipefail
