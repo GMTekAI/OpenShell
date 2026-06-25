@@ -90,7 +90,6 @@ pub struct SandboxSpec {
     pub environment: Option<HashMap<String, String>>,
     pub providers: Option<Vec<String>>,
     pub gpu: Option<bool>,
-    pub gpu_device: Option<String>,
 }
 
 /// Options for [`OpenShellClient::list_sandboxes`].
@@ -164,7 +163,6 @@ fn sdk_spec_from_js(spec: SandboxSpec) -> sdk::SandboxSpec {
         environment: spec.environment.unwrap_or_default(),
         providers: spec.providers.unwrap_or_default(),
         gpu: spec.gpu.unwrap_or(false),
-        gpu_device: spec.gpu_device,
     }
 }
 

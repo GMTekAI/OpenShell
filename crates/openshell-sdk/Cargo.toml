@@ -27,7 +27,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-tungstenite = { workspace = true }
-tonic = { workspace = true, features = ["tls", "tls-native-roots"] }
+tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tower = { workspace = true }
 tracing = { workspace = true }
 

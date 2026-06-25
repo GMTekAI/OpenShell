@@ -102,10 +102,6 @@ pub struct SandboxSpec {
     pub providers: Vec<String>,
     /// Request a GPU.
     pub gpu: bool,
-    /// Driver-specific GPU device selector (CDI ID for Docker/Podman; BDF or
-    /// index for VM). Only meaningful when `gpu` is true; empty defers to the
-    /// driver's default selection.
-    pub gpu_device: Option<String>,
 }
 
 /// Reference to a sandbox owned by the gateway.
@@ -122,10 +118,11 @@ pub struct SandboxRef {
 impl SandboxRef {
     pub(crate) fn from_proto(sandbox: proto::Sandbox) -> Self {
         let meta = sandbox.metadata.unwrap_or_default();
+        let phase = sandbox.status.unwrap_or_default().phase;
         Self {
             id: meta.id,
             name: meta.name,
-            phase: sandbox.phase.into(),
+            phase: phase.into(),
             labels: meta.labels,
             resource_version: meta.resource_version,
         }

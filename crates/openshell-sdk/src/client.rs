@@ -290,19 +290,20 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
         environment,
         providers,
         gpu,
-        gpu_device,
     } = spec;
     let template = image.map(|image| proto::SandboxTemplate {
         image,
         ..proto::SandboxTemplate::default()
+    });
+    let resource_requirements = gpu.then(|| proto::ResourceRequirements {
+        gpu: Some(proto::GpuResourceRequirements { count: None }),
     });
     proto::CreateSandboxRequest {
         spec: Some(proto::SandboxSpec {
             environment,
             template,
             providers,
-            gpu,
-            gpu_device: gpu_device.unwrap_or_default(),
+            resource_requirements,
             ..proto::SandboxSpec::default()
         }),
         name: name.unwrap_or_default(),

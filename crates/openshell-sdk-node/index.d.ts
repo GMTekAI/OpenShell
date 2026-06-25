@@ -134,5 +134,4 @@ export interface SandboxSpec {
   environment?: Record<string, string>
   providers?: Array<string>
   gpu?: boolean
-  gpuDevice?: string
 }

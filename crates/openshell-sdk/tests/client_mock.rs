@@ -52,9 +52,10 @@ fn sandbox_with_phase(name: &str, phase: proto::SandboxPhase) -> proto::Sandbox 
             resource_version: 1,
         }),
         spec: None,
-        status: None,
-        phase: phase.into(),
-        current_policy_version: 0,
+        status: Some(proto::SandboxStatus {
+            phase: phase.into(),
+            ..Default::default()
+        }),
     }
 }
 
@@ -68,6 +69,13 @@ impl OpenShell for TestOpenShell {
             status: proto::ServiceStatus::Healthy.into(),
             version: "test-1.2.3".to_string(),
         }))
+    }
+
+    async fn update_provider_profiles(
+        &self,
+        _: tonic::Request<proto::UpdateProviderProfilesRequest>,
+    ) -> Result<Response<proto::UpdateProviderProfilesResponse>, Status> {
+        Ok(Response::new(proto::UpdateProviderProfilesResponse::default()))
     }
 
     async fn create_sandbox(
@@ -599,7 +607,13 @@ async fn create_sandbox_passes_spec_through() {
     assert_eq!(observed.name, "my-box");
     assert_eq!(observed.labels, labels);
     let observed_spec = observed.spec.unwrap();
-    assert!(observed_spec.gpu);
+    assert!(
+        observed_spec
+            .resource_requirements
+            .as_ref()
+            .and_then(|r| r.gpu.as_ref())
+            .is_some()
+    );
     assert_eq!(
         observed_spec.template.as_ref().unwrap().image,
         "ghcr.io/foo:bar"
