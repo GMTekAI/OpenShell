@@ -467,6 +467,27 @@ pub fn create_netns_for_proxy(
     }
 }
 
+/// Install pod-network bypass enforcement for Kubernetes sidecar topology.
+///
+/// This runs in the current network namespace, not in a per-workload netns.
+/// The rules allow loopback and the sidecar proxy UID, then reject direct
+/// TCP/UDP egress from other UIDs so traffic must use the sidecar's local
+/// proxy.
+///
+/// # Errors
+///
+/// Returns an error when `nft` is unavailable or the ruleset cannot be loaded.
+pub fn install_sidecar_bypass_rules(proxy_uid: u32) -> Result<()> {
+    let nft_cmd = find_nft().ok_or_else(|| {
+        miette::miette!(
+            "trusted nft helper not found; sidecar network enforcement requires nftables"
+        )
+    })?;
+    let log_prefix = Some("openshell:sidecar-bypass:");
+    let ruleset = nft_ruleset::generate_sidecar_bypass_ruleset(proxy_uid, log_prefix);
+    run_nft_current_namespace(&nft_cmd, &ruleset)
+}
+
 /// Run an `ip` command on the host.
 fn run_ip(args: &[&str]) -> Result<()> {
     let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
@@ -483,6 +504,39 @@ fn run_ip(args: &[&str]) -> Result<()> {
         return Err(miette::miette!(
             "{ip_path} {} failed: {}",
             args.join(" "),
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
+}
+
+fn run_nft_current_namespace(nft_cmd: &str, ruleset: &str) -> Result<()> {
+    use std::io::Write;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("openshell-sidecar-nft-")
+        .suffix(".conf")
+        .tempfile()
+        .into_diagnostic()?;
+    tmp.write_all(ruleset.as_bytes()).into_diagnostic()?;
+    let ruleset_path = tmp.path().to_string_lossy().to_string();
+
+    debug!(
+        command = %format!("{nft_cmd} -f {ruleset_path}"),
+        "Loading nftables sidecar ruleset"
+    );
+
+    let output = Command::new(nft_cmd)
+        .args(["-f", &ruleset_path])
+        .output()
+        .into_diagnostic()?;
+
+    drop(tmp);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!(
+            "sidecar nft ruleset load failed: {}",
             stderr.trim()
         ));
     }

@@ -15,6 +15,9 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
+/// Default UID for the long-running Kubernetes network supervisor sidecar.
+pub const DEFAULT_SIDECAR_PROXY_UID: u32 = 1337;
+
 /// How the supervisor binary is delivered into sandbox pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -47,6 +50,41 @@ impl FromStr for SupervisorSideloadMethod {
             "init-container" => Ok(Self::InitContainer),
             other => Err(format!(
                 "unknown supervisor sideload method '{other}'; expected 'image-volume' or 'init-container'"
+            )),
+        }
+    }
+}
+
+/// How the supervisor is arranged inside Kubernetes sandbox pods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupervisorTopology {
+    /// Run networking and process supervision in the agent container.
+    #[default]
+    Combined,
+    /// Run network supervision in a privileged sidecar and process supervision
+    /// as a low-capability wrapper in the agent container.
+    Sidecar,
+}
+
+impl std::fmt::Display for SupervisorTopology {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Combined => f.write_str("combined"),
+            Self::Sidecar => f.write_str("sidecar"),
+        }
+    }
+}
+
+impl FromStr for SupervisorTopology {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "combined" => Ok(Self::Combined),
+            "sidecar" => Ok(Self::Sidecar),
+            other => Err(format!(
+                "unknown supervisor topology '{other}'; expected 'combined' or 'sidecar'"
             )),
         }
     }
@@ -176,6 +214,14 @@ pub struct KubernetesComputeConfig {
     pub supervisor_image_pull_policy: String,
     /// How the supervisor binary is delivered into sandbox pods.
     pub supervisor_sideload_method: SupervisorSideloadMethod,
+    /// Supervisor pod topology. `combined` preserves the existing single
+    /// root supervisor container path; `sidecar` moves pod-level network
+    /// enforcement into a dedicated sidecar container.
+    pub supervisor_topology: SupervisorTopology,
+    /// UID used by the long-running network sidecar in `sidecar` topology.
+    /// The network init container installs nftables rules that exempt this
+    /// UID, so it must not match the sandbox workload UID.
+    pub sidecar_proxy_uid: u32,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
@@ -213,7 +259,7 @@ pub struct KubernetesComputeConfig {
     pub provider_spiffe_workload_api_socket_path: String,
     /// UID used for the supervisor container `securityContext.runAsUser` and
     /// PVC init container ownership operations. When empty, the driver
-    /// auto-detects from OpenShift SCC annotations on the target namespace;
+    /// auto-detects from `OpenShift` SCC annotations on the target namespace;
     /// if those are also absent, falls back to `1000`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_uid: Option<u32>,
@@ -231,15 +277,15 @@ pub const MIN_SA_TOKEN_TTL_SECS: i64 = 600;
 /// pod start).
 pub const MAX_SA_TOKEN_TTL_SECS: i64 = 86_400;
 
-/// Default sandbox UID used when neither config nor OpenShift SCC annotations
+/// Default sandbox UID used when neither config nor `OpenShift` SCC annotations
 /// provide a resolved value.
 pub(crate) const DEFAULT_SANDBOX_UID: u32 = 1000;
 
-/// The annotation key for the OpenShift ServiceAccount UID range.
+/// The annotation key for the `OpenShift` `ServiceAccount` UID range.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
 pub const ANNOTATION_SCC_UID_RANGE: &str = "openshift.io/sa.scc.uid-range";
 
-/// The annotation key for the OpenShift ServiceAccount supplemental groups.
+/// The annotation key for the `OpenShift` `ServiceAccount` supplemental groups.
 /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
 pub const ANNOTATION_SCC_SUPPLEMENTAL_GROUPS: &str = "openshift.io/sa.scc.supplemental-groups";
 
@@ -258,6 +304,8 @@ impl Default for KubernetesComputeConfig {
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            supervisor_topology: SupervisorTopology::default(),
+            sidecar_proxy_uid: DEFAULT_SIDECAR_PROXY_UID,
             grpc_endpoint: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             client_tls_secret_name: String::new(),
@@ -302,11 +350,21 @@ impl KubernetesComputeConfig {
         )
     }
 
+    pub fn validate_sidecar_proxy_uid(&self) -> Result<(), String> {
+        if self.sidecar_proxy_uid < openshell_policy::MIN_SANDBOX_UID {
+            return Err(format!(
+                "sidecar_proxy_uid must be at least {}",
+                openshell_policy::MIN_SANDBOX_UID
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve the sandbox UID/GID pair.
     ///
     /// Resolution order:
     /// 1. Configured `sandbox_uid` / `sandbox_gid` (explicit override)
-    /// 2. OpenShift SCC namespace annotations (`sa.scc.uid-range`,
+    /// 2. `OpenShift` SCC namespace annotations (`sa.scc.uid-range`,
     ///    `sa.scc.supplemental-groups`) — passed in as the optional
     ///    `namespace_annotations` map
     /// 3. Fallback defaults: UID=`1000`, GID=UID
@@ -318,12 +376,11 @@ impl KubernetesComputeConfig {
             return uid;
         }
         // Try OpenShift SCC annotation.
-        if let Some(anns) = namespace_annotations {
-            if let Some(range) = anns.get(ANNOTATION_SCC_UID_RANGE) {
-                if let Some(uid) = Self::from_open_shift_uid_range(range) {
-                    return uid;
-                }
-            }
+        if let Some(anns) = namespace_annotations
+            && let Some(range) = anns.get(ANNOTATION_SCC_UID_RANGE)
+            && let Some(uid) = Self::from_open_shift_uid_range(range)
+        {
+            return uid;
         }
         DEFAULT_SANDBOX_UID
     }
@@ -334,11 +391,11 @@ impl KubernetesComputeConfig {
         _namespace_annotations: Option<&std::collections::BTreeMap<String, String>>,
     ) -> u32 {
         self.sandbox_gid
-            .or_else(|| self.sandbox_uid)
+            .or(self.sandbox_uid)
             .unwrap_or(resolved_uid)
     }
 
-    /// Parse OpenShift SCC `sa.scc.uid-range` annotation.
+    /// Parse `OpenShift` SCC `sa.scc.uid-range` annotation.
     ///
     /// Format: `<start>/<size>` (e.g. `1000000000/10000`).
     pub fn from_open_shift_uid_range(annotation: &str) -> Option<u32> {
@@ -350,7 +407,7 @@ impl KubernetesComputeConfig {
             .filter(|&uid| uid >= openshell_policy::MIN_SANDBOX_UID)
     }
 
-    /// Parse OpenShift SCC `sa.scc.supplemental-groups` annotation.
+    /// Parse `OpenShift` SCC `sa.scc.supplemental-groups` annotation.
     pub fn from_open_shift_supplemental_groups(annotation: &str) -> Option<u32> {
         let (start, _) = annotation.split_once('/')?;
         start
@@ -405,6 +462,56 @@ mod tests {
             cfg.workspace_default_storage_size,
             DEFAULT_WORKSPACE_STORAGE_SIZE
         );
+    }
+
+    #[test]
+    fn default_supervisor_topology_is_combined() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.supervisor_topology, SupervisorTopology::Combined);
+    }
+
+    #[test]
+    fn default_sidecar_proxy_uid_is_dedicated_non_root_uid() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.sidecar_proxy_uid, DEFAULT_SIDECAR_PROXY_UID);
+    }
+
+    #[test]
+    fn serde_override_supervisor_topology_sidecar() {
+        let json = serde_json::json!({
+            "supervisor_topology": "sidecar"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.supervisor_topology, SupervisorTopology::Sidecar);
+    }
+
+    #[test]
+    fn serde_override_sidecar_proxy_uid() {
+        let json = serde_json::json!({
+            "sidecar_proxy_uid": 2000
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.sidecar_proxy_uid, 2000);
+        cfg.validate_sidecar_proxy_uid().unwrap();
+    }
+
+    #[test]
+    fn validate_sidecar_proxy_uid_rejects_privileged_uid() {
+        let cfg = KubernetesComputeConfig {
+            sidecar_proxy_uid: 999,
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_sidecar_proxy_uid().unwrap_err();
+        assert!(err.contains("sidecar_proxy_uid"));
+    }
+
+    #[test]
+    fn serde_rejects_invalid_supervisor_topology() {
+        let json = serde_json::json!({
+            "supervisor_topology": "daemonset"
+        });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
     }
 
     #[test]
@@ -572,7 +679,7 @@ mod tests {
     fn parse_openshift_uid_range() {
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_uid_range("1000000000/10000"),
-            Some(1000000000)
+            Some(1_000_000_000)
         );
         assert_eq!(
             KubernetesComputeConfig::from_open_shift_uid_range("1000/50000"),
@@ -620,7 +727,7 @@ mod tests {
             ANNOTATION_SCC_UID_RANGE.to_string(),
             "1000000000/10000".to_string(),
         );
-        assert_eq!(cfg.resolve_sandbox_uid(Some(&anns)), 1000000000);
+        assert_eq!(cfg.resolve_sandbox_uid(Some(&anns)), 1_000_000_000);
     }
 
     #[test]

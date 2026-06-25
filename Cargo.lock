@@ -3809,6 +3809,7 @@ dependencies = [
  "clap",
  "futures",
  "miette",
+ "nix",
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",

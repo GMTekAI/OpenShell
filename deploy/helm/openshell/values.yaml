@@ -44,6 +44,14 @@ supervisor:
   # On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled,
   # set this to "image-volume" explicitly.
   sideloadMethod: ""
+  # -- Supervisor pod topology for Kubernetes sandboxes.
+  # "combined" runs the current single supervisor container in the agent pod.
+  # "sidecar" runs network enforcement in a dedicated sidecar and the process
+  # supervisor as a low-capability wrapper in the agent container.
+  topology: "combined"
+  # -- UID for the long-running network sidecar in sidecar topology. The
+  # network init container installs nftables rules that exempt this UID.
+  sidecarProxyUid: 1337
 
 # -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []

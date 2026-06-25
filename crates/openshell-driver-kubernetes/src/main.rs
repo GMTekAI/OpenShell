@@ -11,7 +11,8 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
-    KubernetesComputeConfig, KubernetesComputeDriver, SupervisorSideloadMethod,
+    DEFAULT_SIDECAR_PROXY_UID, KubernetesComputeConfig, KubernetesComputeDriver,
+    SupervisorSideloadMethod, SupervisorTopology,
 };
 
 #[derive(Parser, Debug)]
@@ -80,6 +81,16 @@ struct Args {
     )]
     supervisor_sideload_method: SupervisorSideloadMethod,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_TOPOLOGY",
+        default_value = "combined"
+    )]
+    supervisor_topology: SupervisorTopology,
+
+    #[arg(long, env = "OPENSHELL_SIDECAR_PROXY_UID", default_value_t = DEFAULT_SIDECAR_PROXY_UID)]
+    sidecar_proxy_uid: u32,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
@@ -117,6 +128,8 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string()),
         supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
         supervisor_sideload_method: args.supervisor_sideload_method,
+        supervisor_topology: args.supervisor_topology,
+        sidecar_proxy_uid: args.sidecar_proxy_uid,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
