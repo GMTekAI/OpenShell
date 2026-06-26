@@ -1,0 +1,136 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Kubernetes Sandbox Topology"
+sidebar-title: "Topology"
+description: "Choose between combined and sidecar supervisor topology for Kubernetes sandbox pods."
+keywords: "Generative AI, Cybersecurity, Kubernetes, Sandboxing, Sidecar, Network Policy, RuntimeClass"
+position: 2
+---
+
+Kubernetes sandbox pods can run the OpenShell supervisor in `combined` or
+`sidecar` topology. Choose the topology based on which controls you need inside
+the pod and how much privilege your cluster allows on the agent container.
+
+## Choose a Topology
+
+The default `combined` topology preserves the full OpenShell enforcement model.
+Use `sidecar` only when you accept network-focused enforcement in exchange for a
+lower-privilege agent container.
+
+| Topology | Use when | Main tradeoff |
+|---|---|---|
+| `combined` | You need OpenShell network, filesystem, and process controls in the sandbox workload. | The agent container carries the Linux capabilities the supervisor needs. |
+| `sidecar` | You need the agent container to run as non-root without added Linux capabilities, and network policy is the primary control. | Filesystem policy, process privilege dropping, and process/binary identity checks are not applied by the process supervisor. |
+
+## Combined Topology
+
+Combined topology is the original Kubernetes mode and remains the default. The
+agent container starts the OpenShell supervisor, and the supervisor launches the
+workload after applying sandbox setup.
+
+Combined topology keeps these controls in one supervisor path:
+
+- Network endpoint and L7 policy enforcement.
+- Filesystem policy enforcement.
+- Process and binary identity checks.
+- Privilege drop into the sandbox user.
+- Gateway relay, SSH sessions, exec, and file sync.
+
+Because the supervisor performs network namespace setup and process/filesystem
+controls from the agent container, Kubernetes grants that container elevated
+Linux capabilities. Use this mode when you need the complete OpenShell sandbox
+contract and your cluster policy permits those capabilities.
+
+## Sidecar Topology
+
+Sidecar topology splits the supervisor into a network sidecar and a
+low-privilege process supervisor in the agent container.
+
+The pod contains these OpenShell-managed pieces:
+
+| Component | Runs as | Purpose |
+|---|---|---|
+| Network init container | Root with setup capabilities | Installs pod-level nftables rules and prepares shared sidecar state. |
+| Network sidecar | `supervisor.sidecarProxyUid` | Runs the proxy, enforces network policy, writes proxy TLS material, and forwards gateway traffic on loopback. |
+| Agent container | Resolved sandbox UID/GID | Runs the process supervisor and launches the user workload. |
+
+In this topology, the agent container runs with `runAsNonRoot: true`,
+`allowPrivilegeEscalation: false`, and `capabilities.drop: ["ALL"]`. The
+long-running network sidecar also drops all Linux capabilities. The root init
+container keeps the setup capabilities needed to configure pod networking.
+
+Sidecar mode preserves gateway session behavior, including SSH connectivity,
+because the process supervisor still owns the session relay. The network sidecar
+handles outbound enforcement and forwards the process supervisor's gateway
+traffic to the real gateway endpoint.
+
+<Warning>
+Sidecar mode runs the process supervisor in network-only mode. OpenShell still
+enforces network endpoint and L7 policy through the sidecar, but the process
+supervisor does not apply Landlock filesystem policy, process privilege
+dropping, or process/binary identity checks.
+</Warning>
+
+## Credential Exposure
+
+Sidecar topology uses pod `fsGroup` and group-readable projected credentials so
+the non-root process supervisor can authenticate to the gateway. This includes
+the projected ServiceAccount token used for sandbox token bootstrap and the
+sandbox client TLS secret.
+
+Treat the agent container as trusted with respect to those in-pod gateway
+credentials. Use `combined` topology when that credential exposure is not
+acceptable for your deployment.
+
+## RuntimeClass Isolation
+
+Sidecar topology pairs well with runtime classes such as gVisor or Kata
+Containers when the cluster supports them. A sandboxed runtime strengthens the
+container boundary while OpenShell focuses on network policy enforcement from
+the sidecar.
+
+Runtime classes do not re-enable the OpenShell filesystem and process controls
+that sidecar mode relaxes. Use them as an additional workload boundary, not as a
+replacement for the combined topology's full supervisor controls.
+
+You can set a default runtime class in the Kubernetes driver configuration or
+override it per sandbox with driver config:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers"}}}' \
+  -- claude
+```
+
+## Enable Sidecar Mode
+
+Set `supervisor.topology=sidecar` in the Helm chart values:
+
+```yaml
+supervisor:
+  topology: sidecar
+  sidecarProxyUid: 1337
+```
+
+`sidecarProxyUid` must be a non-root UID and must not match the sandbox UID.
+The network init container exempts this UID from proxy redirection so the
+sidecar can reach the gateway.
+
+For direct gateway TOML configuration, set the equivalent Kubernetes driver
+fields:
+
+```toml
+[openshell.drivers.kubernetes]
+supervisor_topology = "sidecar"
+sidecar_proxy_uid = 1337
+```
+
+Leave `supervisor.topology` unset, or set it to `combined`, to keep the original
+single-container supervisor path.
+
+## Next Steps
+
+- To install OpenShell on Kubernetes, refer to [Setup](/kubernetes/setup).
+- To configure gateway authentication, refer to [Access Control](/kubernetes/access-control).
+- To review the driver fields, refer to [Gateway Configuration File](/reference/gateway-config).
