@@ -36,7 +36,9 @@ if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/pulls/1865" ]]; then
 fi
 
 if [[ "$1" == "api" && "$2" == "repos/NVIDIA/OpenShell/issues/1865/comments" ]]; then
-    printf '%s\n' "$MOCK_EXISTING_BODY"
+    if [[ -n "$MOCK_EXISTING_BODY" ]]; then
+        jq -Rn --arg body "$MOCK_EXISTING_BODY" '$body'
+    fi
     exit 0
 fi
 
@@ -113,6 +115,28 @@ run_case "allows terminal cleanup" \
     '> **gator-agent**
 
 ## Monitoring Complete' \
+    0
+
+run_case "blocks new reviewer failure disposition" \
+    '' \
+    '> **gator-agent**
+
+## Blocked
+
+Gator is blocked from completing the required independent re-review for current head `0e4d7af7722fbedce2307d571b0c937a1eb3250f` because the `principal-engineer-reviewer` sub-agent failed before producing a review result due to a Codex token refresh/authentication error.' \
+    20
+
+run_case "ignores legacy reviewer failure disposition" \
+    '> **gator-agent**
+
+## Blocked
+
+Gator is blocked from completing the required independent re-review for current head `0e4d7af7722fbedce2307d571b0c937a1eb3250f` because the `principal-engineer-reviewer` sub-agent failed before producing a review result due to a Codex token refresh/authentication error.' \
+    '> **gator-agent**
+
+## PR Review Status
+
+Head SHA: `0e4d7af7722fbedce2307d571b0c937a1eb3250f`' \
     0
 
 printf 'PASS: gh same-SHA guard tests\n'

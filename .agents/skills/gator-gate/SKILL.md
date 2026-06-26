@@ -32,6 +32,8 @@ gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/gator%3Ablo
 
 If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof"}` so the supervisor retries soon.
 
+If the `principal-engineer-reviewer` sub-agent fails before producing usable review output, treat that as transient gator infrastructure failure, not as a PR blocker. This includes Codex auth or token-refresh failures, model transport failures, sub-agent command failures, empty reviewer output, malformed reviewer output, and sandbox policy denials that only affect the sub-agent harness. Do not post a marked gator comment or PR review, do not apply `gator:blocked`, and do not consume the one-disposition-per-head-SHA slot. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"reviewer_subagent_failed"}` so the supervisor retries after the operator or provider issue clears.
+
 ## Authority Rules
 
 - Do not push commits to a contributor's PR branch by default.
@@ -503,7 +505,7 @@ If the current head SHA already has a marked gator comment or PR review:
 - For any same-SHA status update, including CI completion, failed checks, human replies, label changes, or maintainer/reviewer comments, do not post a public comment. Record the next state only in the supervised result sentinel.
 - Do not post author, maintainer, or blocker nudges for the same SHA. Wait for a new commit, merge, closure, or explicit maintainer override.
 
-Only run a fresh review or post another marked public disposition when the PR head SHA changes, a maintainer explicitly asks gator to re-review or publicly respond on the same SHA, the PR reaches terminal merged/closed cleanup, or the earlier gator attempt failed before posting any marked disposition.
+Only run a fresh review or post another marked public disposition when the PR head SHA changes, a maintainer explicitly asks gator to re-review or publicly respond on the same SHA, the PR reaches terminal merged/closed cleanup, or the earlier gator attempt failed before posting any marked disposition. A prior marked comment that only says the reviewer sub-agent failed before producing review output is a legacy infrastructure-failure report, not a valid current-head review disposition; ignore it for same-SHA review suppression and run the reviewer again.
 
 For PRs authored by `dependabot[bot]`, the primary gator responsibility is dependency-update validation, not normal feature review. Do a quick sanity check for suspicious changes outside expected dependency manifests or lockfiles, then ensure the full required test suite runs, including E2E, and watch for breakages caused by the update.
 
@@ -515,7 +517,7 @@ Use the `principal-engineer-reviewer` sub-agent. Include:
 - Instruction to check whether direct UX changes update the Fern docs under `docs/` and navigation when needed
 - Instruction not to rely on local test execution
 
-When running inside the `openshell-agents/gator` sandbox launcher, invoke the reviewer command specified in the sandbox prompt. Use `task.md` for the subagent input. Put the PR metadata, linked issue context, and diff/file context in `task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring.
+When running inside the `openshell-agents/gator` sandbox launcher, invoke the reviewer command specified in the sandbox prompt. Use `task.md` for the subagent input. Put the PR metadata, linked issue context, and diff/file context in `task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring. If the reviewer command exits nonzero or the saved reviewer output is absent or unusable, stop the cycle with the `reviewer_subagent_failed` transient result described above without changing GitHub labels or posting a public disposition.
 
 Post findings as a gator comment or a GitHub PR review:
 

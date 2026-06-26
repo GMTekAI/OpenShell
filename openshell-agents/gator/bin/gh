@@ -76,6 +76,37 @@ read_body() {
     printf '%s' "$body_field"
 }
 
+is_legacy_reviewer_failure_disposition() {
+    local existing_body="$1"
+    local head_sha="$2"
+
+    [[ "$existing_body" == *"$GATOR_MARKER"* ]] || return 1
+    [[ "$existing_body" == *"$head_sha"* ]] || return 1
+    [[ "$existing_body" == *"principal-engineer-reviewer"* ]] || return 1
+    [[ "$existing_body" == *"failed before producing"* ]] || return 1
+}
+
+has_blocking_same_sha_disposition() {
+    local head_sha="$1"
+    local encoded_bodies="$2"
+    local encoded_body existing_body
+
+    while IFS= read -r encoded_body; do
+        [[ -n "$encoded_body" ]] || continue
+
+        existing_body="$(printf '%s' "$encoded_body" | jq -r . 2>/dev/null || printf '%s' "$encoded_body")"
+        [[ "$existing_body" == *"$head_sha"* ]] || continue
+
+        if is_legacy_reviewer_failure_disposition "$existing_body" "$head_sha"; then
+            continue
+        fi
+
+        return 0
+    done <<< "$encoded_bodies"
+
+    return 1
+}
+
 guard_duplicate_gator_disposition() {
     local owner="$1"
     local repo="$2"
@@ -89,11 +120,17 @@ guard_duplicate_gator_disposition() {
     head_sha="$($REAL_GH api "repos/$owner/$repo/pulls/$number" --jq '.head.sha // empty' 2>/dev/null || true)"
     [[ -n "$head_sha" ]] || return 0
 
-    local existing_comments existing_reviews
-    existing_comments="$($REAL_GH api "repos/$owner/$repo/issues/$number/comments" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body' 2>/dev/null || true)"
-    existing_reviews="$($REAL_GH api "repos/$owner/$repo/pulls/$number/reviews" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body' 2>/dev/null || true)"
+    if is_legacy_reviewer_failure_disposition "$body" "$head_sha"; then
+        echo "openshell-agent: blocked public reviewer sub-agent failure disposition for $owner/$repo#$number ($head_sha)" >&2
+        echo "openshell-agent: return OPENSHELL_AGENT_RESULT status=transient_failure with reason=reviewer_subagent_failed instead" >&2
+        return 20
+    fi
 
-    if printf '%s\n%s\n' "$existing_comments" "$existing_reviews" | grep -Fq "$head_sha"; then
+    local existing_comments existing_reviews
+    existing_comments="$($REAL_GH api "repos/$owner/$repo/issues/$number/comments" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null || true)"
+    existing_reviews="$($REAL_GH api "repos/$owner/$repo/pulls/$number/reviews" --paginate --jq '.[] | select(.body | contains("> **gator-agent**")) | .body | @json' 2>/dev/null || true)"
+
+    if has_blocking_same_sha_disposition "$head_sha" "$(printf '%s\n%s\n' "$existing_comments" "$existing_reviews")"; then
         echo "openshell-agent: blocked duplicate gator same-SHA disposition for $owner/$repo#$number ($head_sha)" >&2
         echo "openshell-agent: push a new commit, remove the old disposition, or set OPENSHELL_GATOR_ALLOW_SAME_SHA_COMMENT=1 for an explicit maintainer-requested same-SHA action" >&2
         return 20
