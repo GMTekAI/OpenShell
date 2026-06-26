@@ -1,0 +1,95 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.middleware.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/struct.proto";
+
+service SupervisorMiddleware {
+  rpc Describe(google.protobuf.Empty) returns (MiddlewareManifest);
+  rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
+  rpc EvaluateHttpRequest(HttpRequestEvaluation) returns (HttpRequestResult);
+}
+
+message MiddlewareManifest {
+  string api_version = 1;
+  string name = 2;
+  string service_version = 3;
+  repeated MiddlewareBinding bindings = 4;
+}
+
+message MiddlewareBinding {
+  string id = 1;
+  string operation = 2;
+  string phase = 3;
+}
+
+message ValidateConfigRequest {
+  string api_version = 1;
+  string binding_id = 2;
+  google.protobuf.Struct config = 3;
+}
+
+message ValidateConfigResponse {
+  bool valid = 1;
+  string reason = 2;
+}
+
+message HttpRequestEvaluation {
+  string api_version = 1;
+  string binding_id = 2;
+  string phase = 3;
+  RequestContext context = 4;
+  google.protobuf.Struct config = 5;
+  HttpRequestTarget target = 6;
+  map<string, string> headers = 7;
+  bytes body = 8;
+}
+
+message RequestContext {
+  string request_id = 1;
+  string sandbox_id = 2;
+  Process originating_process = 3;
+}
+
+message HttpRequestTarget {
+  string scheme = 1;
+  string host = 2;
+  uint32 port = 3;
+  string method = 4;
+  string path = 5;
+  string query = 6;
+}
+
+message Process {
+  string binary = 1;
+  uint32 pid = 2;
+  repeated string ancestors = 3;
+}
+
+enum Decision {
+  DECISION_UNSPECIFIED = 0;
+  DECISION_ALLOW = 1;
+  DECISION_DENY = 2;
+}
+
+message Finding {
+  string type = 1;
+  string label = 2;
+  uint32 count = 3;
+  string confidence = 4;
+  string severity = 5;
+}
+
+message HttpRequestResult {
+  Decision decision = 1;
+  string reason = 2;
+  bytes body = 3;
+  bool has_body = 4;
+  map<string, string> add_headers = 5;
+  repeated Finding findings = 6;
+  map<string, string> metadata = 7;
+}
