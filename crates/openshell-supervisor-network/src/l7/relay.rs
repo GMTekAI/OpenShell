@@ -15,9 +15,12 @@ use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
-    NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
+    ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
+    ocsf_emit,
 };
+use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -450,6 +453,37 @@ where
         let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+            let chain =
+                engine.query_middleware_chain(&middleware_network_input(ctx), &req.target)?;
+            let req =
+                match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
+                    .await?
+                {
+                    MiddlewareApplyResult::Allowed(req) => req,
+                    MiddlewareApplyResult::Denied(reason) => {
+                        crate::l7::rest::RestProvider::default()
+                            .deny_with_redacted_target(
+                                &crate::l7::provider::L7Request {
+                                    action: request_info.action.clone(),
+                                    target: redacted_target.clone(),
+                                    query_params: request_info.query_params.clone(),
+                                    raw_header: Vec::new(),
+                                    body_length: crate::l7::provider::BodyLength::None,
+                                },
+                                &ctx.policy_name,
+                                &reason,
+                                client,
+                                Some(&redacted_target),
+                                Some(crate::l7::rest::DenyResponseContext {
+                                    host: Some(&ctx.host),
+                                    port: Some(ctx.port),
+                                    binary: Some(&ctx.binary_path),
+                                }),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
@@ -734,6 +768,167 @@ fn jsonrpc_engine_type(protocol: L7Protocol) -> &'static str {
     }
 }
 
+enum MiddlewareApplyResult {
+    Allowed(crate::l7::provider::L7Request),
+    Denied(String),
+}
+
+async fn apply_middleware_chain<C: AsyncRead + AsyncWrite + Unpin + Send>(
+    req: crate::l7::provider::L7Request,
+    client: &mut C,
+    ctx: &L7EvalContext,
+    chain: Vec<openshell_supervisor_middleware::ChainEntry>,
+    generation_guard: &PolicyGenerationGuard,
+) -> Result<MiddlewareApplyResult> {
+    if chain.is_empty() {
+        return Ok(MiddlewareApplyResult::Allowed(req));
+    }
+    let buffered =
+        crate::l7::rest::buffer_request_body_for_middleware(&req, client, Some(generation_guard))
+            .await?;
+    let headers = safe_middleware_headers(&buffered.headers)?;
+    let input = openshell_supervisor_middleware::HttpRequestInput {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        sandbox_id: String::new(),
+        binary: ctx.binary_path.clone(),
+        pid: 0,
+        ancestors: ctx.ancestors.clone(),
+        scheme: "https".into(),
+        host: ctx.host.clone(),
+        port: ctx.port,
+        method: req.action.clone(),
+        path: req.target.clone(),
+        query: String::new(),
+        headers,
+        body: buffered.body,
+    };
+    let outcome = openshell_supervisor_middleware::ChainRunner::default()
+        .evaluate(&chain, input)
+        .await?;
+    emit_middleware_events(ctx, &req, &outcome);
+    let rebuilt = crate::l7::rest::rebuild_request_with_buffered_body(
+        &req,
+        &buffered.headers,
+        &outcome.body,
+        &outcome.added_headers,
+    )?;
+    if outcome.allowed {
+        Ok(MiddlewareApplyResult::Allowed(rebuilt))
+    } else {
+        Ok(MiddlewareApplyResult::Denied(outcome.reason))
+    }
+}
+
+fn safe_middleware_headers(headers: &[u8]) -> Result<BTreeMap<String, String>> {
+    let header_str =
+        std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let mut out = BTreeMap::new();
+    for line in header_str.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty()
+            || matches!(
+                name.as_str(),
+                "authorization" | "cookie" | "host" | "content-length" | "transfer-encoding"
+            )
+            || name.starts_with("x-amz-")
+            || name.starts_with("x-openshell-credential")
+        {
+            continue;
+        }
+        out.insert(name, value.trim().to_string());
+    }
+    Ok(out)
+}
+
+fn middleware_network_input(ctx: &L7EvalContext) -> crate::opa::NetworkInput {
+    crate::opa::NetworkInput {
+        host: ctx.host.clone(),
+        port: ctx.port,
+        binary_path: PathBuf::from(&ctx.binary_path),
+        binary_sha256: String::new(),
+        ancestors: ctx.ancestors.iter().map(PathBuf::from).collect(),
+        cmdline_paths: ctx.cmdline_paths.iter().map(PathBuf::from).collect(),
+    }
+}
+
+fn emit_middleware_events(
+    ctx: &L7EvalContext,
+    req: &crate::l7::provider::L7Request,
+    outcome: &openshell_supervisor_middleware::ChainOutcome,
+) {
+    for invocation in &outcome.applied {
+        let allowed = invocation.decision == openshell_core::proto::Decision::Allow;
+        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Other)
+            .action(if allowed {
+                ActionId::Allowed
+            } else {
+                ActionId::Denied
+            })
+            .disposition(if allowed {
+                DispositionId::Allowed
+            } else {
+                DispositionId::Blocked
+            })
+            .severity(if allowed {
+                SeverityId::Informational
+            } else {
+                SeverityId::Medium
+            })
+            .http_request(HttpRequest::new(
+                &req.action,
+                OcsfUrl::new("http", &ctx.host, &req.target, ctx.port),
+            ))
+            .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+            .firewall_rule(&ctx.policy_name, "middleware")
+            .message(format!(
+                "MIDDLEWARE {} {} decision={:?} transformed={}",
+                invocation.name,
+                invocation.implementation,
+                invocation.decision,
+                invocation.transformed
+            ))
+            .build();
+        ocsf_emit!(event);
+    }
+    if !outcome.allowed && outcome.reason.starts_with("middleware_failed:") {
+        let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .severity(SeverityId::High)
+            .finding_info(FindingInfo::new(
+                "openshell.middleware.failure",
+                "Supervisor middleware failure",
+            ))
+            .message("Required supervisor middleware failed closed")
+            .build();
+        ocsf_emit!(event);
+    }
+    for finding in &outcome.findings {
+        let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
+            .severity(match finding.finding.severity.as_str() {
+                "high" => SeverityId::High,
+                "low" => SeverityId::Low,
+                _ => SeverityId::Medium,
+            })
+            .finding_info(FindingInfo::new(
+                &finding.finding.r#type,
+                &finding.finding.label,
+            ))
+            .evidence_pairs(&[
+                ("middleware", &finding.middleware),
+                ("count", &finding.finding.count.to_string()),
+            ])
+            .message(format!(
+                "Middleware finding {} count={}",
+                finding.finding.r#type, finding.finding.count
+            ))
+            .build();
+        ocsf_emit!(event);
+    }
+}
+
 /// REST relay loop: parse request -> evaluate -> allow/deny -> relay response -> repeat.
 async fn relay_rest<C, U>(
     config: &L7EndpointConfig,
@@ -903,6 +1098,37 @@ where
         let _ = &eval_target;
 
         if allowed || config.enforcement == EnforcementMode::Audit {
+            let chain =
+                engine.query_middleware_chain(&middleware_network_input(ctx), &req.target)?;
+            let req =
+                match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
+                    .await?
+                {
+                    MiddlewareApplyResult::Allowed(req) => req,
+                    MiddlewareApplyResult::Denied(reason) => {
+                        provider
+                            .deny_with_redacted_target(
+                                &crate::l7::provider::L7Request {
+                                    action: request_info.action.clone(),
+                                    target: redacted_target.clone(),
+                                    query_params: request_info.query_params.clone(),
+                                    raw_header: Vec::new(),
+                                    body_length: crate::l7::provider::BodyLength::None,
+                                },
+                                &ctx.policy_name,
+                                &reason,
+                                client,
+                                Some(&redacted_target),
+                                Some(crate::l7::rest::DenyResponseContext {
+                                    host: Some(&ctx.host),
+                                    port: Some(ctx.port),
+                                    binary: Some(&ctx.binary_path),
+                                }),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
             let req_with_auth =
                 match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
                     Ok(req) => req,
@@ -1336,6 +1562,37 @@ where
         let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+            let chain =
+                engine.query_middleware_chain(&middleware_network_input(ctx), &req.target)?;
+            let req =
+                match apply_middleware_chain(req, client, ctx, chain, engine.generation_guard())
+                    .await?
+                {
+                    MiddlewareApplyResult::Allowed(req) => req,
+                    MiddlewareApplyResult::Denied(reason) => {
+                        crate::l7::rest::RestProvider::default()
+                            .deny_with_redacted_target(
+                                &crate::l7::provider::L7Request {
+                                    action: request_info.action.clone(),
+                                    target: redacted_target.clone(),
+                                    query_params: request_info.query_params.clone(),
+                                    raw_header: Vec::new(),
+                                    body_length: crate::l7::provider::BodyLength::None,
+                                },
+                                &ctx.policy_name,
+                                &reason,
+                                client,
+                                Some(&redacted_target),
+                                Some(crate::l7::rest::DenyResponseContext {
+                                    host: Some(&ctx.host),
+                                    port: Some(ctx.port),
+                                    binary: Some(&ctx.binary_path),
+                                }),
+                            )
+                            .await?;
+                        return Ok(());
+                    }
+                };
             let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
                 &req,
                 client,
@@ -1674,6 +1931,7 @@ pub async fn relay_passthrough_with_credentials<C, U>(
     upstream: &mut U,
     ctx: &L7EvalContext,
     generation_guard: &PolicyGenerationGuard,
+    middleware_engine: Option<&crate::opa::OpaEngine>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -1755,6 +2013,43 @@ where
                 .build();
             ocsf_emit!(event);
         }
+
+        let req = if let Some(engine) = middleware_engine {
+            let input = middleware_network_input(ctx);
+            let (chain, generation) =
+                engine.query_middleware_chain_with_generation(&input, &req.target)?;
+            if generation != generation_guard.captured_generation() {
+                return Ok(());
+            }
+            match apply_middleware_chain(req, client, ctx, chain, generation_guard).await? {
+                MiddlewareApplyResult::Allowed(req) => req,
+                MiddlewareApplyResult::Denied(reason) => {
+                    crate::l7::rest::RestProvider::default()
+                        .deny_with_redacted_target(
+                            &crate::l7::provider::L7Request {
+                                action: "HTTP".into(),
+                                target: redacted_target.clone(),
+                                query_params: std::collections::HashMap::new(),
+                                raw_header: Vec::new(),
+                                body_length: crate::l7::provider::BodyLength::None,
+                            },
+                            &ctx.policy_name,
+                            &reason,
+                            client,
+                            Some(&redacted_target),
+                            Some(crate::l7::rest::DenyResponseContext {
+                                host: Some(&ctx.host),
+                                port: Some(ctx.port),
+                                binary: Some(&ctx.binary_path),
+                            }),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            req
+        };
 
         let req_with_auth = match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await
         {
@@ -1899,6 +2194,63 @@ network_policies:
         };
 
         (config, tunnel_engine, ctx, fixture)
+    }
+
+    fn middleware_relay_context(
+        middleware_impl: &str,
+        on_error: &str,
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        let data = format!(
+            r#"
+network_middlewares:
+  - name: request-middleware
+    middleware: {middleware_impl}
+    on_error: {on_error}
+network_policies:
+  rest_api:
+    name: rest_api
+    middleware: ["request-middleware"]
+    endpoints:
+      - host: api.example.test
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: "/v1/**"
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+        );
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.test".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+
+        (config, tunnel_engine, ctx)
     }
 
     fn passthrough_token_grant_relay_context(
@@ -2112,7 +2464,10 @@ network_policies:
         .unwrap();
         let upstream_request = String::from_utf8_lossy(&upstream_request[..n]);
 
-        assert!(upstream_request.starts_with("GET /v1/projects HTTP/1.1\r\n"));
+        assert!(
+            upstream_request.starts_with("GET /v1/projects HTTP/1.1\r\n"),
+            "unexpected upstream request: {upstream_request:?}"
+        );
         assert!(upstream_request.contains("Authorization: Bearer grant-token\r\n"));
         assert!(!upstream_request.contains("stale-token"));
         assert_eq!(authorization_header_count(&upstream_request), 1);
@@ -2195,6 +2550,115 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn l7_rest_middleware_redacts_body_before_upstream() {
+        let (config, tunnel_engine, ctx) =
+            middleware_relay_context("openshell/secrets", "fail_closed");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"api_key":"sk-1234567890abcdef"}"#;
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).unwrap()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+
+        let mut upstream_request = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_request),
+        )
+        .await
+        .expect("request should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_request[..n]);
+        assert!(upstream_request.contains(r#""api_key":"[REDACTED]""#));
+        assert!(!upstream_request.contains("sk-1234567890abcdef"));
+
+        upstream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("204 No Content"));
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn l7_rest_middleware_fail_closed_does_not_reach_upstream() {
+        let (config, tunnel_engine, ctx) =
+            middleware_relay_context("example/unavailable", "fail_closed");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"POST /v1/messages HTTP/1.1\r\nHost: api.example.test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+        )
+        .await
+        .unwrap();
+
+        let mut response = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("denial should reach client")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains("403 Forbidden"));
+        assert!(response.contains("middleware_failed"));
+
+        let mut upstream_request = [0u8; 32];
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_request),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(_) | Ok(Ok(0))),
+            "upstream should not receive request bytes"
+        );
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn passthrough_relay_injects_token_grant_authorization_header() {
         let (generation_guard, ctx, fixture) =
             passthrough_token_grant_relay_context(Ok("grant-token"));
@@ -2206,6 +2670,7 @@ network_policies:
                 &mut relay_upstream,
                 &ctx,
                 &generation_guard,
+                None,
             )
             .await
         });
@@ -2268,6 +2733,7 @@ network_policies:
                 &mut relay_upstream,
                 &ctx,
                 &generation_guard,
+                None,
             )
             .await
         });
@@ -3173,7 +3639,10 @@ network_policies:
         .expect("first request should reach upstream")
         .unwrap();
         let first_upstream = String::from_utf8_lossy(&first_upstream[..n]);
-        assert!(first_upstream.starts_with("POST /write HTTP/1.1"));
+        assert!(
+            first_upstream.starts_with("POST /write HTTP/1.1"),
+            "unexpected upstream request: {first_upstream:?}"
+        );
 
         upstream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nOK")
@@ -3243,6 +3712,7 @@ network_policies:
                 &mut relay_upstream,
                 &ctx,
                 &generation_guard,
+                None,
             )
             .await
         });

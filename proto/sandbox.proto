@@ -5,6 +5,8 @@ syntax = "proto3";
 
 package openshell.sandbox.v1;
 
+import "google/protobuf/struct.proto";
+
 // Sandbox-supervisor configuration and policy messages.
 //
 // Conventions:
@@ -25,6 +27,8 @@ message SandboxPolicy {
   ProcessPolicy process = 4;
   // Network access policies keyed by name (e.g. "claude_code", "gitlab").
   map<string, NetworkPolicyRule> network_policies = 5;
+  // Reusable supervisor middleware configs for network egress.
+  repeated NetworkMiddlewareConfig network_middlewares = 6;
 }
 
 // Filesystem access policy.
@@ -59,6 +63,27 @@ message NetworkPolicyRule {
   repeated NetworkEndpoint endpoints = 2;
   // Allowed binary identities.
   repeated NetworkBinary binaries = 3;
+  // Ordered middleware configs applied to every endpoint in this policy.
+  repeated string middleware = 4;
+}
+
+// A reusable middleware config referenced by network policies/endpoints.
+message NetworkMiddlewareConfig {
+  // Policy-local config name.
+  string name = 1;
+  // Built-in or registered middleware implementation name.
+  string middleware = 2;
+  // Service-specific configuration.
+  google.protobuf.Struct config = 3;
+  // Failure behavior: "fail_closed" (default) or "fail_open".
+  string on_error = 4;
+  // Optional global endpoint selector for this config.
+  MiddlewareEndpointSelector endpoints = 5;
+}
+
+message MiddlewareEndpointSelector {
+  repeated string include = 1;
+  repeated string exclude = 2;
 }
 
 // A network endpoint (host + port) with optional L7 inspection config.
@@ -143,6 +168,8 @@ message NetworkEndpoint {
   uint32 json_rpc_max_body_bytes = 22;
   // MCP-only policy and inspection options. Only used when protocol is "mcp".
   McpOptions mcp = 23;
+  // Ordered middleware configs applied to this endpoint after policy-level middleware.
+  repeated string middleware = 24;
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more
@@ -175,8 +202,6 @@ message McpOptions {
   // MCP-family methods at the method layer unless a tool-name policy narrows
   // tools/call. When unset or false, explicit method rules are required.
   optional bool allow_all_known_mcp_methods = 2;
-}
-
 // Trusted GraphQL operation classification.
 message GraphqlOperation {
   // Operation type: "query", "mutation", or "subscription".

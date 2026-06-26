@@ -27,6 +27,7 @@ const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 /// Maximum body bytes for `SigV4` body-signing mode. Larger than the credential
 /// rewrite limit because Bedrock payloads can be several megabytes.
 const MAX_SIGV4_BODY_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_MIDDLEWARE_BODY_BYTES: usize = MAX_REWRITE_BODY_BYTES;
 const RELAY_BUF_SIZE: usize = 8192;
 const HTTP_METHOD_PREFIXES: &[&[u8]] = &[
     b"GET ",
@@ -768,6 +769,83 @@ struct PreparedRequestBody {
     body: Vec<u8>,
 }
 
+pub(crate) struct BufferedRequestBody {
+    pub(crate) headers: Vec<u8>,
+    pub(crate) body: Vec<u8>,
+}
+
+pub(crate) async fn buffer_request_body_for_middleware<C: AsyncRead + Unpin>(
+    req: &L7Request,
+    client: &mut C,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<BufferedRequestBody> {
+    let header_end = req
+        .raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(req.raw_header.len(), |p| p + 4);
+    let headers = req.raw_header[..header_end].to_vec();
+    let already_read = &req.raw_header[header_end..];
+    match req.body_length {
+        BodyLength::None => Ok(BufferedRequestBody {
+            headers,
+            body: already_read.to_vec(),
+        }),
+        BodyLength::ContentLength(len) => {
+            let len = usize::try_from(len)
+                .map_err(|_| miette!("request body is too large for middleware"))?;
+            if len > MAX_MIDDLEWARE_BODY_BYTES {
+                return Err(miette!(
+                    "middleware buffers at most {MAX_MIDDLEWARE_BODY_BYTES} request body bytes"
+                ));
+            }
+            let initial_len = already_read.len().min(len);
+            let mut body = Vec::with_capacity(len);
+            body.extend_from_slice(&already_read[..initial_len]);
+            let mut remaining = len.saturating_sub(initial_len);
+            let mut buf = [0u8; RELAY_BUF_SIZE];
+            while remaining > 0 {
+                let to_read = remaining.min(buf.len());
+                let n = client.read(&mut buf[..to_read]).await.into_diagnostic()?;
+                if n == 0 {
+                    return Err(miette!(
+                        "Connection closed with {remaining} body bytes remaining"
+                    ));
+                }
+                if let Some(guard) = generation_guard {
+                    guard.ensure_current()?;
+                }
+                body.extend_from_slice(&buf[..n]);
+                remaining -= n;
+            }
+            Ok(BufferedRequestBody { headers, body })
+        }
+        BodyLength::Chunked => {
+            let body = collect_chunked_body(client, already_read, generation_guard).await?;
+            Ok(BufferedRequestBody { headers, body })
+        }
+    }
+}
+
+pub(crate) fn rebuild_request_with_buffered_body(
+    req: &L7Request,
+    headers: &[u8],
+    body: &[u8],
+    add_headers: &std::collections::BTreeMap<String, String>,
+) -> Result<L7Request> {
+    let mut header_bytes = set_content_length(headers, body.len())?;
+    header_bytes = strip_header(&header_bytes, "transfer-encoding")?;
+    header_bytes = append_headers(&header_bytes, add_headers)?;
+    header_bytes.extend_from_slice(body);
+    Ok(L7Request {
+        action: req.action.clone(),
+        target: req.target.clone(),
+        query_params: req.query_params.clone(),
+        raw_header: header_bytes,
+        body_length: BodyLength::ContentLength(body.len() as u64),
+    })
+}
+
 async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
     req: &L7Request,
     client: &mut C,
@@ -1158,6 +1236,50 @@ fn set_content_length(headers: &[u8], len: usize) -> Result<Vec<u8>> {
         out.push_str("\r\n");
     }
     Ok(out.into_bytes())
+}
+
+fn strip_header(headers: &[u8], strip_name: &str) -> Result<Vec<u8>> {
+    let header_str =
+        std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let mut out = String::with_capacity(header_str.len());
+    for line in header_str.split("\r\n") {
+        if line.is_empty() {
+            out.push_str("\r\n");
+            break;
+        }
+        if line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(strip_name))
+        {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    Ok(out.into_bytes())
+}
+
+fn append_headers(
+    headers: &[u8],
+    add_headers: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
+    if add_headers.is_empty() {
+        return Ok(headers.to_vec());
+    }
+    let split = headers
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(headers.len(), |pos| pos);
+    let mut out = Vec::with_capacity(headers.len() + add_headers.len() * 32);
+    out.extend_from_slice(&headers[..split]);
+    for (name, value) in add_headers {
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+    }
+    out.extend_from_slice(b"\r\n\r\n");
+    Ok(out)
 }
 
 pub(crate) fn request_is_websocket_upgrade(raw_header: &[u8]) -> bool {

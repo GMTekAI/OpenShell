@@ -13,6 +13,8 @@ use openshell_core::policy::{
 };
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use openshell_policy::L7ConfigStanza;
+use openshell_supervisor_middleware::ChainEntry;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -132,6 +134,19 @@ impl TunnelPolicyEngine {
     pub(crate) fn engine(&self) -> &Mutex<regorus::Engine> {
         &self.engine
     }
+
+    /// Query the ordered middleware chain for a request path within this tunnel.
+    pub fn query_middleware_chain(
+        &self,
+        input: &NetworkInput,
+        request_path: &str,
+    ) -> Result<Vec<ChainEntry>> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        query_middleware_chain_locked(&mut engine, input, request_path)
+    }
 }
 
 impl OpaEngine {
@@ -200,6 +215,14 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
 
         // Validate BEFORE expanding presets
+        let middleware_errors = validate_middleware_policies(&data);
+        if !middleware_errors.is_empty() {
+            return Err(miette::miette!(
+                "middleware policy validation failed:\n{}",
+                middleware_errors.join("\n")
+            ));
+        }
+
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
         for w in &warnings {
             openshell_ocsf::ocsf_emit!(
@@ -548,6 +571,21 @@ impl OpaEngine {
         }
     }
 
+    /// Query the ordered middleware chain for a parsed HTTP request path.
+    pub fn query_middleware_chain_with_generation(
+        &self,
+        input: &NetworkInput,
+        request_path: &str,
+    ) -> Result<(Vec<ChainEntry>, u64)> {
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
+        let chain = query_middleware_chain_locked(&mut engine, input, request_path)?;
+        Ok((chain, generation))
+    }
+
     /// Query `allowed_ips` from the matched endpoint config for a given request.
     ///
     /// Returns the list of CIDR/IP strings from the endpoint's `allowed_ips`
@@ -687,6 +725,243 @@ fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
     }
 }
 
+fn network_input_json(input: &NetworkInput) -> serde_json::Value {
+    let ancestor_strs: Vec<String> = input
+        .ancestors
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let cmdline_strs: Vec<String> = input
+        .cmdline_paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    serde_json::json!({
+        "exec": {
+            "path": input.binary_path.to_string_lossy(),
+            "ancestors": ancestor_strs,
+            "cmdline_paths": cmdline_strs,
+        },
+        "network": {
+            "host": input.host,
+            "port": input.port,
+        }
+    })
+}
+
+#[derive(Debug, Clone)]
+struct MiddlewareContext {
+    policy_middleware: Vec<String>,
+    endpoint_middleware: Vec<String>,
+    endpoint_path: String,
+}
+
+fn query_middleware_chain_locked(
+    engine: &mut regorus::Engine,
+    input: &NetworkInput,
+    request_path: &str,
+) -> Result<Vec<ChainEntry>> {
+    engine
+        .set_input_json(&network_input_json(input).to_string())
+        .map_err(|e| miette::miette!("{e}"))?;
+
+    let configs_val = engine
+        .eval_rule("data.openshell.sandbox.network_middlewares".into())
+        .map_err(|e| miette::miette!("{e}"))?;
+    let configs = parse_middleware_configs(&configs_val)?;
+    if configs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let contexts_val = engine
+        .eval_rule("data.openshell.sandbox._matching_middleware_contexts".into())
+        .map_err(|e| miette::miette!("{e}"))?;
+    let contexts = parse_middleware_contexts(&contexts_val);
+    let Some(context) = select_middleware_context(&contexts, request_path) else {
+        return Ok(global_middleware_entries(
+            &configs,
+            &input.host,
+            &HashSet::new(),
+        )?);
+    };
+
+    let mut explicit = Vec::new();
+    for name in context
+        .policy_middleware
+        .iter()
+        .chain(context.endpoint_middleware.iter())
+    {
+        if !explicit.contains(name) {
+            explicit.push(name.clone());
+        }
+    }
+    let explicit_set: HashSet<String> = explicit.iter().cloned().collect();
+    let mut ordered = global_middleware_entries(&configs, &input.host, &explicit_set)?;
+    for name in explicit {
+        if !ordered.iter().any(|entry| entry.name == name) {
+            let config = configs
+                .iter()
+                .find(|config| get_str(config, "name").as_deref() == Some(name.as_str()))
+                .ok_or_else(|| miette::miette!("unknown middleware config '{name}'"))?;
+            ordered.push(chain_entry_from_value(config)?);
+        }
+    }
+    Ok(ordered)
+}
+
+fn parse_middleware_configs(value: &regorus::Value) -> Result<Vec<regorus::Value>> {
+    match value {
+        regorus::Value::Undefined => Ok(Vec::new()),
+        regorus::Value::Array(values) => Ok(values.to_vec()),
+        other => Err(miette::miette!(
+            "network_middlewares must be an array, got {other:?}"
+        )),
+    }
+}
+
+fn parse_middleware_contexts(value: &regorus::Value) -> Vec<MiddlewareContext> {
+    let regorus::Value::Array(values) = value else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .filter_map(|value| {
+            let regorus::Value::Object(_) = value else {
+                return None;
+            };
+            let endpoint = get_field(value, "endpoint")?;
+            Some(MiddlewareContext {
+                policy_middleware: get_str_array(value, "policy_middleware"),
+                endpoint_middleware: get_str_array(endpoint, "middleware"),
+                endpoint_path: get_str(endpoint, "path").unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn select_middleware_context<'a>(
+    contexts: &'a [MiddlewareContext],
+    request_path: &str,
+) -> Option<&'a MiddlewareContext> {
+    contexts
+        .iter()
+        .filter(|context| crate::l7::endpoint_path_matches(&context.endpoint_path, request_path))
+        .max_by_key(|context| {
+            if context.endpoint_path.is_empty() {
+                0
+            } else {
+                context.endpoint_path.chars().filter(|c| *c != '*').count()
+            }
+        })
+}
+
+fn global_middleware_entries(
+    configs: &[regorus::Value],
+    host: &str,
+    explicit: &HashSet<String>,
+) -> Result<Vec<ChainEntry>> {
+    let mut entries = Vec::new();
+    for config in configs {
+        let name = get_str(config, "name").unwrap_or_default();
+        if explicit.contains(&name) {
+            continue;
+        }
+        if middleware_selector_matches(config, host) {
+            entries.push(chain_entry_from_value(config)?);
+        }
+    }
+    Ok(entries)
+}
+
+fn middleware_selector_matches(config: &regorus::Value, host: &str) -> bool {
+    let Some(selector) = get_field(config, "endpoints") else {
+        return false;
+    };
+    let includes = get_str_array(selector, "include");
+    let excludes = get_str_array(selector, "exclude");
+    let included =
+        !includes.is_empty() && includes.iter().any(|pattern| host_matches(pattern, host));
+    let excluded = excludes.iter().any(|pattern| host_matches(pattern, host));
+    included && !excluded
+}
+
+fn host_matches(pattern: &str, host: &str) -> bool {
+    if pattern == "*" || pattern == "**" {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return pattern.eq_ignore_ascii_case(host);
+    }
+    glob::Pattern::new(&pattern.to_ascii_lowercase())
+        .is_ok_and(|pattern| pattern.matches(&host.to_ascii_lowercase()))
+}
+
+fn chain_entry_from_value(value: &regorus::Value) -> Result<ChainEntry> {
+    let name = get_str(value, "name").unwrap_or_default();
+    let implementation = get_str(value, "middleware").unwrap_or_default();
+    Ok(ChainEntry {
+        name,
+        implementation,
+        config: get_field(value, "config")
+            .map(regorus_value_to_struct)
+            .unwrap_or_default(),
+        on_error: openshell_supervisor_middleware::OnError::parse(
+            get_str(value, "on_error").as_deref().unwrap_or_default(),
+        )?,
+    })
+}
+
+fn get_field<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
+    let key_val = regorus::Value::String(key.into());
+    match val {
+        regorus::Value::Object(map) => map.get(&key_val),
+        _ => None,
+    }
+}
+
+fn regorus_value_to_struct(value: &regorus::Value) -> prost_types::Struct {
+    let regorus::Value::Object(map) = value else {
+        return prost_types::Struct::default();
+    };
+    prost_types::Struct {
+        fields: map
+            .iter()
+            .filter_map(|(key, value)| match key {
+                regorus::Value::String(key) => {
+                    Some((key.to_string(), regorus_value_to_prost(value)))
+                }
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+fn regorus_value_to_prost(value: &regorus::Value) -> prost_types::Value {
+    use prost_types::{ListValue, Struct, Value, value::Kind};
+    Value {
+        kind: Some(match value {
+            regorus::Value::Bool(value) => Kind::BoolValue(*value),
+            regorus::Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
+            regorus::Value::String(value) => Kind::StringValue(value.to_string()),
+            regorus::Value::Array(values) => Kind::ListValue(ListValue {
+                values: values.iter().map(regorus_value_to_prost).collect(),
+            }),
+            regorus::Value::Object(values) => Kind::StructValue(Struct {
+                fields: values
+                    .iter()
+                    .filter_map(|(key, value)| match key {
+                        regorus::Value::String(key) => {
+                            Some((key.to_string(), regorus_value_to_prost(value)))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+            }),
+            regorus::Value::Null | regorus::Value::Undefined => Kind::NullValue(0),
+            _ => Kind::NullValue(0),
+        }),
+    }
+}
+
 fn parse_filesystem_policy(val: &regorus::Value) -> FilesystemPolicy {
     FilesystemPolicy {
         read_only: get_str_array(val, "read_only")
@@ -735,6 +1010,14 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     }
 
     // Validate BEFORE expanding presets (catches user errors like rules+access)
+    let middleware_errors = validate_middleware_policies(&data);
+    if !middleware_errors.is_empty() {
+        return Err(miette::miette!(
+            "middleware policy validation failed:\n{}",
+            middleware_errors.join("\n")
+        ));
+    }
+
     let (errors, warnings) = crate::l7::validate_l7_policies(&data);
     for w in &warnings {
         openshell_ocsf::ocsf_emit!(
@@ -953,6 +1236,131 @@ fn normalize_l7_rule_aliases(
             );
         }
     }
+}
+
+fn validate_middleware_policies(data: &serde_json::Value) -> Vec<String> {
+    let mut errors = Vec::new();
+    let middlewares = data
+        .get("network_middlewares")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut names = HashSet::new();
+    for mw in middlewares {
+        let name = mw
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let implementation = mw
+            .get("middleware")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if name.is_empty() {
+            errors.push("network_middlewares entry has empty name".to_string());
+        } else if !names.insert(name.to_string()) {
+            errors.push(format!("duplicate middleware config '{name}'"));
+        }
+        if implementation.is_empty() {
+            errors.push(format!(
+                "middleware config '{name}' has empty implementation"
+            ));
+        }
+        if implementation.starts_with("openshell/")
+            && implementation != openshell_supervisor_middleware::BUILTIN_SECRETS
+        {
+            errors.push(format!(
+                "middleware config '{name}' references unsupported built-in '{implementation}'"
+            ));
+        }
+        let on_error = mw
+            .get("on_error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !matches!(on_error, "" | "fail_closed" | "fail_open") {
+            errors.push(format!(
+                "middleware config '{name}' has invalid on_error '{on_error}'"
+            ));
+        }
+    }
+
+    let Some(policies) = data
+        .get("network_policies")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return errors;
+    };
+
+    for (policy_name, policy) in policies {
+        let policy_middleware = json_string_array(policy.get("middleware"));
+        for name in &policy_middleware {
+            if !names.contains(name) {
+                errors.push(format!(
+                    "network policy '{policy_name}' references unknown middleware config '{name}'"
+                ));
+            }
+        }
+        for endpoint in policy
+            .get("endpoints")
+            .and_then(serde_json::Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+        {
+            let endpoint_middleware = json_string_array(endpoint.get("middleware"));
+            for name in &endpoint_middleware {
+                if !names.contains(name) {
+                    errors.push(format!(
+                        "network policy '{policy_name}' endpoint references unknown middleware config '{name}'"
+                    ));
+                }
+            }
+            let tls_skip = endpoint
+                .get("tls")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|tls| tls == "skip");
+            if tls_skip && (!policy_middleware.is_empty() || !endpoint_middleware.is_empty()) {
+                errors.push(format!(
+                    "network policy '{policy_name}' attaches middleware to a tls: skip endpoint"
+                ));
+            }
+            if tls_skip && global_selector_matches_any_middleware(middlewares, endpoint) {
+                errors.push(format!(
+                    "network policy '{policy_name}' tls: skip endpoint matches a global middleware selector"
+                ));
+            }
+        }
+    }
+    errors
+}
+
+fn json_string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn global_selector_matches_any_middleware(
+    middlewares: &[serde_json::Value],
+    endpoint: &serde_json::Value,
+) -> bool {
+    let host = endpoint
+        .get("host")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    middlewares.iter().any(|mw| {
+        let Some(selector) = mw.get("endpoints") else {
+            return false;
+        };
+        let includes = json_string_array(selector.get("include"));
+        let excludes = json_string_array(selector.get("exclude"));
+        !includes.is_empty()
+            && includes.iter().any(|pattern| host_matches(pattern, host))
+            && !excludes.iter().any(|pattern| host_matches(pattern, host))
+    })
 }
 
 /// Resolve a policy binary path through the container's root filesystem.
@@ -1316,6 +1724,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 allow_all_known_mcp_methods.into();
                         }
                     }
+                    if !e.middleware.is_empty() {
+                        ep["middleware"] = e.middleware.clone().into();
+                    }
                     ep
                 })
                 .collect();
@@ -1341,14 +1752,43 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     entries
                 })
                 .collect();
-            (
-                key.clone(),
-                serde_json::json!({
-                    "name": rule.name,
-                    "endpoints": endpoints,
-                    "binaries": binaries,
-                }),
-            )
+            let mut policy = serde_json::json!({
+                "name": rule.name,
+                "endpoints": endpoints,
+                "binaries": binaries,
+            });
+            if !rule.middleware.is_empty() {
+                policy["middleware"] = rule.middleware.clone().into();
+            }
+            (key.clone(), policy)
+        })
+        .collect();
+
+    let network_middlewares: Vec<serde_json::Value> = proto
+        .network_middlewares
+        .iter()
+        .map(|mw| {
+            let mut value = serde_json::json!({
+                "name": mw.name,
+                "middleware": mw.middleware,
+            });
+            if let Some(config) = &mw.config {
+                value["config"] = prost_struct_to_json(config);
+            }
+            if !mw.on_error.is_empty() {
+                value["on_error"] = mw.on_error.clone().into();
+            }
+            if let Some(selector) = &mw.endpoints {
+                let mut endpoints = serde_json::json!({});
+                if !selector.include.is_empty() {
+                    endpoints["include"] = selector.include.clone().into();
+                }
+                if !selector.exclude.is_empty() {
+                    endpoints["exclude"] = selector.exclude.clone().into();
+                }
+                value["endpoints"] = endpoints;
+            }
+            value
         })
         .collect();
 
@@ -1357,8 +1797,35 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
         "landlock": landlock,
         "process": process,
         "network_policies": network_policies,
+        "network_middlewares": network_middlewares,
     })
     .to_string()
+}
+
+fn prost_struct_to_json(config: &prost_types::Struct) -> serde_json::Value {
+    serde_json::Value::Object(
+        config
+            .fields
+            .iter()
+            .map(|(key, value)| (key.clone(), prost_value_to_json(value)))
+            .collect(),
+    )
+}
+
+fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::NullValue(_)) | None => serde_json::Value::Null,
+        Some(prost_types::value::Kind::BoolValue(value)) => serde_json::Value::Bool(*value),
+        Some(prost_types::value::Kind::NumberValue(value)) => serde_json::Number::from_f64(*value)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Some(prost_types::value::Kind::StringValue(value)) => {
+            serde_json::Value::String(value.clone())
+        }
+        Some(prost_types::value::Kind::ListValue(value)) => {
+            serde_json::Value::Array(value.values.iter().map(prost_value_to_json).collect())
+        }
+        Some(prost_types::value::Kind::StructValue(value)) => prost_struct_to_json(value),
+    }
 }
 
 #[cfg(test)]
@@ -1407,6 +1874,7 @@ mod tests {
                     path: "/usr/local/bin/claude".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         network_policies.insert(
@@ -1422,6 +1890,7 @@ mod tests {
                     path: "/usr/bin/glab".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         ProtoSandboxPolicy {
@@ -1439,6 +1908,7 @@ mod tests {
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         }
     }
 
@@ -2763,6 +3233,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -2781,6 +3252,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3783,6 +4255,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -3800,6 +4273,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3840,6 +4314,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -3857,6 +4332,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3898,6 +4374,7 @@ network_policies:
                     path: "/usr/local/bin/claude".to_string(),
                     ..Default::default()
                 }],
+                middleware: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -3915,6 +4392,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -3958,6 +4436,7 @@ network_policies:
                     path: "/usr/local/bin/aws".to_string(),
                     ..Default::default()
                 }],
+                middleware: vec![],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -3975,6 +4454,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4017,6 +4497,7 @@ network_policies:
                     path: "/usr/bin/node".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4034,6 +4515,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
@@ -4966,6 +5448,7 @@ process:
                     ..Default::default()
                 }],
                 binaries: vec![proposal_binary],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -4983,6 +5466,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
@@ -5020,6 +5504,7 @@ process:
                     path: "/usr/bin/python".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5037,6 +5522,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
@@ -5090,6 +5576,7 @@ process:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5107,6 +5594,7 @@ process:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
 
@@ -5320,6 +5808,7 @@ network_policies:
                     path: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -5337,6 +5826,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
         let engine = OpaEngine::from_proto(&proto).unwrap();
         // Port 443
@@ -6023,6 +6513,7 @@ network_policies:
                     path: "/usr/bin/python3".to_string(),
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
 
@@ -6279,6 +6770,7 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -6296,6 +6788,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         // Build engine with our PID (symlink resolution will work via /proc/self/root/)
@@ -6356,6 +6849,7 @@ network_policies:
                     path: link_path,
                     ..Default::default()
                 }],
+                ..Default::default()
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -6373,6 +6867,7 @@ network_policies:
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
+            network_middlewares: vec![],
         };
 
         // Initial load at pid=0 — no symlink expansion
@@ -6413,6 +6908,133 @@ network_policies:
         let engine = l7_engine();
         let input = l7_input("api.example.com", 8080, "HEAD", "/repos/myorg/foo");
         assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn middleware_chain_orders_global_policy_endpoint_once() {
+        let data = r#"
+network_middlewares:
+  - name: global-redactor
+    middleware: openshell/secrets
+    endpoints:
+      include: ["api.example.com"]
+  - name: policy-redactor
+    middleware: openshell/secrets
+  - name: endpoint-redactor
+    middleware: openshell/secrets
+network_policies:
+  api:
+    name: api
+    middleware: ["global-redactor", "policy-redactor"]
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        middleware: ["policy-redactor", "endpoint-redactor"]
+        rules:
+          - allow: { method: POST, path: "/v1/**" }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (chain, _) = engine
+            .query_middleware_chain_with_generation(&input, "/v1/messages")
+            .unwrap();
+        let names: Vec<_> = chain.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["global-redactor", "policy-redactor", "endpoint-redactor"]
+        );
+    }
+
+    #[test]
+    fn middleware_policy_validation_rejects_bad_configs() {
+        let cases = [
+            (
+                "missing reference",
+                r#"
+network_middlewares:
+  - name: redactor
+    middleware: openshell/secrets
+network_policies:
+  api:
+    middleware: ["missing"]
+    endpoints:
+      - { host: api.example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#,
+                "unknown middleware config 'missing'",
+            ),
+            (
+                "invalid on_error",
+                r#"
+network_middlewares:
+  - name: redactor
+    middleware: openshell/secrets
+    on_error: maybe
+"#,
+                "invalid on_error",
+            ),
+            (
+                "duplicate names",
+                r#"
+network_middlewares:
+  - name: redactor
+    middleware: openshell/secrets
+  - name: redactor
+    middleware: openshell/secrets
+"#,
+                "duplicate middleware config 'redactor'",
+            ),
+            (
+                "reserved builtin",
+                r#"
+network_middlewares:
+  - name: sigv4
+    middleware: openshell/sigv4
+"#,
+                "unsupported built-in",
+            ),
+            (
+                "tls skip attachment",
+                r#"
+network_middlewares:
+  - name: redactor
+    middleware: openshell/secrets
+network_policies:
+  api:
+    endpoints:
+      - host: api.example.com
+        port: 443
+        tls: skip
+        middleware: ["redactor"]
+    binaries:
+      - { path: /usr/bin/curl }
+"#,
+                "tls: skip",
+            ),
+        ];
+
+        for (name, data, expected) in cases {
+            let err = match OpaEngine::from_strings(TEST_POLICY, data) {
+                Ok(_) => panic!("{name}: expected policy validation failure"),
+                Err(err) => err.to_string(),
+            };
+            assert!(
+                err.contains(expected),
+                "{name}: expected {expected:?} in {err:?}"
+            );
+        }
     }
 
     #[test]

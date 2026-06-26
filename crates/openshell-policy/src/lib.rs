@@ -19,8 +19,8 @@ use std::path::Path;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
-    LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    LandlockPolicy, MiddlewareEndpointSelector, NetworkBinary, NetworkEndpoint,
+    NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy, SandboxPolicy, McpOptions,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,8 @@ struct PolicyFile {
     process: Option<ProcessDef>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    network_middlewares: Vec<NetworkMiddlewareConfigDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -87,6 +89,30 @@ struct NetworkPolicyRuleDef {
     endpoints: Vec<NetworkEndpointDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     binaries: Vec<NetworkBinaryDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    middleware: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkMiddlewareConfigDef {
+    name: String,
+    middleware: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    config: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    on_error: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    endpoints: Option<MiddlewareEndpointSelectorDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MiddlewareEndpointSelectorDef {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    include: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -148,6 +174,8 @@ struct NetworkEndpointDef {
     json_rpc: Option<JsonRpcConfigDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp: Option<McpConfigDef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    middleware: Vec<String>,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -672,6 +700,21 @@ fn yaml_mcp_method(
 }
 
 fn to_proto(raw: PolicyFile) -> SandboxPolicy {
+    let network_middlewares = raw
+        .network_middlewares
+        .into_iter()
+        .map(|mw| NetworkMiddlewareConfig {
+            name: mw.name,
+            middleware: mw.middleware,
+            config: Some(json_map_to_struct(mw.config)),
+            on_error: mw.on_error,
+            endpoints: mw.endpoints.map(|selector| MiddlewareEndpointSelector {
+                include: selector.include,
+                exclude: selector.exclude,
+            }),
+        })
+        .collect();
+
     let network_policies = raw
         .network_policies
         .into_iter()
@@ -745,6 +788,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                             signing_region: e.signing_region,
                             json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
                             mcp: mcp_options(&e.mcp),
+                            middleware: e.middleware,
                         }
                     })
                     .collect(),
@@ -756,6 +800,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                         ..Default::default()
                     })
                     .collect(),
+                middleware: rule.middleware,
             };
             (key, proto_rule)
         })
@@ -776,6 +821,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
             run_as_group: p.run_as_group,
         }),
         network_policies,
+        network_middlewares,
     }
 }
 
@@ -892,6 +938,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             signing_region: e.signing_region.clone(),
                             json_rpc,
                             mcp,
+                            middleware: e.middleware.clone(),
                         }
                     })
                     .collect(),
@@ -903,8 +950,31 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                         harness: false,
                     })
                     .collect(),
+                middleware: rule.middleware.clone(),
             };
             (key.clone(), yaml_rule)
+        })
+        .collect();
+
+    let network_middlewares = policy
+        .network_middlewares
+        .iter()
+        .map(|mw| NetworkMiddlewareConfigDef {
+            name: mw.name.clone(),
+            middleware: mw.middleware.clone(),
+            config: mw
+                .config
+                .as_ref()
+                .map(struct_to_json_map)
+                .unwrap_or_default(),
+            on_error: mw.on_error.clone(),
+            endpoints: mw
+                .endpoints
+                .as_ref()
+                .map(|selector| MiddlewareEndpointSelectorDef {
+                    include: selector.include.clone(),
+                    exclude: selector.exclude.clone(),
+                }),
         })
         .collect();
 
@@ -914,6 +984,69 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
         landlock,
         process,
         network_policies,
+        network_middlewares,
+    }
+}
+
+fn json_map_to_struct(map: BTreeMap<String, serde_json::Value>) -> prost_types::Struct {
+    prost_types::Struct {
+        fields: map
+            .into_iter()
+            .map(|(key, value)| (key, json_to_protobuf_value(value)))
+            .collect(),
+    }
+}
+
+fn json_to_protobuf_value(value: serde_json::Value) -> prost_types::Value {
+    use prost_types::{ListValue, Struct, Value, value::Kind};
+    Value {
+        kind: Some(match value {
+            serde_json::Value::Null => Kind::NullValue(0),
+            serde_json::Value::Bool(value) => Kind::BoolValue(value),
+            serde_json::Value::Number(value) => {
+                Kind::NumberValue(value.as_f64().unwrap_or_default())
+            }
+            serde_json::Value::String(value) => Kind::StringValue(value),
+            serde_json::Value::Array(values) => Kind::ListValue(ListValue {
+                values: values.into_iter().map(json_to_protobuf_value).collect(),
+            }),
+            serde_json::Value::Object(values) => Kind::StructValue(Struct {
+                fields: values
+                    .into_iter()
+                    .map(|(key, value)| (key, json_to_protobuf_value(value)))
+                    .collect(),
+            }),
+        }),
+    }
+}
+
+fn struct_to_json_map(config: &prost_types::Struct) -> BTreeMap<String, serde_json::Value> {
+    config
+        .fields
+        .iter()
+        .map(|(key, value)| (key.clone(), protobuf_value_to_json(value)))
+        .collect()
+}
+
+fn protobuf_value_to_json(value: &prost_types::Value) -> serde_json::Value {
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::NullValue(_)) | None => serde_json::Value::Null,
+        Some(prost_types::value::Kind::BoolValue(value)) => serde_json::Value::Bool(*value),
+        Some(prost_types::value::Kind::NumberValue(value)) => serde_json::Number::from_f64(*value)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        Some(prost_types::value::Kind::StringValue(value)) => {
+            serde_json::Value::String(value.clone())
+        }
+        Some(prost_types::value::Kind::ListValue(value)) => {
+            serde_json::Value::Array(value.values.iter().map(protobuf_value_to_json).collect())
+        }
+        Some(prost_types::value::Kind::StructValue(value)) => serde_json::Value::Object(
+            value
+                .fields
+                .iter()
+                .map(|(key, value)| (key.clone(), protobuf_value_to_json(value)))
+                .collect(),
+        ),
     }
 }
 
@@ -1029,6 +1162,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
             run_as_group: "sandbox".into(),
         }),
         network_policies: HashMap::new(),
+        network_middlewares: vec![],
     }
 }
 
@@ -1400,6 +1534,87 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_network_middlewares() {
+        let yaml = r#"
+version: 1
+network_middlewares:
+  - name: global-redactor
+    middleware: openshell/secrets
+    on_error: fail_open
+    endpoints:
+      include: ["api.example.com", "*.service.test"]
+      exclude: ["internal.example.com"]
+    config:
+      secrets: ["api_key", "authorization"]
+      service:
+        mode: redact
+        max_matches: 2
+  - name: endpoint-redactor
+    middleware: openshell/secrets
+network_policies:
+  api:
+    name: api
+    middleware: ["global-redactor"]
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        middleware: ["endpoint-redactor"]
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        assert_eq!(proto.network_middlewares.len(), 2);
+        assert_eq!(proto.network_middlewares[0].name, "global-redactor");
+        assert_eq!(proto.network_middlewares[0].middleware, "openshell/secrets");
+        assert_eq!(proto.network_middlewares[0].on_error, "fail_open");
+        assert_eq!(
+            proto.network_middlewares[0]
+                .endpoints
+                .as_ref()
+                .expect("selector")
+                .include,
+            vec!["api.example.com", "*.service.test"]
+        );
+        assert_eq!(
+            proto.network_middlewares[0]
+                .endpoints
+                .as_ref()
+                .expect("selector")
+                .exclude,
+            vec!["internal.example.com"]
+        );
+        assert!(
+            proto.network_middlewares[0]
+                .config
+                .as_ref()
+                .expect("config")
+                .fields
+                .contains_key("service")
+        );
+        assert_eq!(
+            proto.network_policies["api"].middleware,
+            vec!["global-redactor"]
+        );
+        assert_eq!(
+            proto.network_policies["api"].endpoints[0].middleware,
+            vec!["endpoint-redactor"]
+        );
+
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let reparsed = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(reparsed.network_middlewares, proto.network_middlewares);
+        assert_eq!(
+            reparsed.network_policies["api"].middleware,
+            vec!["global-redactor"]
+        );
+        assert_eq!(
+            reparsed.network_policies["api"].endpoints[0].middleware,
+            vec!["endpoint-redactor"]
+        );
+    }
+
+    #[test]
     fn restrictive_default_has_no_network_policies() {
         let policy = restrictive_default_policy();
         assert!(
@@ -1714,6 +1929,7 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
+            network_middlewares: Vec::new(),
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }

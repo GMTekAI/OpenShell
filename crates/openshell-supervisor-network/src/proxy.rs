@@ -1183,6 +1183,7 @@ async fn handle_tcp_connection(
                         &mut tls_upstream,
                         &ctx,
                         &generation_guard,
+                        Some(&opa_engine),
                     )
                     .await
                 }
@@ -1288,6 +1289,7 @@ async fn handle_tcp_connection(
                 &mut upstream,
                 &ctx,
                 &generation_guard,
+                Some(&opa_engine),
             )
             .await
             {
