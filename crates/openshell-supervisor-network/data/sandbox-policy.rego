@@ -48,9 +48,9 @@ deny_reason := reason if {
 	cmdline_str := concat(", ", input.exec.cmdline_paths)
 	binary_misses := [r |
 		some name
-		policy := data.network_policies[name]
-		endpoint_allowed(policy, input.network)
-		not binary_allowed(policy, input.exec)
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	not binary_allowed(policy, input.exec)
 		r := sprintf("binary '%s' not allowed in policy '%s' (ancestors: [%s], cmdline: [%s]). SYMLINK HINT: the binary path is the kernel-resolved target from /proc/<pid>/exe, not the symlink. If your policy specifies a symlink (e.g., /usr/bin/python3) but the actual binary is /usr/bin/python3.11, either: (1) use the canonical path in your policy (run 'readlink -f /usr/bin/python3' inside the sandbox), or (2) ensure symlink resolution is working (check sandbox logs for 'Cannot access container filesystem')", [input.exec.path, name, ancestors_str, cmdline_str])
 	]
 	count(binary_misses) > 0
@@ -98,6 +98,25 @@ endpoint_policy_for_request if {
 	some name
 	data.network_policies[name]
 	endpoint_allowed(data.network_policies[name], input.network)
+}
+
+# MCP is transport-authoritative for its origin (see
+# _transport_endpoint_configs) and request-authoritative only for a matching
+# path. Other paths on a shared origin retain their normal REST/GraphQL policy.
+mcp_authority_for_network(network) if {
+	some name
+	policy := data.network_policies[name]
+	ep := policy.endpoints[_]
+	object.get(ep, "protocol", "") == "mcp"
+	endpoint_matches_request(ep, network)
+}
+
+mcp_authority_for_l7_request(network, request) if {
+	some name
+	policy := data.network_policies[name]
+	ep := policy.endpoints[_]
+	object.get(ep, "protocol", "") == "mcp"
+	endpoint_matches_l7_request(ep, network, request)
 }
 
 # Endpoint matching: exact host (case-insensitive) + port in ports list.
@@ -212,20 +231,36 @@ default allow_request = false
 # "duplicated definition of local variable" error that occurs when the
 # outer `some name` iterates over multiple policies that share a host:port.
 _policy_allows_l7(policy) if {
-	some ep
 	ep := policy.endpoints[_]
-	endpoint_matches_l7_request(ep, input.network, input.request)
+	authoritative_endpoint_matches_l7_request(ep, input.network, input.request)
 	request_allowed_for_endpoint(input.request, ep)
 }
 
 # L7 request allowed if any matching L4 policy also allows the L7 request
 # AND no deny rule blocks it. Deny rules take precedence over allow rules.
 allow_request if {
+	not mcp_authority_for_l7_request(input.network, input.request)
 	some name
 	policy := data.network_policies[name]
 	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
 	_policy_allows_l7(policy)
+	not deny_request
+}
+
+# MCP policies compose as an allow union among MCP endpoints that match the
+# same reserved origin, caller identity, and path. Non-MCP endpoints are never
+# considered once the origin is reserved.
+allow_request if {
+	mcp_authority_for_l7_request(input.network, input.request)
+	some name
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	binary_allowed(policy, input.exec)
+	ep := policy.endpoints[_]
+	object.get(ep, "protocol", "") == "mcp"
+	endpoint_matches_l7_request(ep, input.network, input.request)
+	request_allowed_for_endpoint(input.request, ep)
 	not deny_request
 }
 
@@ -240,9 +275,8 @@ default deny_request = false
 # Per-policy helper: true when this policy has at least one endpoint matching
 # the L4 request whose deny_rules also match the specific L7 request.
 _policy_denies_l7(policy) if {
-	some ep
 	ep := policy.endpoints[_]
-	endpoint_matches_l7_request(ep, input.network, input.request)
+	authoritative_endpoint_matches_l7_request(ep, input.network, input.request)
 	request_denied_for_endpoint(input.request, ep)
 }
 
@@ -518,6 +552,23 @@ request_allowed_for_endpoint(request, endpoint) if {
 	object.get(jsonrpc, "receive_stream", false)
 	jsonrpc_no_parse_error(jsonrpc)
 	object.get(jsonrpc, "method", null) == null
+	not object.get(jsonrpc, "has_response", false)
+}
+
+# MCP Streamable HTTP session termination is a transport control rather than a
+# JSON-RPC method. The Rust parser sets this flag only for a bodyless DELETE
+# carrying exactly one non-empty visible-ASCII MCP-Session-Id header. Endpoint
+# host/port/path and caller binary matching still happen in the surrounding
+# policy rules, and credential authorization uses this same decision.
+request_allowed_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "mcp"
+	request.method == "DELETE"
+	jsonrpc := object.get(request, "jsonrpc", null)
+	is_object(jsonrpc)
+	object.get(jsonrpc, "session_termination", false)
+	jsonrpc_no_parse_error(jsonrpc)
+	object.get(jsonrpc, "method", null) == null
+	not object.get(jsonrpc, "receive_stream", false)
 	not object.get(jsonrpc, "has_response", false)
 }
 
@@ -836,7 +887,6 @@ command_matches(actual, expected) if {
 
 # Per-policy helper: returns matching endpoint configs for a single policy.
 _policy_endpoint_configs(policy) := [ep |
-	some ep
 	ep := policy.endpoints[_]
 	endpoint_matches_request(ep, input.network)
 	endpoint_has_extended_config(ep)
@@ -845,19 +895,87 @@ _policy_endpoint_configs(policy) := [ep |
 # Collect matching endpoint configs across all policies.  Iterates over
 # _matching_policy_names (a set, safe from regorus variable collisions)
 # then collects per-policy configs via the helper function.
-_matching_endpoint_configs := [cfg |
+_matching_endpoint_configs := [ep |
 	some pname
-	_matching_policy_names[pname]
-	cfgs := _policy_endpoint_configs(data.network_policies[pname])
-	cfg := cfgs[_]
+	policy := data.network_policies[pname]
+	ep := policy.endpoints[_]
+	endpoint_matches_request(ep, input.network)
+	endpoint_has_extended_config(ep)
+	route_endpoint_config_visible(policy, ep)
 ]
+
+route_endpoint_config_visible(policy, _) if {
+	binary_allowed(policy, input.exec)
+}
+
+route_endpoint_config_visible(_, ep) if {
+	object.get(ep, "protocol", "") == "mcp"
+}
 
 matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
 
+# Transport policy is queried before application bytes are parsed. For an MCP
+# reserved origin, collect every MCP endpoint config independent of the caller
+# binary so a `tls: require` floor cannot be hidden behind a broader policy or
+# a different binary match. Non-MCP origins retain the legacy binary-scoped
+# endpoint-config behavior.
+_transport_endpoint_configs := [ep |
+	some name
+	policy := data.network_policies[name]
+	ep := policy.endpoints[_]
+	endpoint_matches_request(ep, input.network)
+	endpoint_has_extended_config(ep)
+	transport_endpoint_config_applies(policy, ep)
+]
+
+transport_endpoint_config_applies(_, ep) if {
+	mcp_authority_for_network(input.network)
+	object.get(ep, "protocol", "") == "mcp"
+}
+
+transport_endpoint_config_applies(policy, _) if {
+	not mcp_authority_for_network(input.network)
+	binary_allowed(policy, input.exec)
+}
+
+# Credential keys form global, policy-owned capabilities. The supervisor uses
+# this set to remove a reserved key from the sandbox-global resolver unless the
+# selected endpoint explicitly owns that key.
+_reserved_credential_keys := [key |
+	some name
+	policy := data.network_policies[name]
+	ep := policy.endpoints[_]
+	keys := object.get(ep, "credential_keys", [])
+	key := keys[_]
+]
+
+# Keys authorized for this exact parsed request. Resolver scoping uses this
+# result after L7 evaluation; a broad policy that happens to allow the request
+# cannot borrow a key owned by a different endpoint.
+_authorized_credential_keys := [key |
+	some name
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	binary_allowed(policy, input.exec)
+	ep := policy.endpoints[_]
+	authoritative_endpoint_matches_l7_request(ep, input.network, input.request)
+	request_allowed_for_endpoint(input.request, ep)
+	not request_denied_for_endpoint(input.request, ep)
+	keys := object.get(ep, "credential_keys", [])
+	key := keys[_]
+]
+
+_credential_bound_request if {
+	some name
+	policy := data.network_policies[name]
+	ep := policy.endpoints[_]
+	endpoint_matches_l7_request(ep, input.network, input.request)
+	count(object.get(ep, "credential_keys", [])) > 0
+}
+
 _policy_has_exact_declared_endpoint(policy) if {
-	some ep
 	ep := policy.endpoints[_]
 	not object.get(ep, "advisor_proposed", false)
 	not contains(ep.host, "*")
@@ -898,6 +1016,17 @@ endpoint_matches_l7_request(ep, network, request) if {
 	endpoint_path_matches_request(ep, request)
 }
 
+authoritative_endpoint_matches_l7_request(ep, network, request) if {
+	mcp_authority_for_l7_request(network, request)
+	object.get(ep, "protocol", "") == "mcp"
+	endpoint_matches_l7_request(ep, network, request)
+}
+
+authoritative_endpoint_matches_l7_request(ep, network, request) if {
+	not mcp_authority_for_l7_request(network, request)
+	endpoint_matches_l7_request(ep, network, request)
+}
+
 endpoint_path_matches_request(ep, request) if {
 	object.get(ep, "path", "") == ""
 }
@@ -920,4 +1049,8 @@ endpoint_has_extended_config(ep) if {
 
 endpoint_has_extended_config(ep) if {
 	ep.tls
+}
+
+endpoint_has_extended_config(ep) if {
+	count(object.get(ep, "credential_keys", [])) > 0
 }

@@ -60,6 +60,11 @@ openshell provider create --name my-api --type generic --credential API_KEY
 
 This looks up the current value of `$API_KEY` in your shell and stores it.
 
+Use `--output json` when automation must bind later mutations to the exact
+object created by this request. The response includes the immutable provider
+`id`, `resource_version`, type, and credential key names, but never credential
+values.
+
 Provider profile metadata is available for known provider types. Provider profile
 network policy is gateway opt-in:
 
@@ -119,6 +124,16 @@ Update a provider's credentials:
 
 ```shell
 openshell provider update my-claude --from-existing
+```
+
+Automation can make update fail closed if the name was replaced or the provider
+changed after inspection:
+
+```shell
+openshell provider update my-claude \
+  --expected-id <provider-id> \
+  --expected-resource-version <resource-version> \
+  --credential ANTHROPIC_API_KEY
 ```
 
 Set or clear a credential expiry timestamp:
@@ -182,6 +197,10 @@ Delete a provider:
 openshell provider delete my-claude
 ```
 
+For an ownership-sensitive delete, pass both `--expected-id` and
+`--expected-resource-version`. OpenShell rejects the mutation if either value is
+stale. Identity preconditions apply to one provider name per command.
+
 ## Attach Providers to Sandboxes
 
 Pass one or more `--provider` flags when creating a sandbox:
@@ -227,7 +246,7 @@ provider instance, and pass `--provider <name>` explicitly.
 
 The agent process inside the sandbox never sees real credential values. At startup, the proxy replaces each credential with an opaque placeholder token in the agent's environment. When the agent sends an HTTP request containing a placeholder, the proxy resolves it to the real credential before forwarding upstream.
 
-This resolution requires the proxy to see plaintext HTTP. Endpoints must use `protocol: rest` in the policy (which auto-terminates TLS) or explicit `tls: terminate`. Endpoints without TLS termination pass traffic through as an opaque stream, and credential placeholders are forwarded unresolved.
+This resolution requires the proxy to inspect HTTP. Configure the appropriate HTTP protocol, such as `protocol: rest` or `protocol: mcp`, and set `tls: require` for credential-bearing HTTPS endpoints. `tls: require` denies plaintext, h2c, unsupported tunnel protocols, unavailable TLS state, and non-CONNECT forwarding. It also requires certificate-validated upstream TLS without a raw relay fallback. Before replacement, OpenShell requires an origin-form request target and exactly one valid `Host` header matching the policy-bound host and HTTPS effective port. Endpoints with `tls: skip` pass encrypted traffic through as an opaque stream, so the proxy cannot resolve placeholders.
 
 ### Supported injection locations
 
@@ -241,6 +260,14 @@ The proxy resolves credential placeholders in the following parts of an HTTP req
 | URL path segment | Agent builds a URL with the placeholder in the path. Supports concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
 
 The proxy does not modify request bodies, cookies, or response content.
+
+Credential-bound MCP is deliberately narrower than the general locations in
+this table. When an enforced `protocol: mcp` endpoint declares
+`credential_keys`, OpenShell resolves exactly one authorized placeholder in an
+`Authorization: Bearer` header. It rejects duplicate authorization fields and
+reserved credential markers in the target, query, session header, or custom
+headers. The provider must be attached with its exact immutable ID, current
+resource version, and the same credential key before resolution is active.
 
 ### Fail-closed behavior
 

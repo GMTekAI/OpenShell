@@ -161,6 +161,9 @@ pub enum PolicyMergeError {
         port: u32,
         access: String,
     },
+    DuplicateCredentialKey {
+        key: String,
+    },
 }
 
 impl std::fmt::Display for PolicyMergeError {
@@ -195,6 +198,10 @@ impl std::fmt::Display for PolicyMergeError {
             Self::UnsupportedAccessPreset { host, port, access } => write!(
                 f,
                 "endpoint {host}:{port} uses unsupported access preset '{access}'"
+            ),
+            Self::DuplicateCredentialKey { key } => write!(
+                f,
+                "credential key '{key}' is declared by more than one endpoint; credential ownership must be unique"
             ),
         }
     }
@@ -288,8 +295,11 @@ pub fn merge_policy(
     let mut merged = policy.clone();
     let mut warnings = Vec::new();
 
+    validate_unique_credential_keys(&merged)?;
+
     for operation in operations {
         apply_operation(&mut merged, operation, &mut warnings)?;
+        validate_unique_credential_keys(&merged)?;
     }
 
     let changed = merged != policy;
@@ -511,18 +521,24 @@ fn merge_endpoint(
         },
         warnings,
     );
-    let existing_tls = existing.tls.clone();
-    merge_string_field(
-        &mut existing.tls,
-        &incoming.tls,
-        PolicyMergeWarning::ExistingTlsRetained {
-            host: host.clone(),
-            port,
-            existing: existing_tls,
-            incoming: incoming.tls.clone(),
-        },
-        warnings,
-    );
+    // `require` is a security floor: once any overlapping endpoint requires
+    // TLS, a later merge must not weaken it through ordering.
+    if existing.tls == "require" || incoming.tls == "require" {
+        existing.tls = "require".to_string();
+    } else {
+        let existing_tls = existing.tls.clone();
+        merge_string_field(
+            &mut existing.tls,
+            &incoming.tls,
+            PolicyMergeWarning::ExistingTlsRetained {
+                host: host.clone(),
+                port,
+                existing: existing_tls,
+                incoming: incoming.tls.clone(),
+            },
+            warnings,
+        );
+    }
 
     if !incoming.rules.is_empty() {
         expand_existing_access(existing, &host, port, warnings)?;
@@ -555,11 +571,26 @@ fn merge_endpoint(
 
     append_unique_deny_rules(&mut existing.deny_rules, &incoming.deny_rules);
     append_unique_strings(&mut existing.allowed_ips, &incoming.allowed_ips);
+    append_unique_strings(&mut existing.credential_keys, &incoming.credential_keys);
     existing.allow_encoded_slash |= incoming.allow_encoded_slash;
     existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
     existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
     existing.advisor_proposed |= incoming.advisor_proposed;
     normalize_endpoint(existing);
+    Ok(())
+}
+
+fn validate_unique_credential_keys(policy: &SandboxPolicy) -> Result<(), PolicyMergeError> {
+    let mut owners = HashSet::new();
+    for rule in policy.network_policies.values() {
+        for endpoint in &rule.endpoints {
+            for key in &endpoint.credential_keys {
+                if !owners.insert(key.as_str()) {
+                    return Err(PolicyMergeError::DuplicateCredentialKey { key: key.clone() });
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1239,6 +1270,51 @@ mod tests {
 
         let endpoint = &result.policy.network_policies["existing"].endpoints[0];
         assert!(endpoint.request_body_credential_rewrite);
+    }
+
+    #[test]
+    fn add_rule_tls_require_dominates_existing_and_incoming_order() {
+        for require_is_incoming in [false, true] {
+            let mut existing_endpoint = endpoint("mcp.example.test", 443);
+            existing_endpoint.tls = if require_is_incoming {
+                "auto".into()
+            } else {
+                "require".into()
+            };
+            let mut incoming_endpoint = endpoint("mcp.example.test", 443);
+            incoming_endpoint.tls = if require_is_incoming {
+                "require".into()
+            } else {
+                "skip".into()
+            };
+
+            let mut policy = restrictive_default_policy();
+            policy.network_policies.insert(
+                "existing".into(),
+                NetworkPolicyRule {
+                    name: "existing".into(),
+                    endpoints: vec![existing_endpoint],
+                    ..Default::default()
+                },
+            );
+            let result = merge_policy(
+                policy,
+                &[PolicyMergeOp::AddRule {
+                    rule_name: "incoming".into(),
+                    rule: NetworkPolicyRule {
+                        name: "incoming".into(),
+                        endpoints: vec![incoming_endpoint],
+                        ..Default::default()
+                    },
+                }],
+            )
+            .expect("merge should succeed");
+
+            assert_eq!(
+                result.policy.network_policies["existing"].endpoints[0].tls,
+                "require"
+            );
+        }
     }
 
     #[test]

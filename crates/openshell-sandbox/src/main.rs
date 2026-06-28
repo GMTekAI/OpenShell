@@ -36,6 +36,15 @@ const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 /// Default `--mode` value: run both supervisor leaves in a single binary.
 const DEFAULT_MODE: &str = "network,process";
 
+/// Release/probe marker for the complete authenticated MCP boundary: required
+/// TLS, Host/query binding, MCP origin authority, endpoint-owned credential
+/// keys, sticky reservation lifetime, and policy-before-provider load order.
+/// Keep the exact bytes stable for downstream capability checks that inspect
+/// the installed supervisor binary.
+#[used]
+static AUTHENTICATED_MCP_BOUNDARY_MARKER: &[u8] =
+    b"authenticated-mcp-policy-bound-credential-rewrite-v1";
+
 /// Which supervisor leaves are enabled in this process.
 ///
 /// Parsed from a comma-separated `--mode` value, e.g. `network`,
@@ -195,6 +204,8 @@ fn copy_self(dest: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    std::hint::black_box(AUTHENTICATED_MCP_BOUNDARY_MARKER);
+
     // Handle `copy-self <DEST>` before clap so it works without any of the
     // sandbox flags. Kubernetes init containers invoke this path to seed an
     // emptyDir volume that the agent container then executes from.

@@ -676,6 +676,25 @@ openshell sandbox provider detach provider-demo work-github
 
 Attach and detach are idempotent. Attach validates that the provider exists before mutating the sandbox, and provider deletion fails while the provider is attached to any sandbox.
 
+For an endpoint-scoped MCP credential, first apply a sandbox base policy whose
+matching endpoint declares the key in `credential_keys`. Then attach the
+provider using the immutable ID and current resource version reported by
+`openshell provider get`:
+
+```shell
+openshell sandbox provider attach provider-demo work-github \
+  --expected-provider-id <provider-id> \
+  --expected-provider-resource-version <resource-version> \
+  --credential-key GITHUB_TOKEN
+```
+
+Repeat `--credential-key` only for keys declared by the same exact MCP endpoint.
+The gateway verifies the durable policy reservation, provider ownership, and
+credential presence before it atomically stores the attachment and binding.
+Updates, deletes, attaches, and detaches that use identity preconditions fail
+when either the immutable ID or resource version has changed. Detaching removes
+the active binding; it does not release the sandbox-lifetime key reservation.
+
 ### Runtime Limitations
 
 Provider attach and detach update the persisted sandbox provider list. Running sandboxes poll for provider environment revisions and effective policy changes.

@@ -114,6 +114,7 @@ async fn websocket_upgrade_through_l7_relay_exchanges_message() {
         query_params: HashMap::new(),
         raw_header,
         body_length: BodyLength::None,
+        raw_target: String::new(),
     };
 
     // Run the relay in a background task (simulates what relay_rest does)
@@ -242,6 +243,7 @@ async fn normal_http_request_still_works_after_relay_changes() {
         query_params: HashMap::new(),
         raw_header,
         body_length: BodyLength::None,
+        raw_target: String::new(),
     };
 
     let outcome = tokio::time::timeout(

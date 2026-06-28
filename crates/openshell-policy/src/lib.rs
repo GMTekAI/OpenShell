@@ -12,7 +12,7 @@
 mod compose;
 mod merge;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
 
@@ -115,6 +115,12 @@ struct NetworkEndpointDef {
     rules: Vec<L7RuleDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_ips: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_credential_keys"
+    )]
+    credential_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     deny_rules: Vec<L7DenyRuleDef>,
     /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
@@ -148,6 +154,49 @@ struct NetworkEndpointDef {
     json_rpc: Option<JsonRpcConfigDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mcp: Option<McpConfigDef>,
+}
+
+const MAX_CREDENTIAL_KEYS_PER_ENDPOINT: usize = 64;
+
+fn valid_credential_key(key: &str) -> bool {
+    let mut chars = key.bytes();
+    matches!(chars.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+        && chars.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn deserialize_credential_keys<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let keys = Vec::<String>::deserialize(deserializer)?;
+    if keys.is_empty() {
+        return Err(D::Error::custom(
+            "credential_keys must contain at least one env key when present",
+        ));
+    }
+    if keys.len() > MAX_CREDENTIAL_KEYS_PER_ENDPOINT {
+        return Err(D::Error::custom(format!(
+            "credential_keys contains more than {MAX_CREDENTIAL_KEYS_PER_ENDPOINT} entries"
+        )));
+    }
+    let mut unique = HashSet::with_capacity(keys.len());
+    for key in &keys {
+        if !valid_credential_key(key) {
+            return Err(D::Error::custom(format!(
+                "credential key '{key}' must match ^[A-Za-z_][A-Za-z0-9_]*$"
+            )));
+        }
+        if !unique.insert(key.as_str()) {
+            return Err(D::Error::custom(format!(
+                "credential key '{key}' is duplicated"
+            )));
+        }
+    }
+    Ok(keys)
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -714,6 +763,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips,
+                            credential_keys: e.credential_keys,
                             deny_rules: deny_rules
                                 .into_iter()
                                 .map(|deny| deny_def_to_proto(&protocol, deny))
@@ -867,6 +917,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             access: e.access.clone(),
                             rules,
                             allowed_ips: e.allowed_ips.clone(),
+                            credential_keys: e.credential_keys.clone(),
                             deny_rules,
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
@@ -1084,6 +1135,36 @@ pub enum PolicyViolation {
     },
     /// `credential_signing` and `request_body_credential_rewrite` are both set.
     CredentialSigningWithBodyRewrite { policy_name: String, host: String },
+    /// `tls` has an unrecognized value.
+    UnknownTlsMode {
+        policy_name: String,
+        host: String,
+        value: String,
+    },
+    /// A bound credential key is not a valid environment-variable name.
+    InvalidCredentialKey {
+        policy_name: String,
+        host: String,
+        key: String,
+    },
+    /// One endpoint declares more bound credential keys than the schema limit.
+    TooManyCredentialKeys {
+        policy_name: String,
+        host: String,
+        count: usize,
+    },
+    /// A credential key is declared by more than one endpoint.
+    DuplicateCredentialKey {
+        key: String,
+        first_policy: String,
+        second_policy: String,
+    },
+    /// Bound credentials are restricted to enforce-mode MCP in v1.
+    CredentialBindingRequiresEnforcedHttp { policy_name: String, host: String },
+    /// Bound credentials require TLS so resolved values never cross plaintext.
+    CredentialBindingRequiresTls { policy_name: String, host: String },
+    /// Bound MCP credentials require an exact host, port, and path.
+    CredentialBindingRequiresExactEndpoint { policy_name: String, host: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -1143,6 +1224,71 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': endpoint '{host}' has both credential_signing \
                      and request_body_credential_rewrite set; these options are mutually exclusive"
+                )
+            }
+            Self::UnknownTlsMode {
+                policy_name,
+                host,
+                value,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has unrecognized tls \
+                     value '{value}' (expected auto, require, skip, terminate, or passthrough)"
+                )
+            }
+            Self::InvalidCredentialKey {
+                policy_name,
+                host,
+                key,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has invalid credential key \
+                     '{key}' (expected ^[A-Za-z_][A-Za-z0-9_]*$)"
+                )
+            }
+            Self::TooManyCredentialKeys {
+                policy_name,
+                host,
+                count,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has too many credential \
+                     keys ({count} > {MAX_CREDENTIAL_KEYS_PER_ENDPOINT})"
+                )
+            }
+            Self::DuplicateCredentialKey {
+                key,
+                first_policy,
+                second_policy,
+            } => {
+                write!(
+                    f,
+                    "credential key '{key}' is declared more than once (policies \
+                     '{first_policy}' and '{second_policy}'); credential ownership must be unique"
+                )
+            }
+            Self::CredentialBindingRequiresEnforcedHttp { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' declares credential_keys \
+                     but is not an enforce-mode MCP endpoint"
+                )
+            }
+            Self::CredentialBindingRequiresTls { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' declares credential_keys \
+                     but does not set tls: require"
+                )
+            }
+            Self::CredentialBindingRequiresExactEndpoint { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' declares credential_keys \
+                     but does not use one exact host, port, and path"
                 )
             }
         }
@@ -1233,6 +1379,7 @@ pub fn validate_sandbox_policy(
     }
 
     // Check network policy endpoint hosts for TLD wildcards.
+    let mut credential_owners: HashMap<&str, String> = HashMap::new();
     for (key, rule) in &policy.network_policies {
         let name = if rule.name.is_empty() {
             key.clone()
@@ -1272,6 +1419,70 @@ pub fn validate_sandbox_policy(
                     policy_name: name.clone(),
                     host: ep.host.clone(),
                 });
+            }
+            if !matches!(
+                ep.tls.as_str(),
+                "" | "auto" | "require" | "skip" | "terminate" | "passthrough"
+            ) {
+                violations.push(PolicyViolation::UnknownTlsMode {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                    value: ep.tls.clone(),
+                });
+            }
+            if ep.credential_keys.len() > MAX_CREDENTIAL_KEYS_PER_ENDPOINT {
+                violations.push(PolicyViolation::TooManyCredentialKeys {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                    count: ep.credential_keys.len(),
+                });
+            }
+            if !ep.credential_keys.is_empty() {
+                if ep.protocol != "mcp" || ep.enforcement != "enforce" {
+                    violations.push(PolicyViolation::CredentialBindingRequiresEnforcedHttp {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                    });
+                }
+                if ep.tls != "require" {
+                    violations.push(PolicyViolation::CredentialBindingRequiresTls {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                    });
+                }
+                let ports = if ep.ports.is_empty() {
+                    usize::from(ep.port > 0)
+                } else {
+                    ep.ports.len()
+                };
+                if ep.host.contains('*')
+                    || ep.path.is_empty()
+                    || ep.path.contains(['*', '?'])
+                    || ports != 1
+                {
+                    violations.push(PolicyViolation::CredentialBindingRequiresExactEndpoint {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                    });
+                }
+            }
+            for credential_key in &ep.credential_keys {
+                if !valid_credential_key(credential_key) {
+                    violations.push(PolicyViolation::InvalidCredentialKey {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                        key: credential_key.clone(),
+                    });
+                }
+                if let Some(first_policy) = credential_owners.get(credential_key.as_str()) {
+                    violations.push(PolicyViolation::DuplicateCredentialKey {
+                        key: credential_key.clone(),
+                        first_policy: first_policy.clone(),
+                        second_policy: name.clone(),
+                    });
+                } else {
+                    credential_owners.insert(credential_key, name.clone());
+                }
             }
         }
     }
@@ -2004,6 +2215,50 @@ network_policies:
                 .iter()
                 .any(|v| matches!(v, PolicyViolation::CredentialSigningWithBodyRewrite { .. }))
         );
+    }
+
+    #[test]
+    fn validate_accepts_tls_require() {
+        let mut policy = SandboxPolicy::default();
+        policy.network_policies.insert(
+            "mcp".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.test".into(),
+                    port: 443,
+                    ports: vec![443],
+                    tls: "require".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_unknown_tls_mode() {
+        let mut policy = SandboxPolicy::default();
+        policy.network_policies.insert(
+            "mcp".into(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.test".into(),
+                    port: 443,
+                    ports: vec![443],
+                    tls: "sometimes".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let violations = validate_sandbox_policy(&policy).expect_err("unknown TLS must fail");
+        assert!(matches!(
+            violations.as_slice(),
+            [PolicyViolation::UnknownTlsMode { value, .. }] if value == "sometimes"
+        ));
     }
 
     #[test]

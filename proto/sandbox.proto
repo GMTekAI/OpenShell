@@ -143,6 +143,10 @@ message NetworkEndpoint {
   uint32 json_rpc_max_body_bytes = 22;
   // MCP-only policy and inspection options. Only used when protocol is "mcp".
   McpOptions mcp = 23;
+  // Credential env keys exclusively owned by this endpoint. A declared key is
+  // globally reserved within the effective sandbox policy and can be resolved
+  // only while this enforce-mode HTTP L7 endpoint authorizes the request.
+  repeated string credential_keys = 24;
 }
 
 // MCP options are grouped so MCP-specific policy can grow without adding more

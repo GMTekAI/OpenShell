@@ -287,6 +287,9 @@ message HealthResponse {
 
   // Service version.
   string version = 2;
+  // Explicit gateway control-plane contracts. Clients must require the
+  // complete marker they depend on rather than inferring from a version.
+  repeated string capabilities = 3;
 }
 
 // Public sandbox resource exposed by the OpenShell API.
@@ -332,6 +335,16 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // Gateway-owned exact source bindings for endpoint-scoped credential keys.
+  // Clients cannot set this at sandbox creation. Scoped provider attach and
+  // detach mutate it atomically with `providers`.
+  repeated SandboxProviderCredentialBinding provider_credential_bindings = 12;
+}
+
+message SandboxProviderCredentialBinding {
+  string provider_name = 1;
+  string provider_id = 2;
+  repeated string credential_keys = 3;
 }
 
 message ResourceRequirements {
@@ -480,6 +493,16 @@ message AttachSandboxProviderRequest {
   // If non-zero, the server validates that the sandbox's current resource_version
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   uint64 expected_resource_version = 3;
+  // Optional immutable provider identity precondition. Empty preserves legacy
+  // name-only behavior.
+  string expected_provider_id = 4;
+  // Optional provider CAS precondition. Zero preserves legacy behavior.
+  uint64 expected_provider_resource_version = 5;
+  // Credential keys to activate for this exact provider identity. Empty
+  // preserves legacy unscoped attachment behavior. Non-empty requires all
+  // identity/resource-version preconditions and a current sandbox-scoped
+  // base policy that reserves each key.
+  repeated string credential_keys = 6;
 }
 
 // Detach provider from sandbox request.
@@ -493,6 +516,11 @@ message DetachSandboxProviderRequest {
   // If non-zero, the server validates that the sandbox's current resource_version
   // matches this value before applying the mutation, returning ABORTED on mismatch.
   uint64 expected_resource_version = 3;
+  // Optional immutable provider identity precondition. Empty preserves legacy
+  // name-only behavior.
+  string expected_provider_id = 4;
+  // Optional provider CAS precondition. Zero preserves legacy behavior.
+  uint64 expected_provider_resource_version = 5;
 }
 
 // Delete sandbox request.
@@ -514,6 +542,10 @@ message ListSandboxesResponse {
 // List providers attached to a sandbox response.
 message ListSandboxProvidersResponse {
   repeated openshell.datamodel.v1.Provider providers = 1;
+  repeated SandboxProviderCredentialBinding provider_credential_bindings = 2;
+  // Provider names present in the sandbox spec, including a name whose
+  // provider record is currently missing. This supports fail-closed recovery.
+  repeated string attached_provider_names = 3;
 }
 
 // Attach provider to sandbox response.
@@ -864,11 +896,23 @@ message UpdateProviderRequest {
   // Optional per-credential expiry timestamps to merge into the provider.
   // A zero value removes the expiry for that credential.
   map<string, int64> credential_expires_at_ms = 2;
+  // Optional immutable provider identity precondition. Empty preserves legacy
+  // name-only behavior.
+  string expected_provider_id = 3;
+  // Optional provider CAS precondition. Zero falls back to provider metadata
+  // resource_version and then to the current version for legacy callers.
+  uint64 expected_resource_version = 4;
 }
 
 // Delete provider request.
 message DeleteProviderRequest {
   string name = 1;
+  // Optional immutable provider identity precondition. Empty preserves legacy
+  // name-only behavior.
+  string expected_provider_id = 2;
+  // Optional provider CAS precondition. Zero uses the current version for
+  // backward compatibility.
+  uint64 expected_resource_version = 3;
 }
 
 // Provider response.
@@ -1189,6 +1233,20 @@ message GetSandboxProviderEnvironmentResponse {
   // Maps endpoint-bound provider metadata to credential metadata.
   // Supervisor uses this to inject Authorization headers for token grant credentials.
   map<string, ProviderProfileCredential> dynamic_credentials = 4;
+  // Gateway-owned monotonic union of credential env keys that have ever been
+  // reserved by an accepted sandbox-scoped policy for this sandbox ID. The
+  // runtime must install these reservations before provider credentials.
+  repeated string reserved_credential_keys = 5;
+  // Storage revision of reserved_credential_keys. This changes whenever the
+  // durable union grows and survives policy removal and gateway restart.
+  uint64 credential_reservation_revision = 6;
+  // Active endpoint-scoped credential key to immutable provider ID. A
+  // reserved key without a matching active binding must not be resolved.
+  map<string, string> credential_provider_ids = 7;
+  // Source provider ID for each returned environment entry. This contains no
+  // credential values and lets the runtime reject retained/stale generations
+  // whose source no longer matches credential_provider_ids.
+  map<string, string> environment_provider_ids = 8;
 }
 
 // ---------------------------------------------------------------------------

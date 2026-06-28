@@ -533,7 +533,11 @@ enum Commands {
 
     /// Show gateway status and information.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Status,
+    Status {
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
 
     /// Manage inference configuration.
     #[command(after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
@@ -782,6 +786,10 @@ enum ProviderCommands {
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Manage provider credential refresh.
@@ -854,6 +862,14 @@ enum ProviderCommands {
         /// Credential expiry (`KEY=TIMESTAMP`). Accepts epoch milliseconds or RFC3339. A zero timestamp clears expiry.
         #[arg(long = "credential-expires-at", value_name = "KEY=TIMESTAMP")]
         credential_expires_at: Vec<String>,
+
+        /// Require the current provider to have this immutable ID.
+        #[arg(long = "expected-id", requires = "expected_resource_version")]
+        expected_id: Option<String>,
+
+        /// Require the current provider to have this resource version.
+        #[arg(long = "expected-resource-version", requires = "expected_id")]
+        expected_resource_version: Option<u64>,
     },
 
     /// Delete providers by name.
@@ -862,6 +878,14 @@ enum ProviderCommands {
         /// Provider names.
         #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_provider_names))]
         names: Vec<String>,
+
+        /// Require the provider to have this immutable ID (single NAME only).
+        #[arg(long = "expected-id", requires = "expected_resource_version")]
+        expected_id: Option<String>,
+
+        /// Require the provider to have this resource version (single NAME only).
+        #[arg(long = "expected-resource-version", requires = "expected_id")]
+        expected_resource_version: Option<u64>,
     },
 }
 
@@ -1512,6 +1536,10 @@ enum SandboxProviderCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Print exact attachment and credential-binding metadata as JSON.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Attach a provider to a sandbox.
@@ -1524,6 +1552,28 @@ enum SandboxProviderCommands {
         /// Provider name to attach.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         provider: String,
+
+        /// Require the provider to have this immutable ID.
+        #[arg(
+            long = "expected-provider-id",
+            requires = "expected_provider_resource_version"
+        )]
+        expected_provider_id: Option<String>,
+
+        /// Require the provider to have this resource version.
+        #[arg(
+            long = "expected-provider-resource-version",
+            requires = "expected_provider_id"
+        )]
+        expected_provider_resource_version: Option<u64>,
+
+        /// Activate an endpoint-scoped credential key for this exact provider.
+        #[arg(
+            long = "credential-key",
+            value_name = "ENV_KEY",
+            requires = "expected_provider_id"
+        )]
+        credential_keys: Vec<String>,
     },
 
     /// Detach a provider from a sandbox.
@@ -1536,6 +1586,20 @@ enum SandboxProviderCommands {
         /// Provider name to detach.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         provider: String,
+
+        /// Require the provider to have this immutable ID.
+        #[arg(
+            long = "expected-provider-id",
+            requires = "expected_provider_resource_version"
+        )]
+        expected_provider_id: Option<String>,
+
+        /// Require the provider to have this resource version.
+        #[arg(
+            long = "expected-provider-resource-version",
+            requires = "expected_provider_id"
+        )]
+        expected_provider_resource_version: Option<u64>,
     },
 }
 
@@ -2083,11 +2147,15 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Top-level status
         // -----------------------------------------------------------
-        Some(Commands::Status) => {
+        Some(Commands::Status { output }) => {
             if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_auth(&mut tls, &ctx.name);
-                run::gateway_status(&ctx.name, &ctx.endpoint, &tls).await?;
+                if matches!(output, OutputFormat::Json) {
+                    run::gateway_status_json(&ctx.name, &ctx.endpoint, &tls).await?;
+                } else {
+                    run::gateway_status(&ctx.name, &ctx.endpoint, &tls).await?;
+                }
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
@@ -2856,17 +2924,43 @@ async fn main() -> Result<()> {
                             run::print_ssh_config(&ctx.name, &name);
                         }
                         SandboxCommands::Provider(command) => match command {
-                            SandboxProviderCommands::List { name } => {
+                            SandboxProviderCommands::List { name, json } => {
                                 let name = resolve_sandbox_name(name, &ctx.name)?;
-                                run::sandbox_provider_list(endpoint, &name, &tls).await?;
+                                run::sandbox_provider_list(endpoint, &name, json, &tls).await?;
                             }
-                            SandboxProviderCommands::Attach { name, provider } => {
-                                run::sandbox_provider_attach(endpoint, &name, &provider, &tls)
-                                    .await?;
+                            SandboxProviderCommands::Attach {
+                                name,
+                                provider,
+                                expected_provider_id,
+                                expected_provider_resource_version,
+                                credential_keys,
+                            } => {
+                                run::sandbox_provider_attach(
+                                    endpoint,
+                                    &name,
+                                    &provider,
+                                    expected_provider_id.as_deref(),
+                                    expected_provider_resource_version.unwrap_or(0),
+                                    &credential_keys,
+                                    &tls,
+                                )
+                                .await?;
                             }
-                            SandboxProviderCommands::Detach { name, provider } => {
-                                run::sandbox_provider_detach(endpoint, &name, &provider, &tls)
-                                    .await?;
+                            SandboxProviderCommands::Detach {
+                                name,
+                                provider,
+                                expected_provider_id,
+                                expected_provider_resource_version,
+                            } => {
+                                run::sandbox_provider_detach(
+                                    endpoint,
+                                    &name,
+                                    &provider,
+                                    expected_provider_id.as_deref(),
+                                    expected_provider_resource_version.unwrap_or(0),
+                                    &tls,
+                                )
+                                .await?;
                             }
                         },
                     }
@@ -2890,8 +2984,9 @@ async fn main() -> Result<()> {
                     from_gcloud_adc,
                     runtime_credentials,
                     config,
+                    output,
                 } => {
-                    run::provider_create_with_options(
+                    run::provider_create_with_output(
                         endpoint,
                         &name,
                         provider_type.as_str(),
@@ -2900,6 +2995,7 @@ async fn main() -> Result<()> {
                         from_gcloud_adc,
                         runtime_credentials,
                         &config,
+                        output.as_str(),
                         &tls,
                     )
                     .await?;
@@ -3003,6 +3099,8 @@ async fn main() -> Result<()> {
                     credentials,
                     config,
                     credential_expires_at,
+                    expected_id,
+                    expected_resource_version,
                 } => {
                     run::provider_update(
                         endpoint,
@@ -3011,12 +3109,25 @@ async fn main() -> Result<()> {
                         &credentials,
                         &config,
                         &credential_expires_at,
+                        expected_id.as_deref(),
+                        expected_resource_version.unwrap_or(0),
                         &tls,
                     )
                     .await?;
                 }
-                ProviderCommands::Delete { names } => {
-                    run::provider_delete(endpoint, &names, &tls).await?;
+                ProviderCommands::Delete {
+                    names,
+                    expected_id,
+                    expected_resource_version,
+                } => {
+                    run::provider_delete(
+                        endpoint,
+                        &names,
+                        expected_id.as_deref(),
+                        expected_resource_version.unwrap_or(0),
+                        &tls,
+                    )
+                    .await?;
                 }
             }
         }
@@ -3290,7 +3401,9 @@ mod tests {
 
         let Some(Commands::Sandbox {
             command:
-                Some(SandboxCommands::Provider(SandboxProviderCommands::Attach { name, provider })),
+                Some(SandboxCommands::Provider(SandboxProviderCommands::Attach {
+                    name, provider, ..
+                })),
         }) = cli.command
         else {
             panic!("expected sandbox provider attach command");
@@ -3463,7 +3576,12 @@ mod tests {
             .expect("global gateway flag should parse with subcommands");
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
-        assert!(matches!(cli.command, Some(Commands::Status)));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Status {
+                output: OutputFormat::Table
+            })
+        ));
     }
 
     #[test]

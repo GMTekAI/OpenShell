@@ -403,6 +403,21 @@ fn unsupported_l7_tunnel_protocol_detail(
     }
 }
 
+fn tls_requirement_denial_detail(
+    tls_mode: crate::l7::TlsMode,
+    tunnel_protocol: TunnelProtocol,
+) -> Option<&'static str> {
+    if tls_mode != crate::l7::TlsMode::Require || tunnel_protocol == TunnelProtocol::Tls {
+        return None;
+    }
+    Some(match tunnel_protocol {
+        TunnelProtocol::Http1 => "TLS is required; plaintext HTTP is denied",
+        TunnelProtocol::H2cPriorKnowledge => "TLS is required; h2c is denied",
+        TunnelProtocol::Unsupported => "TLS is required; unsupported tunnel bytes are denied",
+        TunnelProtocol::Tls => unreachable!(),
+    })
+}
+
 async fn peek_tunnel_protocol(client: &TcpStream) -> Result<Option<TunnelProtocol>> {
     let mut peek_buf = [0u8; TUNNEL_PROTOCOL_PEEK_BYTES];
     let deadline = tokio::time::Instant::now() + TUNNEL_PROTOCOL_PEEK_TIMEOUT;
@@ -741,7 +756,88 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
+    let effective_tls_mode = match query_tls_mode(&opa_engine, &decision, &host_lc, port) {
+        Ok(mode) => mode,
+        Err(error) => {
+            warn!(
+                host = %host_lc,
+                port,
+                error = %error,
+                "CONNECT denied because TLS policy could not be resolved"
+            );
+            respond(
+                &mut client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "tls_policy_unavailable",
+                    "TLS policy could not be resolved",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if effective_tls_mode == crate::l7::TlsMode::Require && tls_state.is_none() {
+        respond(
+            &mut client,
+            &build_json_error_response(
+                503,
+                "Service Unavailable",
+                "tls_unavailable",
+                "TLS is required by policy but proxy TLS state is unavailable",
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    let reserved_credential_keys = match query_reserved_credential_keys(&opa_engine, &decision) {
+        Ok(keys) => keys,
+        Err(error) => {
+            warn!(error = %error, "CONNECT denied because credential reservations are unavailable");
+            respond(
+                &mut client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "credential_policy_unavailable",
+                    "Credential policy could not be resolved",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
+
+    // Credential-bound MCP origins derive their pre-connect pinset from every
+    // matching bound MCP transport config, independent of policy/list order or
+    // caller binary. This union permits the TCP connect needed before a path
+    // is visible; the L7 relay then intersects against the selected path's
+    // config before forwarding application bytes.
+    let mcp_transport_pins = match query_mcp_credential_transport_pins(
+        &opa_engine,
+        &decision,
+        &host_lc,
+        port,
+    ) {
+        Ok(pins) => pins,
+        Err(error) => {
+            warn!(error = %error, "CONNECT denied because MCP transport IP pins are unavailable");
+            respond(
+                &mut client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "credential_policy_unavailable",
+                    "MCP transport IP policy could not be resolved",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     // Query allowed_ips from the matched endpoint config (if any).
     // When present, the SSRF check validates resolved IPs against this
@@ -750,12 +846,21 @@ async fn handle_tcp_connection(
     // implicitly allowed — the user explicitly declared the destination.
     // Exact declared hostnames also skip the private-IP blanket block below,
     // while keeping loopback/link-local/unspecified addresses denied.
-    let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
-    if raw_allowed_ips.is_empty() {
-        raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
-    }
-    let exact_declared_endpoint_host =
-        query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
+    let (raw_allowed_ips, exact_declared_endpoint_host) = mcp_transport_pins.map_or_else(
+        || {
+            let mut pins = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+            if pins.is_empty() {
+                pins = implicit_allowed_ips_for_ip_host(&host);
+            }
+            (
+                pins,
+                query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port),
+            )
+        },
+        // An empty pinset deliberately falls through to the default public
+        // address checks rather than exact-host private-IP permission.
+        |pins| (pins, false),
+    );
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
@@ -1035,6 +1140,7 @@ async fn handle_tcp_connection(
         "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
         dns_connect_start.elapsed().as_millis()
     );
+    let upstream_ip = upstream.peer_addr().into_diagnostic()?.ip();
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
@@ -1070,15 +1176,12 @@ async fn handle_tcp_connection(
     }
     emit_connect_activity_if_l4_only(&activity_tx, l7_route.as_ref());
 
-    // Determine effective TLS mode. Check the raw endpoint config for
-    // `tls: skip` independently of L7 config (which requires `protocol`).
-    let effective_tls_skip =
-        query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
-
     // Build L7 eval context (shared by TLS-terminated and plaintext paths).
-    let ctx = crate::l7::relay::L7EvalContext {
+    let mut ctx = crate::l7::relay::L7EvalContext {
         host: host_lc.clone(),
         port,
+        upstream_ip: Some(upstream_ip),
+        http_default_port: 0,
         policy_name: matched_policy.clone().unwrap_or_default(),
         binary_path: decision
             .binary
@@ -1095,7 +1198,9 @@ async fn handle_tcp_connection(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
-        secret_resolver: secret_resolver.clone(),
+        secret_resolver: secret_resolver.as_ref().map(|resolver| {
+            Arc::new(resolver.with_reserved_credential_keys(&reserved_credential_keys))
+        }),
         activity_tx: activity_tx.clone(),
         dynamic_credentials: dynamic_credentials.clone(),
         token_grant_resolver: dynamic_credentials
@@ -1103,7 +1208,7 @@ async fn handle_tcp_connection(
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
     };
 
-    if effective_tls_skip {
+    if effective_tls_mode == crate::l7::TlsMode::Skip {
         // tls: skip — raw tunnel, no termination, no credential injection.
         debug!(
             host = %host_lc,
@@ -1122,6 +1227,45 @@ async fn handle_tcp_connection(
     let Some(tunnel_protocol) = peek_tunnel_protocol(&client).await? else {
         return Ok(());
     };
+    ctx.http_default_port = if tunnel_protocol == TunnelProtocol::Tls {
+        443
+    } else {
+        80
+    };
+
+    if let Some(detail) = tls_requirement_denial_detail(effective_tls_mode, tunnel_protocol) {
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+            .actor_process(
+                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    .with_cmd_line(&cmdline_str),
+            )
+            .firewall_rule(policy_str, "tls")
+            .message(format!(
+                "CONNECT denied non-TLS tunnel for {host_lc}:{port}"
+            ))
+            .status_detail(detail)
+            .build();
+        ocsf_emit!(event);
+        emit_denial(
+            &denial_tx,
+            &host_lc,
+            port,
+            &binary_str,
+            &decision,
+            detail,
+            "connect-tls-required",
+        );
+        emit_activity_simple(activity_tx.as_ref(), true, "tls_required");
+        client.shutdown().await.into_diagnostic()?;
+        return Ok(());
+    }
 
     if tunnel_protocol == TunnelProtocol::Tls {
         // TLS detected — terminate unconditionally.
@@ -1206,7 +1350,7 @@ async fn handle_tcp_connection(
                     ocsf_emit!(event);
                 }
             }
-        } else {
+        } else if effective_tls_mode != crate::l7::TlsMode::Require {
             {
                 let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::Fail)
@@ -1222,6 +1366,10 @@ async fn handle_tcp_connection(
             let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
                 .await
                 .into_diagnostic()?;
+        } else {
+            // The preflight above guarantees this branch is unreachable, but
+            // keep the runtime fail-closed if TLS state changes unexpectedly.
+            return Ok(());
         }
     } else if tunnel_protocol == TunnelProtocol::Http1 {
         // Plaintext HTTP detected.
@@ -2181,7 +2329,12 @@ fn select_l7_config_for_path<'a>(
     configs
         .iter()
         .filter(|snapshot| snapshot.config.matches_path(path))
-        .max_by_key(|snapshot| snapshot.config.path_specificity())
+        .max_by_key(|snapshot| {
+            (
+                snapshot.config.path_specificity(),
+                usize::from(snapshot.config.protocol == crate::l7::L7Protocol::Mcp),
+            )
+        })
 }
 
 /// Query the TLS mode for an endpoint, independent of L7 config.
@@ -2192,13 +2345,13 @@ fn query_tls_mode(
     decision: &ConnectDecision,
     host: &str,
     port: u16,
-) -> crate::l7::TlsMode {
+) -> Result<crate::l7::TlsMode> {
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
         NetworkAction::Deny { .. } => false,
     };
     if !has_policy {
-        return crate::l7::TlsMode::Auto;
+        return Ok(crate::l7::TlsMode::Auto);
     }
 
     let input = crate::opa::NetworkInput {
@@ -2210,10 +2363,81 @@ fn query_tls_mode(
         cmdline_paths: decision.cmdline_paths.clone(),
     };
 
-    match engine.query_endpoint_config(&input) {
-        Ok(Some(val)) => crate::l7::parse_tls_mode(&val),
-        _ => crate::l7::TlsMode::Auto,
+    let (configs, _) = engine.query_transport_endpoint_configs_with_generation(&input)?;
+    dominant_tls_mode(&configs)
+}
+
+fn query_mcp_credential_transport_pins(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> Result<Option<Vec<String>>> {
+    let has_policy = matches!(
+        &decision.action,
+        NetworkAction::Allow {
+            matched_policy: Some(_)
+        }
+    );
+    if !has_policy {
+        return Ok(None);
     }
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+    let (values, generation) = engine.query_transport_endpoint_configs_with_generation(&input)?;
+    if generation != decision.generation {
+        return Err(miette::miette!(
+            "policy changed while MCP transport pins were queried [expected_generation:{} current_generation:{generation}]",
+            decision.generation
+        ));
+    }
+
+    let mut found_bound_mcp = false;
+    let mut pins = std::collections::BTreeSet::new();
+    for value in values {
+        let Some(config) = crate::l7::parse_l7_config(&value) else {
+            continue;
+        };
+        if config.protocol != crate::l7::L7Protocol::Mcp || config.credential_keys.is_empty() {
+            continue;
+        }
+        found_bound_mcp = true;
+        pins.extend(config.allowed_ips);
+    }
+    Ok(found_bound_mcp.then(|| pins.into_iter().collect()))
+}
+
+fn dominant_tls_mode(configs: &[regorus::Value]) -> Result<crate::l7::TlsMode> {
+    let mut modes = Vec::with_capacity(configs.len());
+    for config in configs {
+        let mode = crate::l7::parse_tls_mode(config)
+            .ok_or_else(|| miette::miette!("matched endpoint has an unrecognized tls mode"))?;
+        modes.push(mode);
+    }
+    if modes.contains(&crate::l7::TlsMode::Require) {
+        return Ok(crate::l7::TlsMode::Require);
+    }
+    Ok(modes.into_iter().next().unwrap_or(crate::l7::TlsMode::Auto))
+}
+
+fn query_reserved_credential_keys(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+) -> Result<Arc<std::collections::HashSet<String>>> {
+    let (keys, generation) = engine.query_reserved_credential_keys_with_generation()?;
+    if generation != decision.generation {
+        return Err(miette::miette!(
+            "policy changed while credential reservations were queried [expected_generation:{} current_generation:{generation}]",
+            decision.generation
+        ));
+    }
+    Ok(Arc::new(keys.into_iter().collect()))
 }
 
 /// When the policy endpoint host is a literal IP address, the user has
@@ -3055,6 +3279,8 @@ struct ForwardRelayOptions<'a> {
     websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
     secret_resolver: Option<&'a SecretResolver>,
     request_body_credential_rewrite: bool,
+    host: &'a str,
+    port: u16,
 }
 
 async fn relay_rewritten_forward_request<C, U>(
@@ -3082,6 +3308,7 @@ where
         query_params,
         raw_header: rewritten,
         body_length,
+        raw_target: String::new(),
     };
 
     crate::l7::rest::relay_http_request_with_options_guarded(
@@ -3093,11 +3320,13 @@ where
             generation_guard: Some(options.generation_guard),
             websocket_extensions: options.websocket_extensions,
             request_body_credential_rewrite: options.request_body_credential_rewrite,
+            credential_bearer_only: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: "",
             signing_region: "",
-            host: "",
-            port: 0,
+            host: options.host,
+            port: options.port,
+            http_default_port: 80,
         },
     )
     .await
@@ -3123,6 +3352,7 @@ async fn inject_token_grant_for_forward_request(
         query_params: std::collections::HashMap::new(),
         raw_header: forward_request_bytes,
         body_length,
+        raw_target: String::new(),
     };
 
     crate::l7::token_grant_injection::inject_if_needed(forward_request_for_token_grant, l7_ctx)
@@ -3179,6 +3409,7 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
+    let raw_forward_path = path.clone();
     let host_lc = host.to_ascii_lowercase();
 
     if host_lc == POLICY_LOCAL_HOST {
@@ -3232,6 +3463,32 @@ async fn handle_forward_proxy(
         respond(
             client,
             b"HTTP/1.1 400 Bad Request\r\nContent-Length: 27\r\n\r\nUse CONNECT for HTTPS URLs",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Credential-bearing absolute-form requests are authority-bound before
+    // placeholder replacement, token grant injection, or any upstream write.
+    // Plain HTTP absolute-form requests have an effective default port of 80.
+    if (secret_resolver.is_some() || dynamic_credentials.is_some())
+        && let Err(error) =
+            crate::l7::http::validate_bound_host_header(&buf[..used], &host_lc, port, 80)
+    {
+        warn!(
+            dst_host = %host_lc,
+            dst_port = port,
+            error = %error,
+            "FORWARD rejected credential-bearing request with invalid Host binding"
+        );
+        respond(
+            client,
+            &build_json_error_response(
+                400,
+                "Bad Request",
+                "invalid_host_binding",
+                "Host header must exactly match the absolute request target",
+            ),
         )
         .await?;
         return Ok(());
@@ -3337,6 +3594,58 @@ async fn handle_forward_proxy(
         }
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
+    let forward_tls_mode = match query_tls_mode(&opa_engine, &decision, &host_lc, port) {
+        Ok(mode) => mode,
+        Err(error) => {
+            warn!(
+                host = %host_lc,
+                port,
+                error = %error,
+                "FORWARD denied because TLS policy could not be resolved"
+            );
+            respond(
+                client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "tls_policy_unavailable",
+                    "TLS policy could not be resolved",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if forward_tls_mode == crate::l7::TlsMode::Require {
+        respond(
+            client,
+            &build_json_error_response(
+                403,
+                "Forbidden",
+                "tls_required",
+                "This endpoint requires CONNECT with TLS",
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    let reserved_credential_keys = match query_reserved_credential_keys(&opa_engine, &decision) {
+        Ok(keys) => keys,
+        Err(error) => {
+            warn!(error = %error, "FORWARD denied because credential reservations are unavailable");
+            respond(
+                client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "credential_policy_unavailable",
+                    "Credential policy could not be resolved",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
     let forward_generation_guard = match opa_engine.generation_guard(decision.generation) {
         Ok(guard) => guard,
@@ -3366,9 +3675,14 @@ async fn handle_forward_proxy(
     let mut forward_websocket_request =
         crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
     let mut request_body_credential_rewrite = false;
-    let l7_ctx = crate::l7::relay::L7EvalContext {
+    let mut authorized_credential_keys = Vec::new();
+    let mut credential_rewrite_exclusive = false;
+    let mut credential_ip_configs = Vec::new();
+    let mut l7_ctx = crate::l7::relay::L7EvalContext {
         host: host_lc.clone(),
         port,
+        upstream_ip: None,
+        http_default_port: 80,
         policy_name: matched_policy.clone().unwrap_or_default(),
         binary_path: decision
             .binary
@@ -3385,7 +3699,9 @@ async fn handle_forward_proxy(
             .iter()
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
-        secret_resolver: secret_resolver.clone(),
+        secret_resolver: secret_resolver.as_ref().map(|resolver| {
+            Arc::new(resolver.with_reserved_credential_keys(&reserved_credential_keys))
+        }),
         activity_tx: activity_tx.cloned(),
         dynamic_credentials: dynamic_credentials.clone(),
         token_grant_resolver: dynamic_credentials
@@ -3456,48 +3772,42 @@ async fn handle_forward_proxy(
                 .any(|snapshot| snapshot.config.allow_encoded_slash),
             ..Default::default()
         };
-        let query_params =
-            match crate::l7::path::canonicalize_request_target(&path, &canonicalize_options) {
-                Ok((canon, query)) => {
-                    upstream_target = match query.as_deref() {
-                        Some(raw_query) if !raw_query.is_empty() => {
-                            format!("{}?{raw_query}", canon.path)
-                        }
-                        _ => canon.path.clone(),
-                    };
-                    let params = query
-                        .as_deref()
-                        .map_or_else(std::collections::HashMap::new, |q| {
-                            crate::l7::rest::parse_query_params(q).unwrap_or_default()
-                        });
-                    path = canon.path;
-                    params
-                }
-                Err(e) => {
-                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message(format!(
-                            "FORWARD_L7 rejecting non-canonical request-target: {e}"
-                        ))
-                        .build();
-                    ocsf_emit!(event);
-                    emit_activity_simple(activity_tx, true, "l7_parse_rejection");
-                    respond(
-                        client,
-                        &build_json_error_response(
-                            400,
-                            "Bad Request",
-                            "invalid_request_target",
-                            "request-target must be canonical",
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
+        match crate::l7::path::canonicalize_request_target(&raw_forward_path, &canonicalize_options)
+        {
+            Ok((canon, query)) => {
+                upstream_target = match query.as_deref() {
+                    Some(raw_query) if !raw_query.is_empty() => {
+                        format!("{}?{raw_query}", canon.path)
+                    }
+                    _ => canon.path.clone(),
+                };
+                path = canon.path;
+            }
+            Err(e) => {
+                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                    .message(format!(
+                        "FORWARD_L7 rejecting non-canonical request-target: {e}"
+                    ))
+                    .build();
+                ocsf_emit!(event);
+                emit_activity_simple(activity_tx, true, "l7_parse_rejection");
+                respond(
+                    client,
+                    &build_json_error_response(
+                        400,
+                        "Bad Request",
+                        "invalid_request_target",
+                        "request-target must be canonical",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
         let Some(l7_config) = select_l7_config_for_path(&route.configs, &path) else {
             emit_activity_simple(activity_tx, true, "l7_policy");
             respond(
@@ -3512,6 +3822,81 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        let selected_canonicalization = crate::l7::path::canonicalize_request_target(
+            &raw_forward_path,
+            &crate::l7::path::CanonicalizeOptions {
+                allow_encoded_slash: l7_config.config.allow_encoded_slash,
+                ..Default::default()
+            },
+        );
+        let (selected_path, selected_raw_query) = match selected_canonicalization {
+            Ok((canonical, raw_query)) => (canonical.path, raw_query),
+            Err(error) => {
+                emit_activity_simple(activity_tx, true, "l7_parse_rejection");
+                respond(
+                    client,
+                    &build_json_error_response(
+                        400,
+                        "Bad Request",
+                        "invalid_request_target",
+                        &format!("request-target rejected by selected endpoint policy: {error}"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let selected_upstream_target = match selected_raw_query.as_deref() {
+            Some(raw_query) if !raw_query.is_empty() => {
+                format!("{selected_path}?{raw_query}")
+            }
+            _ => selected_path.clone(),
+        };
+        if selected_path != path || selected_upstream_target != upstream_target {
+            emit_activity_simple(activity_tx, true, "l7_parse_rejection");
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "ambiguous_request_target",
+                    "request-target canonicalization changed after selecting the endpoint policy",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        let query_params = selected_raw_query
+            .as_deref()
+            .map_or_else(std::collections::HashMap::new, |query| {
+                crate::l7::rest::parse_query_params(query).unwrap_or_default()
+            });
+        path = selected_path;
+        upstream_target = selected_upstream_target;
+        credential_ip_configs = route
+            .configs
+            .iter()
+            .filter(|snapshot| {
+                !snapshot.config.credential_keys.is_empty() && snapshot.config.matches_path(&path)
+            })
+            .map(|snapshot| snapshot.config.clone())
+            .collect();
+        if l7_config.config.protocol == crate::l7::L7Protocol::Mcp
+            && crate::l7::http::has_query_delimiter(&raw_forward_path)
+        {
+            emit_activity_simple(activity_tx, true, "l7_parse_rejection");
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_mcp_target",
+                    "MCP endpoint request targets must not contain a query delimiter",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
         if crate::l7::rest::request_is_h2c_upgrade(&forward_request_bytes) {
             let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
@@ -3580,6 +3965,7 @@ async fn handle_forward_proxy(
                 query_params: query_params.clone(),
                 raw_header: forward_request_bytes,
                 body_length,
+                raw_target: String::new(),
             };
             let info = match crate::l7::graphql::inspect_graphql_request(
                 client,
@@ -3631,10 +4017,18 @@ async fn handle_forward_proxy(
                 query_params: query_params.clone(),
                 raw_header: forward_request_bytes,
                 body_length,
+                raw_target: String::new(),
             };
             if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&jsonrpc_request) {
                 forward_request_bytes = jsonrpc_request.raw_header;
                 Some(crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream())
+            } else if l7_config.config.protocol == crate::l7::L7Protocol::Mcp
+                && jsonrpc_request.action.eq_ignore_ascii_case("DELETE")
+            {
+                let info =
+                    crate::l7::jsonrpc::JsonRpcRequestInfo::session_termination(&jsonrpc_request);
+                forward_request_bytes = jsonrpc_request.raw_header;
+                Some(info)
             } else {
                 let body = match crate::l7::http::read_body_for_inspection(
                     client,
@@ -3803,8 +4197,25 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
+        let credential_authorization =
+            crate::l7::relay::authorized_credential_keys(&tunnel_engine, &l7_ctx, &request_info)?;
+        credential_rewrite_exclusive = credential_authorization.exclusive;
+        if allowed {
+            authorized_credential_keys = credential_authorization.keys;
+        }
         l7_activity_pending = true;
         forward_tunnel_engine = Some(tunnel_engine);
+    }
+
+    let request_secret_resolver = crate::l7::relay::scoped_secret_resolver(
+        &l7_ctx,
+        &authorized_credential_keys,
+        credential_rewrite_exclusive,
+    );
+    l7_ctx.secret_resolver = request_secret_resolver.clone();
+    if credential_rewrite_exclusive {
+        l7_ctx.dynamic_credentials = None;
+        l7_ctx.token_grant_resolver = None;
     }
 
     // 5. DNS resolution + SSRF defence (mirrors the CONNECT path logic).
@@ -4156,6 +4567,25 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
+    let connected_upstream_ip = upstream.peer_addr().into_diagnostic()?.ip();
+    if !credential_ip_configs
+        .iter()
+        .all(|config| config.allows_upstream_ip(connected_upstream_ip))
+    {
+        emit_activity_simple(activity_tx, true, "credential_ip_binding");
+        respond(
+            client,
+            &build_json_error_response(
+                403,
+                "Forbidden",
+                "credential_ip_binding_denied",
+                "credential-bound MCP endpoint upstream IP is outside its allowed_ips pinset",
+            ),
+        )
+        .await?;
+        return Ok(());
+    }
+    l7_ctx.upstream_ip = Some(connected_upstream_ip);
 
     // Log success
     {
@@ -4217,7 +4647,7 @@ async fn handle_forward_proxy(
         &forward_request_bytes,
         forward_request_bytes.len(),
         &upstream_target,
-        secret_resolver.as_deref(),
+        request_secret_resolver.as_deref(),
         request_body_credential_rewrite,
     ) {
         Ok(bytes) => bytes,
@@ -4265,8 +4695,10 @@ async fn handle_forward_proxy(
         ForwardRelayOptions {
             generation_guard: &forward_generation_guard,
             websocket_extensions,
-            secret_resolver: secret_resolver.as_deref(),
+            secret_resolver: request_secret_resolver.as_deref(),
             request_body_credential_rewrite,
+            host: &host_lc,
+            port,
         },
     )
     .await?;
@@ -4374,6 +4806,7 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 mod tests {
     use super::*;
     use std::future::Future;
+    use std::io::BufReader;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -4394,6 +4827,8 @@ mod tests {
             allow_encoded_slash: false,
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
+            credential_keys: Vec::new(),
+            allowed_ips: Vec::new(),
             websocket_graphql_policy: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
@@ -4427,6 +4862,184 @@ mod tests {
         assert!(could_be_supported_tunnel_protocol_prefix(b"GE"));
         assert!(could_be_supported_tunnel_protocol_prefix(b"PRI * H"));
         assert!(!could_be_supported_tunnel_protocol_prefix(b"SSH"));
+    }
+
+    #[test]
+    fn tls_require_dominates_every_matching_endpoint_config() {
+        let configs = [
+            regorus::Value::from_json_str(r#"{"tls":"skip"}"#).unwrap(),
+            regorus::Value::from_json_str(r#"{"tls":"require"}"#).unwrap(),
+            regorus::Value::from_json_str(r#"{"tls":"auto"}"#).unwrap(),
+        ];
+        assert_eq!(
+            dominant_tls_mode(&configs).unwrap(),
+            crate::l7::TlsMode::Require
+        );
+    }
+
+    #[test]
+    fn tls_require_denies_every_non_tls_tunnel_protocol() {
+        for protocol in [
+            TunnelProtocol::Http1,
+            TunnelProtocol::H2cPriorKnowledge,
+            TunnelProtocol::Unsupported,
+        ] {
+            assert!(tls_requirement_denial_detail(crate::l7::TlsMode::Require, protocol).is_some());
+        }
+        assert_eq!(
+            tls_requirement_denial_detail(crate::l7::TlsMode::Require, TunnelProtocol::Tls),
+            None
+        );
+        assert_eq!(
+            tls_requirement_denial_detail(crate::l7::TlsMode::Auto, TunnelProtocol::Http1),
+            None
+        );
+    }
+
+    #[test]
+    fn dominant_tls_mode_rejects_unknown_values() {
+        let configs = [regorus::Value::from_json_str(r#"{"tls":"sometimes"}"#).unwrap()];
+        assert!(dominant_tls_mode(&configs).is_err());
+    }
+
+    #[tokio::test]
+    async fn tls_required_authenticated_mcp_succeeds_with_bound_host() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let host = "mcp.example.test";
+
+        let sandbox_ca = crate::l7::tls::SandboxCa::generate().unwrap();
+        let sandbox_ca_pem = sandbox_ca.cert_pem().to_string();
+        let cert_cache = crate::l7::tls::CertCache::new(sandbox_ca);
+        let mut sandbox_roots = rustls::RootCertStore::empty();
+        let mut sandbox_ca_reader = BufReader::new(sandbox_ca_pem.as_bytes());
+        for cert in rustls_pemfile::certs(&mut sandbox_ca_reader) {
+            sandbox_roots.add(cert.unwrap()).unwrap();
+        }
+        let mut app_tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(sandbox_roots)
+            .with_no_client_auth();
+        app_tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let upstream_key = rcgen::KeyPair::generate().unwrap();
+        let upstream_params = rcgen::CertificateParams::new(vec![host.to_string()]).unwrap();
+        let upstream_cert = upstream_params.self_signed(&upstream_key).unwrap();
+        let upstream_cert_der =
+            rustls::pki_types::CertificateDer::from(upstream_cert.der().to_vec());
+        let upstream_key_der =
+            rustls::pki_types::PrivateKeyDer::try_from(upstream_key.serialize_der()).unwrap();
+        let mut upstream_server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![upstream_cert_der.clone()], upstream_key_der)
+            .unwrap();
+        upstream_server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let mut upstream_roots = rustls::RootCertStore::empty();
+        upstream_roots.add(upstream_cert_der).unwrap();
+        let mut proxy_upstream_config = rustls::ClientConfig::builder()
+            .with_root_certificates(upstream_roots)
+            .with_no_client_auth();
+        proxy_upstream_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let tls_state = ProxyTlsState::new(cert_cache, Arc::new(proxy_upstream_config));
+
+        let policy_data = r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 443
+        path: /mcp
+        protocol: mcp
+        tls: require
+        enforcement: enforce
+        rules:
+          - allow:
+              method: initialize
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let (config, tunnel_engine, mut ctx) =
+            forward_websocket_policy_parts(policy_data, host, 443, "/mcp", "mcp_api");
+        ctx.http_default_port = 443;
+        assert_eq!(config.tls, crate::l7::TlsMode::Require);
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("MCP_TOKEN".to_string(), "authenticated-secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        ctx.secret_resolver = resolver.map(Arc::new);
+        let placeholder = child_env["MCP_TOKEN"].clone();
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (tcp, _) = upstream_listener.accept().await.unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(upstream_server_config));
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = tls.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "upstream TLS closed before MCP request");
+                request.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&request).contains(r#""method":"initialize""#) {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("Host: mcp.example.test\r\n"));
+            assert!(request.contains("Authorization: Bearer authenticated-secret\r\n"));
+            assert!(!request.contains("OPENSHELL_SECRET"));
+            tls.write_all(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (client_tcp, _) = proxy_listener.accept().await.unwrap();
+            let upstream_tcp = TcpStream::connect(upstream_addr).await.unwrap();
+            let mut tls_client = crate::l7::tls::tls_terminate_client(client_tcp, &tls_state, host)
+                .await
+                .unwrap();
+            let mut tls_upstream = crate::l7::tls::tls_connect_upstream(
+                upstream_tcp,
+                host,
+                tls_state.upstream_config(),
+            )
+            .await
+            .unwrap();
+            crate::l7::relay::relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut tls_client,
+                &mut tls_upstream,
+                &ctx,
+            )
+            .await
+            .unwrap();
+        });
+
+        let app_tcp = TcpStream::connect(proxy_addr).await.unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(app_tls_config));
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).unwrap();
+        let mut app_tls = connector.connect(server_name, app_tcp).await.unwrap();
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"openshell-test","version":"1.0"}}}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {placeholder}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app_tls.write_all(request.as_bytes()).await.unwrap();
+        app_tls.write_all(body).await.unwrap();
+        let mut response = [0u8; 512];
+        let n = app_tls.read(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("202 Accepted"));
+        drop(app_tls);
+
+        upstream_task.await.unwrap();
+        proxy_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -4563,6 +5176,7 @@ network_policies:
                 calls: Vec::new(),
                 is_batch: false,
                 receive_stream: false,
+                session_termination: false,
                 has_response: false,
                 error: Some("missing or non-string 'jsonrpc' field".to_string()),
             }),
@@ -4588,6 +5202,7 @@ network_policies:
                 calls: Vec::new(),
                 is_batch: false,
                 receive_stream: false,
+                session_termination: false,
                 has_response: true,
                 error: None,
             }),
@@ -4723,6 +5338,8 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: resolver,
                 request_body_credential_rewrite,
+                host: "",
+                port: 0,
             },
         )
         .await?;
@@ -4756,6 +5373,7 @@ network_policies:
         let ctx = crate::l7::relay::L7EvalContext {
             host: "api.example.test".into(),
             port: 8080,
+            http_default_port: 80,
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -4764,6 +5382,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            upstream_ip: None,
         };
 
         (ctx, fixture)
@@ -4777,6 +5396,81 @@ network_policies:
                     .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
             })
             .count()
+    }
+
+    #[test]
+    fn mcp_preconnect_pins_union_only_credential_bound_transport_configs() {
+        let data = r#"
+network_policies:
+  broad_rest:
+    endpoints:
+      - host: api.example.test
+        port: 443
+        path: /rest/**
+        protocol: rest
+        access: full
+    binaries:
+      - { path: /usr/bin/node }
+  bound_one:
+    endpoints:
+      - host: api.example.test
+        port: 443
+        path: /mcp/a
+        protocol: mcp
+        tls: require
+        enforcement: enforce
+        credential_keys: [MCP_A]
+        allowed_ips: [192.0.2.10]
+        rules:
+          - allow: { method: initialize }
+    binaries:
+      - { path: /usr/bin/python3 }
+  bound_two:
+    endpoints:
+      - host: api.example.test
+        port: 443
+        path: /mcp/b
+        protocol: mcp
+        tls: require
+        enforcement: enforce
+        credential_keys: [MCP_B]
+        allowed_ips: [198.51.100.0/24]
+        rules:
+          - allow: { method: initialize }
+    binaries:
+      - { path: /usr/bin/other }
+  unbound_mcp:
+    endpoints:
+      - host: api.example.test
+        port: 443
+        path: /mcp/public
+        protocol: mcp
+        allowed_ips: [203.0.113.99]
+        rules:
+          - allow: { method: initialize }
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine =
+            OpaEngine::from_strings(include_str!("../data/sandbox-policy.rego"), data).unwrap();
+        let decision = ConnectDecision {
+            action: NetworkAction::Allow {
+                matched_policy: Some("broad_rest".to_string()),
+            },
+            generation: engine.current_generation(),
+            binary: Some(PathBuf::from("/usr/bin/node")),
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let pins = query_mcp_credential_transport_pins(&engine, &decision, "api.example.test", 443)
+            .unwrap()
+            .expect("credential-bound MCP origin");
+        assert_eq!(
+            pins,
+            vec!["192.0.2.10".to_string(), "198.51.100.0/24".to_string()]
+        );
     }
 
     fn forward_websocket_policy_parts(
@@ -4814,6 +5508,7 @@ network_policies:
         let ctx = crate::l7::relay::L7EvalContext {
             host: host.to_string(),
             port,
+            http_default_port: 80,
             policy_name: policy_name.to_string(),
             binary_path: "/usr/bin/node".to_string(),
             ancestors: vec![],
@@ -4822,6 +5517,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            upstream_ip: None,
         };
         (config, tunnel_engine, ctx)
     }
@@ -4899,6 +5595,8 @@ network_policies:
                     websocket_extensions,
                     secret_resolver: None,
                     request_body_credential_rewrite: false,
+                    host: &host,
+                    port,
                 },
             )
             .await?;
@@ -4982,6 +5680,7 @@ network_policies:
         let ctx = crate::l7::relay::L7EvalContext {
             host: "gateway.example.test".to_string(),
             port: 80,
+            http_default_port: 80,
             policy_name: "ws_api".to_string(),
             binary_path: "/usr/bin/node".to_string(),
             ancestors: vec![],
@@ -4990,6 +5689,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            upstream_ip: None,
         };
         let query_params = std::collections::HashMap::new();
 
@@ -5025,6 +5725,7 @@ network_policies:
         let ctx = crate::l7::relay::L7EvalContext {
             host: "gateway.example.test".to_string(),
             port: 80,
+            http_default_port: 80,
             policy_name: "rest_api".to_string(),
             binary_path: "/usr/bin/node".to_string(),
             ancestors: vec![],
@@ -5033,6 +5734,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            upstream_ip: None,
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
@@ -5166,6 +5868,8 @@ network_policies:
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
+                    credential_keys: Vec::new(),
+                    allowed_ips: Vec::new(),
                     websocket_graphql_policy: false,
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
@@ -5184,6 +5888,8 @@ network_policies:
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
+                    credential_keys: Vec::new(),
+                    allowed_ips: Vec::new(),
                     websocket_graphql_policy: false,
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
@@ -7391,6 +8097,8 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: Some(&resolver),
                 request_body_credential_rewrite: true,
+                host: "",
+                port: 0,
             },
         )
         .await
@@ -7456,6 +8164,8 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
+                host: "",
+                port: 0,
             },
         )
         .await;
@@ -7499,6 +8209,8 @@ network_policies:
                 websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
                 secret_resolver: None,
                 request_body_credential_rewrite: false,
+                host: "",
+                port: 0,
             },
         )
         .await;

@@ -51,6 +51,10 @@ pub struct L7Request {
     pub action: String,
     /// Target: URL path for REST, empty for SQL.
     pub target: String,
+    /// Original request-target from the client request line, before endpoint
+    /// canonicalization. Route-selected relays revalidate this value using the
+    /// selected endpoint's parser options before authorization or forwarding.
+    pub raw_target: String,
     /// Decoded query parameter multimap for REST requests.
     pub query_params: HashMap<String, Vec<String>>,
     /// Raw request header bytes (request line + headers for HTTP, message for SQL).

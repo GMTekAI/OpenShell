@@ -543,6 +543,15 @@ pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) 
                 let health = response.into_inner();
                 println!("  {} {}", "Status:".dimmed(), "Connected".green());
                 println!("  {} {}", "Version:".dimmed(), health.version);
+                println!(
+                    "  {} {}",
+                    "Capabilities:".dimmed(),
+                    if health.capabilities.is_empty() {
+                        "<none>".to_string()
+                    } else {
+                        health.capabilities.join(", ")
+                    }
+                );
             }
             Err(e) => {
                 if let Some(status) = http_health_check(server, tls).await? {
@@ -579,6 +588,29 @@ pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) 
         }
     }
 
+    Ok(())
+}
+
+/// Emit machine-readable gateway health/capability attestation. Consumers
+/// must parse only the `capabilities` field, never search human display text.
+pub async fn gateway_status_json(gateway_name: &str, server: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let health = client
+        .health(HealthRequest {})
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "gateway": gateway_name,
+            "server": server,
+            "status": "connected",
+            "version": health.version,
+            "capabilities": health.capabilities,
+        }))
+        .into_diagnostic()?
+    );
     Ok(())
 }
 
@@ -3438,7 +3470,12 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
     })
 }
 
-pub async fn sandbox_provider_list(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn sandbox_provider_list(
+    server: &str,
+    name: &str,
+    json: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_sandbox_providers(ListSandboxProvidersRequest {
@@ -3446,7 +3483,50 @@ pub async fn sandbox_provider_list(server: &str, name: &str, tls: &TlsOptions) -
         })
         .await
         .into_diagnostic()?;
-    let providers = response.into_inner().providers;
+    let response = response.into_inner();
+    let providers = response.providers;
+
+    if json {
+        let provider_by_name = providers
+            .iter()
+            .map(|provider| (provider.object_name(), provider))
+            .collect::<HashMap<_, _>>();
+        let binding_by_name = response
+            .provider_credential_bindings
+            .iter()
+            .map(|binding| (binding.provider_name.as_str(), binding))
+            .collect::<HashMap<_, _>>();
+        let attachments = response
+            .attached_provider_names
+            .iter()
+            .map(|provider_name| {
+                let provider = provider_by_name.get(provider_name.as_str()).copied();
+                let binding = binding_by_name.get(provider_name.as_str()).copied();
+                serde_json::json!({
+                    "name": provider_name,
+                    "provider_present": provider.is_some(),
+                    "provider_id": provider.map_or("", |provider| provider.object_id()),
+                    "provider_resource_version": provider
+                        .and_then(|provider| provider.metadata.as_ref())
+                        .map_or(0, |metadata| metadata.resource_version),
+                    "credential_keys": provider.map_or_else(Vec::new, |provider| {
+                        let mut keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
+                        keys.sort();
+                        keys
+                    }),
+                    "bound_provider_id": binding.map_or("", |binding| binding.provider_id.as_str()),
+                    "bound_credential_keys": binding
+                        .map_or_else(Vec::new, |binding| binding.credential_keys.clone()),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({ "attachments": attachments }))
+                .into_diagnostic()?
+        );
+        return Ok(());
+    }
 
     if providers.is_empty() {
         println!("No providers attached to sandbox {name}.");
@@ -3461,6 +3541,9 @@ pub async fn sandbox_provider_attach(
     server: &str,
     name: &str,
     provider: &str,
+    expected_provider_id: Option<&str>,
+    expected_provider_resource_version: u64,
+    credential_keys: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -3483,19 +3566,47 @@ pub async fn sandbox_provider_attach(
             sandbox_name: name.to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
+            expected_provider_id: expected_provider_id.unwrap_or_default().to_string(),
+            expected_provider_resource_version,
+            credential_keys: credential_keys.to_vec(),
         })
         .await
     {
         Ok(response) => response.into_inner(),
         Err(status) if status.code() == Code::Aborted => {
             return Err(miette::miette!(
-                "Failed to attach provider: sandbox was modified by another operation.\n\
+                "Failed to attach provider: sandbox or provider was modified by another operation.\n\
                  Please retry the command."
             )
             .with_source_code(status.message().to_string()));
         }
         Err(e) => return Err(e).into_diagnostic(),
     };
+
+    if !credential_keys.is_empty() {
+        let binding_persisted = response
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.spec.as_ref())
+            .is_some_and(|spec| {
+                spec.providers.iter().any(|name| name == provider)
+                    && spec.provider_credential_bindings.iter().any(|binding| {
+                        binding.provider_name == provider
+                            && binding.provider_id == expected_provider_id.unwrap_or_default()
+                            && credential_keys.iter().all(|key| {
+                                binding
+                                    .credential_keys
+                                    .iter()
+                                    .any(|bound_key| bound_key == key)
+                            })
+                    })
+            });
+        if !binding_persisted {
+            return Err(miette::miette!(
+                "OpenShell gateway did not persist the requested exact provider credential binding"
+            ));
+        }
+    }
 
     if response.attached {
         println!(
@@ -3514,6 +3625,8 @@ pub async fn sandbox_provider_detach(
     server: &str,
     name: &str,
     provider: &str,
+    expected_provider_id: Option<&str>,
+    expected_provider_resource_version: u64,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -3536,19 +3649,40 @@ pub async fn sandbox_provider_detach(
             sandbox_name: name.to_string(),
             provider_name: provider.to_string(),
             expected_resource_version: resource_version,
+            expected_provider_id: expected_provider_id.unwrap_or_default().to_string(),
+            expected_provider_resource_version,
         })
         .await
     {
         Ok(response) => response.into_inner(),
         Err(status) if status.code() == Code::Aborted => {
             return Err(miette::miette!(
-                "Failed to detach provider: sandbox was modified by another operation.\n\
+                "Failed to detach provider: sandbox or provider was modified by another operation.\n\
                  Please retry the command."
             )
             .with_source_code(status.message().to_string()));
         }
         Err(e) => return Err(e).into_diagnostic(),
     };
+
+    if expected_provider_id.is_some() {
+        let detached_exactly = response
+            .sandbox
+            .as_ref()
+            .and_then(|sandbox| sandbox.spec.as_ref())
+            .is_some_and(|spec| {
+                !spec.providers.iter().any(|name| name == provider)
+                    && !spec
+                        .provider_credential_bindings
+                        .iter()
+                        .any(|binding| binding.provider_name == provider)
+            });
+        if !detached_exactly {
+            return Err(miette::miette!(
+                "OpenShell gateway did not remove the provider attachment and credential binding"
+            ));
+        }
+    }
 
     if response.detached {
         println!(
@@ -4431,6 +4565,8 @@ async fn rollback_provider_create_after_gcloud_adc_failure(
     match client
         .delete_provider(DeleteProviderRequest {
             name: provider_name.to_string(),
+            expected_provider_id: String::new(),
+            expected_resource_version: 0,
         })
         .await
     {
@@ -4621,6 +4757,34 @@ pub async fn provider_create_with_options(
     from_gcloud_adc: bool,
     runtime_credentials: bool,
     config: &[String],
+    tls: &TlsOptions,
+) -> Result<()> {
+    provider_create_with_output(
+        server,
+        name,
+        provider_type,
+        from_existing,
+        credentials,
+        from_gcloud_adc,
+        runtime_credentials,
+        config,
+        "table",
+        tls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn provider_create_with_output(
+    server: &str,
+    name: &str,
+    provider_type: &str,
+    from_existing: bool,
+    credentials: &[String],
+    from_gcloud_adc: bool,
+    runtime_credentials: bool,
+    config: &[String],
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     if from_gcloud_adc && (from_existing || !credentials.is_empty() || runtime_credentials) {
@@ -4832,7 +4996,24 @@ pub async fn provider_create_with_options(
         return Ok(());
     }
 
-    println!("{} Created provider {}", "✓".green().bold(), provider_name);
+    if output == "json" {
+        let metadata = provider.metadata.as_ref();
+        let mut credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
+        credential_keys.sort();
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "name": provider_name,
+                "id": provider.object_id(),
+                "resource_version": metadata.map_or(0, |value| value.resource_version),
+                "type": provider.r#type,
+                "credential_keys": credential_keys,
+            }))
+            .into_diagnostic()?
+        );
+    } else {
+        println!("{} Created provider {}", "✓".green().bold(), provider_name);
+    }
     Ok(())
 }
 
@@ -5637,6 +5818,10 @@ fn truncate_display(value: &str, max_width: usize) -> String {
     truncated
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "CLI command handler mirrors independent provider update flags and identity preconditions"
+)]
 pub async fn provider_update(
     server: &str,
     name: &str,
@@ -5644,6 +5829,8 @@ pub async fn provider_update(
     credentials: &[String],
     config: &[String],
     credential_expires_at: &[String],
+    expected_provider_id: Option<&str>,
+    expected_resource_version: u64,
     tls: &TlsOptions,
 ) -> Result<()> {
     if from_existing && !credentials.is_empty() {
@@ -5702,6 +5889,8 @@ pub async fn provider_update(
                 credential_expires_at_ms: HashMap::new(),
             }),
             credential_expires_at_ms,
+            expected_provider_id: expected_provider_id.unwrap_or_default().to_string(),
+            expected_resource_version,
         })
         .await
         .into_diagnostic()?;
@@ -5719,11 +5908,26 @@ pub async fn provider_update(
     Ok(())
 }
 
-pub async fn provider_delete(server: &str, names: &[String], tls: &TlsOptions) -> Result<()> {
+pub async fn provider_delete(
+    server: &str,
+    names: &[String],
+    expected_provider_id: Option<&str>,
+    expected_resource_version: u64,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if (expected_provider_id.is_some() || expected_resource_version != 0) && names.len() != 1 {
+        return Err(miette::miette!(
+            "provider identity preconditions require exactly one provider name"
+        ));
+    }
     let mut client = grpc_client(server, tls).await?;
     for name in names {
         let response = client
-            .delete_provider(DeleteProviderRequest { name: name.clone() })
+            .delete_provider(DeleteProviderRequest {
+                name: name.clone(),
+                expected_provider_id: expected_provider_id.unwrap_or_default().to_string(),
+                expected_resource_version,
+            })
             .await
             .into_diagnostic()?;
         if response.into_inner().deleted {

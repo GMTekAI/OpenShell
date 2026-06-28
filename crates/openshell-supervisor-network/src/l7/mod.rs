@@ -56,6 +56,9 @@ pub enum TlsMode {
     /// terminate it transparently. This is the default for all endpoints.
     #[default]
     Auto,
+    /// Require a TLS client tunnel and verified TLS upstream connection.
+    /// Plaintext and unsupported tunnel protocols fail closed.
+    Require,
     /// Explicit opt-out: raw tunnel with no TLS termination and no credential
     /// injection. Use for client-cert mTLS to upstream or non-standard protocols.
     Skip,
@@ -121,6 +124,10 @@ pub struct L7EndpointConfig {
     /// Opt-in rewrite of credential placeholders in supported textual REST
     /// request bodies before forwarding upstream.
     pub request_body_credential_rewrite: bool,
+    /// Environment credential keys exclusively owned by this endpoint.
+    pub credential_keys: Vec<String>,
+    /// Optional resolved-IP pinset for this endpoint.
+    pub allowed_ips: Vec<String>,
     /// When true, client-to-server GraphQL-over-WebSocket operation messages
     /// are classified with the same operation policy used by GraphQL-over-HTTP.
     pub websocket_graphql_policy: bool,
@@ -166,7 +173,9 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let protocol = L7Protocol::parse(&protocol_val)?;
 
     let tls = match get_object_str(val, "tls").as_deref() {
+        Some("require") => TlsMode::Require,
         Some("skip") => TlsMode::Skip,
+        Some("auto") | None => TlsMode::Auto,
         Some("terminate") => {
             let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(openshell_ocsf::ActivityId::Other)
@@ -191,7 +200,17 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
             openshell_ocsf::ocsf_emit!(event);
             TlsMode::Auto
         }
-        _ => TlsMode::Auto,
+        Some(other) => {
+            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                .activity(openshell_ocsf::ActivityId::Other)
+                .severity(openshell_ocsf::SeverityId::High)
+                .message(format!(
+                    "rejecting endpoint: unrecognized tls value {other:?}"
+                ))
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
+            return None;
+        }
     };
 
     let enforcement = match get_object_str(val, "enforcement").as_deref() {
@@ -204,6 +223,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
     let request_body_credential_rewrite =
         get_object_bool(val, "request_body_credential_rewrite").unwrap_or(false);
+    let credential_keys = get_object_string_array(val, "credential_keys").unwrap_or_default();
+    let allowed_ips = get_object_string_array(val, "allowed_ips").unwrap_or_default();
     let websocket_graphql_policy =
         protocol == L7Protocol::Websocket && endpoint_has_graphql_policy(val);
     let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
@@ -259,6 +280,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         allow_encoded_slash,
         websocket_credential_rewrite,
         request_body_credential_rewrite,
+        credential_keys,
+        allowed_ips,
         websocket_graphql_policy,
         credential_signing,
         signing_service,
@@ -277,6 +300,18 @@ impl L7EndpointConfig {
         } else {
             self.path.chars().filter(|c| *c != '*').count()
         }
+    }
+
+    pub fn allows_upstream_ip(&self, ip: std::net::IpAddr) -> bool {
+        self.allowed_ips.is_empty()
+            || self.allowed_ips.iter().any(|entry| {
+                entry
+                    .parse::<ipnet::IpNet>()
+                    .is_ok_and(|network| network.contains(&ip))
+                    || entry
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|allowed| allowed == ip)
+            })
     }
 }
 
@@ -297,11 +332,13 @@ pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
 ///
 /// Used to check for `tls: skip` even on L4-only endpoints (no `protocol`
 /// field) that explicitly opt out of TLS auto-detection.
-pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
+pub fn parse_tls_mode(val: &regorus::Value) -> Option<TlsMode> {
     match get_object_str(val, "tls").as_deref() {
-        Some("skip") => TlsMode::Skip,
-        // "terminate" and "passthrough" are deprecated aliases (logged by parse_l7_config); fall through to Auto.
-        _ => TlsMode::Auto,
+        Some("require") => Some(TlsMode::Require),
+        Some("skip") => Some(TlsMode::Skip),
+        // "terminate" and "passthrough" are deprecated aliases for Auto.
+        Some("auto" | "terminate" | "passthrough") | None => Some(TlsMode::Auto),
+        Some(_) => None,
     }
 }
 
@@ -323,6 +360,23 @@ fn get_object_u64(val: &regorus::Value, key: &str) -> Option<u64> {
     match val {
         regorus::Value::Object(map) => match map.get(&key_val) {
             Some(regorus::Value::Number(n)) => n.as_u64(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn get_object_string_array(val: &regorus::Value, key: &str) -> Option<Vec<String>> {
+    let key_val = regorus::Value::String(key.into());
+    match val {
+        regorus::Value::Object(map) => match map.get(&key_val) {
+            Some(regorus::Value::Array(values)) => values
+                .iter()
+                .map(|value| match value {
+                    regorus::Value::String(value) => Some(value.to_string()),
+                    _ => None,
+                })
+                .collect(),
             _ => None,
         },
         _ => None,
@@ -932,6 +986,82 @@ fn json_endpoint_has_graphql_policy(ep: &serde_json::Value) -> bool {
             .is_some_and(|rules| rules.iter().any(json_rule_has_graphql_fields))
 }
 
+fn mcp_host_patterns_overlap(left: &str, right: &str) -> bool {
+    let left = left.to_ascii_lowercase();
+    let right = right.to_ascii_lowercase();
+    if left.is_empty() || right.is_empty() {
+        return true;
+    }
+    let left_wildcard = left.contains('*');
+    let right_wildcard = right.contains('*');
+    match (left_wildcard, right_wildcard) {
+        (false, false) => left == right,
+        (true, false) => mcp_host_pattern_matches(&left, &right),
+        (false, true) => mcp_host_pattern_matches(&right, &left),
+        (true, true) => {
+            let left_labels: Vec<&str> = left.split('.').collect();
+            let right_labels: Vec<&str> = right.split('.').collect();
+            let left_recursive = left_labels.first() == Some(&"**");
+            let right_recursive = right_labels.first() == Some(&"**");
+            let left_suffix = left_labels.get(1..).unwrap_or_default();
+            let right_suffix = right_labels.get(1..).unwrap_or_default();
+            if !left_recursive && !right_recursive {
+                left_labels.len() == right_labels.len() && left_suffix == right_suffix
+            } else {
+                dns_suffix_compatible(left_suffix, right_suffix)
+            }
+        }
+    }
+}
+
+fn mcp_host_pattern_matches(pattern: &str, exact: &str) -> bool {
+    let pattern_labels: Vec<&str> = pattern.split('.').collect();
+    let exact_labels: Vec<&str> = exact.split('.').collect();
+    let Some(first_pattern) = pattern_labels.first().copied() else {
+        return true;
+    };
+    if first_pattern == "**" {
+        let suffix = pattern_labels.get(1..).unwrap_or_default();
+        return exact_labels.len() >= suffix.len()
+            && exact_labels[exact_labels.len() - suffix.len()..] == *suffix;
+    }
+    pattern_labels.len() == exact_labels.len()
+        && pattern_labels.get(1..) == exact_labels.get(1..)
+        && glob::Pattern::new(first_pattern).is_ok_and(|pattern| pattern.matches(exact_labels[0]))
+}
+
+fn dns_suffix_compatible(left: &[&str], right: &[&str]) -> bool {
+    let common = left.len().min(right.len());
+    left[left.len() - common..] == right[right.len() - common..]
+}
+
+fn mcp_path_patterns_overlap(left: &str, right: &str) -> bool {
+    let universal = |path: &str| path.is_empty() || path == "**" || path == "/**";
+    if universal(left) || universal(right) {
+        return true;
+    }
+    let has_glob = |path: &str| path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | '{'));
+    match (has_glob(left), has_glob(right)) {
+        (false, false) => left == right,
+        (true, false) => endpoint_path_matches(left, right),
+        (false, true) => endpoint_path_matches(right, left),
+        (true, true) => {
+            let left_prefix = glob_literal_prefix(left);
+            let right_prefix = glob_literal_prefix(right);
+            left_prefix.is_empty()
+                || right_prefix.is_empty()
+                || left_prefix.starts_with(right_prefix)
+                || right_prefix.starts_with(left_prefix)
+        }
+    }
+}
+
+fn glob_literal_prefix(pattern: &str) -> &str {
+    pattern
+        .find(['*', '?', '[', '{'])
+        .map_or(pattern, |index| &pattern[..index])
+}
+
 /// Validate L7 policy configuration in the loaded OPA data.
 ///
 /// Returns a list of errors and warnings. Errors should prevent sandbox startup;
@@ -947,6 +1077,8 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
         return (errors, warnings);
     };
 
+    let mut credential_owners = std::collections::HashMap::<String, String>::new();
+    let mut mcp_security_configs = Vec::<(String, String, Vec<u64>, String, String)>::new();
     for (name, policy) in policies {
         let Some(endpoints) = policy.get("endpoints").and_then(|v| v.as_array()) else {
             continue;
@@ -980,6 +1112,125 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 |arr| arr.iter().filter_map(serde_json::Value::as_u64).collect(),
             );
             let loc = format!("{name}.endpoints[{i}]");
+
+            if protocol == "mcp" {
+                let mut normalized_ports = ports.clone();
+                normalized_ports.sort_unstable();
+                normalized_ports.dedup();
+                let normalized_tls = match tls {
+                    "require" => "require",
+                    "skip" => "skip",
+                    _ => "auto",
+                };
+                let normalized_enforcement = if enforcement == "enforce" {
+                    "enforce"
+                } else {
+                    "audit"
+                };
+                let mut allowed_ips = ep
+                    .get("allowed_ips")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                allowed_ips.sort();
+                allowed_ips.dedup();
+                let security_config = serde_json::json!({
+                    "tls": normalized_tls,
+                    "enforcement": normalized_enforcement,
+                    "allow_encoded_slash": ep.get("allow_encoded_slash").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                    "json_rpc_max_body_bytes": ep.get("json_rpc_max_body_bytes").and_then(serde_json::Value::as_u64).unwrap_or(jsonrpc::DEFAULT_MAX_BODY_BYTES as u64),
+                    "mcp_strict_tool_names": ep.get("mcp_strict_tool_names").and_then(serde_json::Value::as_bool).unwrap_or(true),
+                    "allowed_ips": allowed_ips,
+                    "credential_bound": ep.get("credential_keys").and_then(serde_json::Value::as_array).is_some_and(|keys| !keys.is_empty()),
+                })
+                .to_string();
+                for (first_loc, first_host, first_ports, first_path, first_config) in
+                    &mcp_security_configs
+                {
+                    let ports_overlap = normalized_ports
+                        .iter()
+                        .any(|port| first_ports.contains(port));
+                    if ports_overlap
+                        && mcp_host_patterns_overlap(first_host, host)
+                        && mcp_path_patterns_overlap(first_path, endpoint_path)
+                        && first_config != &security_config
+                    {
+                        errors.push(format!(
+                            "{loc}: overlapping MCP endpoint security settings differ from {first_loc}; tls, enforcement, encoded-slash, body-limit, strict-tool, IP-pin, and credential-binding settings must match"
+                        ));
+                    }
+                }
+                mcp_security_configs.push((
+                    loc.clone(),
+                    host.to_string(),
+                    normalized_ports,
+                    endpoint_path.to_string(),
+                    security_config,
+                ));
+            }
+
+            if let Some(value) = ep.get("credential_keys") {
+                let Some(keys) = value.as_array() else {
+                    errors.push(format!("{loc}: credential_keys must be an array"));
+                    continue;
+                };
+                if keys.is_empty() {
+                    errors.push(format!(
+                        "{loc}: credential_keys must contain at least one key when present"
+                    ));
+                }
+                if keys.len() > 64 {
+                    errors.push(format!(
+                        "{loc}: credential_keys must contain at most 64 keys"
+                    ));
+                }
+                if protocol != "mcp" || enforcement != "enforce" {
+                    errors.push(format!(
+                        "{loc}: credential_keys requires protocol: mcp with enforcement: enforce"
+                    ));
+                }
+                if tls != "require" {
+                    errors.push(format!("{loc}: credential_keys requires tls: require"));
+                }
+                if host.contains('*')
+                    || endpoint_path.is_empty()
+                    || endpoint_path.contains(['*', '?'])
+                    || ports.len() != 1
+                {
+                    errors.push(format!(
+                        "{loc}: credential_keys requires one exact host, port, and path"
+                    ));
+                }
+                let mut endpoint_keys = std::collections::HashSet::new();
+                for key in keys {
+                    let Some(key) = key.as_str() else {
+                        errors.push(format!("{loc}: credential key must be a string"));
+                        continue;
+                    };
+                    let mut bytes = key.bytes();
+                    let valid = matches!(bytes.next(), Some(b'A'..=b'Z' | b'a'..=b'z' | b'_'))
+                        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+                    if !valid {
+                        errors.push(format!(
+                            "{loc}: credential key '{key}' must match ^[A-Za-z_][A-Za-z0-9_]*$"
+                        ));
+                    }
+                    if !endpoint_keys.insert(key) {
+                        errors.push(format!("{loc}: credential key '{key}' is duplicated"));
+                    }
+                    if let Some(owner) = credential_owners.insert(key.to_string(), loc.clone()) {
+                        errors.push(format!(
+                            "{loc}: credential key '{key}' is already owned by {owner}; ownership must be globally unique"
+                        ));
+                    }
+                }
+            }
 
             if protocol == "mcp" {
                 if host.trim().is_empty() {
@@ -1199,6 +1450,15 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             if tls == "terminate" || tls == "passthrough" {
                 warnings.push(format!(
                     "{loc}: 'tls: {tls}' is deprecated; TLS termination is now automatic. Use 'tls: skip' to disable."
+                ));
+            }
+
+            if !matches!(
+                tls,
+                "" | "auto" | "require" | "skip" | "terminate" | "passthrough"
+            ) {
+                errors.push(format!(
+                    "{loc}: unknown tls mode '{tls}' (expected auto, require, skip, terminate, or passthrough)"
                 ));
             }
 
@@ -1668,6 +1928,25 @@ mod tests {
         .unwrap();
         let config = parse_l7_config(&val).unwrap();
         assert_eq!(config.tls, TlsMode::Skip);
+    }
+
+    #[test]
+    fn parse_l7_config_require() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "mcp", "tls": "require", "host": "mcp.example.com", "port": 443}"#,
+        )
+        .unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.tls, TlsMode::Require);
+    }
+
+    #[test]
+    fn parse_l7_config_rejects_unknown_tls() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "tls": "sometimes", "host": "api.example.com", "port": 443}"#,
+        )
+        .unwrap();
+        assert!(parse_l7_config(&val).is_none());
     }
 
     #[test]
@@ -2638,6 +2917,28 @@ mod tests {
     }
 
     #[test]
+    fn validate_unknown_tls_mode_is_an_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "tls": "sometimes"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("unknown tls mode"))
+        );
+    }
+
+    #[test]
     fn validate_tls_skip_with_l7_on_443_warns() {
         let data = serde_json::json!({
             "network_policies": {
@@ -3521,5 +3822,170 @@ mod tests {
             errors.is_empty(),
             "valid deny query matchers should not error: {errors:?}"
         );
+    }
+
+    fn mcp_overlap_endpoint(
+        host: &str,
+        ports: serde_json::Value,
+        path: &str,
+        tls: &str,
+        max_body_bytes: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "host": host,
+            "ports": ports,
+            "path": path,
+            "protocol": "mcp",
+            "tls": tls,
+            "enforcement": "enforce",
+            "json_rpc_max_body_bytes": max_body_bytes,
+            "rules": [{ "allow": { "method": "initialize" } }]
+        })
+    }
+
+    #[test]
+    fn mcp_security_overlap_detects_wildcard_and_exact_host() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "wildcard": { "endpoints": [mcp_overlap_endpoint(
+                    "*.example.com", serde_json::json!([443]), "/mcp", "require", 65536
+                )] },
+                "exact": { "endpoints": [mcp_overlap_endpoint(
+                    "api.example.com", serde_json::json!([443]), "/mcp", "auto", 65536
+                )] }
+            }
+        });
+
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("overlapping MCP endpoint security settings differ")),
+            "wildcard/exact overlap must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_security_overlap_detects_common_port_in_port_sets() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "narrow": { "endpoints": [mcp_overlap_endpoint(
+                    "api.example.com", serde_json::json!([443]), "/mcp", "require", 65536
+                )] },
+                "wide": { "endpoints": [mcp_overlap_endpoint(
+                    "api.example.com", serde_json::json!([443, 8443]), "/mcp", "require", 131_072
+                )] }
+            }
+        });
+
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("overlapping MCP endpoint security settings differ")),
+            "port-set intersection must be rejected: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_security_overlap_rejects_bound_and_unbound_endpoint() {
+        let bound = serde_json::json!({
+            "host": "api.example.com",
+            "ports": [443],
+            "path": "/mcp",
+            "protocol": "mcp",
+            "tls": "require",
+            "enforcement": "enforce",
+            "credential_keys": ["MCP_TOKEN"],
+            "rules": [{ "allow": { "method": "initialize" } }]
+        });
+        let unbound = mcp_overlap_endpoint(
+            "api.example.com",
+            serde_json::json!([443]),
+            "/mcp",
+            "require",
+            65536,
+        );
+        let data = serde_json::json!({
+            "network_policies": {
+                "bound": { "endpoints": [bound] },
+                "unbound": { "endpoints": [unbound] }
+            }
+        });
+
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("overlapping MCP endpoint security settings differ")),
+            "credential binding is part of the security envelope: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_security_different_hosts_do_not_overlap() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "first": { "endpoints": [mcp_overlap_endpoint(
+                    "*.first.example.com", serde_json::json!([443]), "/mcp", "require", 65536
+                )] },
+                "second": { "endpoints": [mcp_overlap_endpoint(
+                    "api.second.example.com", serde_json::json!([443]), "/mcp", "auto", 131_072
+                )] }
+            }
+        });
+
+        let (errors, _) = validate_l7_policies(&data);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("overlapping MCP endpoint security settings differ")),
+            "provably disjoint hosts should not conflict: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn endpoint_ip_pins_accept_bare_addresses_and_cidrs() {
+        let config = L7EndpointConfig {
+            protocol: L7Protocol::Mcp,
+            path: "/mcp".to_string(),
+            tls: TlsMode::Require,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: graphql::DEFAULT_MAX_BODY_BYTES,
+            json_rpc_max_body_bytes: jsonrpc::DEFAULT_MAX_BODY_BYTES,
+            mcp_strict_tool_names: true,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite: false,
+            request_body_credential_rewrite: false,
+            credential_keys: vec!["MCP_TOKEN".to_string()],
+            allowed_ips: vec![
+                "192.0.2.10".to_string(),
+                "2001:db8::10".to_string(),
+                "198.51.100.0/24".to_string(),
+                "2001:db8:1::/48".to_string(),
+            ],
+            websocket_graphql_policy: false,
+            credential_signing: CredentialSigning::None,
+            signing_service: String::new(),
+            signing_region: String::new(),
+        };
+
+        for allowed in [
+            "192.0.2.10",
+            "2001:db8::10",
+            "198.51.100.42",
+            "2001:db8:1::42",
+        ] {
+            assert!(
+                config.allows_upstream_ip(allowed.parse().unwrap()),
+                "{allowed}"
+            );
+        }
+        for denied in ["192.0.2.11", "203.0.113.42", "2001:db8:2::42"] {
+            assert!(
+                !config.allows_upstream_ip(denied.parse().unwrap()),
+                "{denied}"
+            );
+        }
     }
 }

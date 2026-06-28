@@ -188,6 +188,8 @@ pub struct EndpointProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_ips: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny_rules: Vec<L7DenyRuleProfile>,
@@ -779,6 +781,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         access: endpoint.access.clone(),
         rules: endpoint.rules.iter().map(rule_to_proto).collect(),
         allowed_ips: endpoint.allowed_ips.clone(),
+        credential_keys: endpoint.credential_keys.clone(),
         ports: endpoint.ports.clone(),
         deny_rules: endpoint.deny_rules.iter().map(deny_rule_to_proto).collect(),
         allow_encoded_slash: endpoint.allow_encoded_slash,
@@ -811,6 +814,7 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
         enforcement: endpoint.enforcement.clone(),
         rules: endpoint.rules.iter().map(rule_from_proto).collect(),
         allowed_ips: endpoint.allowed_ips.clone(),
+        credential_keys: endpoint.credential_keys.clone(),
         ports: endpoint.ports.clone(),
         deny_rules: endpoint
             .deny_rules

@@ -1116,6 +1116,7 @@ fn network_endpoint_from_json(
         access: endpoint.access,
         rules,
         allowed_ips: endpoint.allowed_ips,
+        credential_keys: Vec::new(),
         ports,
         deny_rules,
         allow_encoded_slash: endpoint.allow_encoded_slash,

@@ -70,6 +70,26 @@ use tokio::sync::mpsc::UnboundedSender;
 #[cfg(target_os = "linux")]
 use tokio::time::timeout;
 
+fn startup_config_provider_pair_is_coherent(
+    initial: &openshell_core::grpc_client::SandboxConfigSnapshot,
+    provider_env_revision: u64,
+    final_snapshot: &openshell_core::grpc_client::SandboxConfigSnapshot,
+) -> bool {
+    initial.policy_hash == final_snapshot.policy_hash
+        && initial.config_revision == final_snapshot.config_revision
+        && initial.provider_env_revision == provider_env_revision
+        && final_snapshot.provider_env_revision == provider_env_revision
+        && initial.policy.is_some()
+        && final_snapshot.policy.is_some()
+}
+
+fn provider_environment_without_config_snapshot_may_activate(reserved_keys: &[String]) -> bool {
+    // Legacy unreserved provider env remains compatible with local policy
+    // overrides. Endpoint-scoped credentials require a gateway config
+    // snapshot so their policy ownership and provider revision can be paired.
+    reserved_keys.is_empty()
+}
+
 /// Run a command in the sandbox.
 ///
 /// # Errors
@@ -128,7 +148,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (policy, opa_engine, retained_proto) = load_policy(
+    let (policy, opa_engine, retained_proto, startup_config_snapshot) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -145,26 +165,71 @@ pub async fn run_sandbox(
         provider_env,
         provider_credential_expires_at_ms,
         dynamic_credentials,
+        reserved_credential_keys,
+        credential_provider_ids,
+        environment_provider_ids,
     ) = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
         match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
             Ok(result) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .state(StateId::Enabled, "loaded")
-                        .message(format!(
-                            "Fetched provider environment [env_count:{}]",
-                            result.environment.len()
-                        ))
-                        .build()
-                );
-                (
-                    result.provider_env_revision,
-                    result.environment,
-                    result.credential_expires_at_ms,
-                    result.dynamic_credentials,
-                )
+                if let Some(opa_engine) = opa_engine.as_ref() {
+                    opa_engine.reserve_credential_keys(&result.reserved_credential_keys)?;
+                }
+                let startup_coherent = if let Some(initial) = startup_config_snapshot.as_ref() {
+                    match openshell_core::grpc_client::fetch_policy_snapshot(endpoint, id).await {
+                        Ok(final_snapshot) => startup_config_provider_pair_is_coherent(
+                            initial,
+                            result.provider_env_revision,
+                            &final_snapshot,
+                        ),
+                        Err(error) => {
+                            warn!(
+                                error = %error,
+                                "Could not stabilize startup config/provider snapshot; credentials remain inactive"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    provider_environment_without_config_snapshot_may_activate(
+                        &result.reserved_credential_keys,
+                    )
+                };
+                if startup_coherent {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .message(format!(
+                                "Fetched provider environment [env_count:{}]",
+                                result.environment.len()
+                            ))
+                            .build()
+                    );
+                    (
+                        result.provider_env_revision,
+                        result.environment,
+                        result.credential_expires_at_ms,
+                        result.dynamic_credentials,
+                        result.reserved_credential_keys,
+                        result.credential_provider_ids,
+                        result.environment_provider_ids,
+                    )
+                } else {
+                    warn!(
+                        provider_env_revision = result.provider_env_revision,
+                        "Startup config/provider snapshot changed during fetch; retaining reservations with credentials inactive until poll retry"
+                    );
+                    (
+                        0,
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                        result.reserved_credential_keys,
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                    )
+                }
             }
             Err(e) => {
                 ocsf_emit!(
@@ -182,6 +247,9 @@ pub async fn run_sandbox(
                     std::collections::HashMap::new(),
                     std::collections::HashMap::new(),
                     std::collections::HashMap::new(),
+                    Vec::new(),
+                    std::collections::HashMap::new(),
+                    std::collections::HashMap::new(),
                 )
             }
         }
@@ -191,14 +259,20 @@ pub async fn run_sandbox(
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
         )
     };
 
-    let provider_credentials = ProviderCredentialState::from_environment(
+    let provider_credentials = ProviderCredentialState::from_environment_with_scope(
         provider_env_revision,
         provider_env,
         provider_credential_expires_at_ms,
         dynamic_credentials,
+        reserved_credential_keys,
+        credential_provider_ids,
+        environment_provider_ids,
     );
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut provider_env = provider_credentials.child_env_with_gcp_resolved();
@@ -1337,6 +1411,7 @@ async fn load_policy(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
+    Option<openshell_core::grpc_client::SandboxConfigSnapshot>,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -1366,7 +1441,7 @@ async fn load_policy(
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
-        return Ok((policy, Some(Arc::new(engine)), None));
+        return Ok((policy, Some(Arc::new(engine)), None, None));
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -1376,12 +1451,12 @@ async fn load_policy(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let proto_policy = grpc_retry("Policy fetch", || {
-            openshell_core::grpc_client::fetch_policy(endpoint, id)
+        let config_snapshot = grpc_retry("Policy fetch", || {
+            openshell_core::grpc_client::fetch_policy_snapshot(endpoint, id)
         })
         .await?;
 
-        let mut proto_policy = if let Some(p) = proto_policy {
+        let mut proto_policy = if let Some(p) = config_snapshot.policy {
             p
         } else {
             // No policy configured on the server. Discover from disk or
@@ -1436,6 +1511,18 @@ async fn load_policy(
             );
         }
 
+        // Re-read the config after any discovery/enrichment sync. The returned
+        // metadata is the startup half of the config -> environment -> config
+        // coherence check performed before credentials are activated.
+        let startup_config_snapshot = grpc_retry("Final startup policy fetch", || {
+            openshell_core::grpc_client::fetch_policy_snapshot(endpoint, id)
+        })
+        .await?;
+        proto_policy = startup_config_snapshot.policy.clone().ok_or_else(|| {
+            miette::miette!("Server returned no policy after startup policy synchronization")
+        })?;
+        enrich_proto_baseline_paths(&mut proto_policy);
+
         // Build OPA engine from baked-in rules + typed proto data.
         // In cluster mode, proxy networking is always enabled so OPA is
         // always required for allow/deny decisions.
@@ -1446,7 +1533,12 @@ async fn load_policy(
         let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
 
         let policy = SandboxPolicy::try_from(proto_policy.clone())?;
-        return Ok((policy, opa_engine, Some(proto_policy)));
+        return Ok((
+            policy,
+            opa_engine,
+            Some(proto_policy),
+            Some(startup_config_snapshot),
+        ));
     }
 
     // No policy source available
@@ -1584,6 +1676,26 @@ struct PolicyPollLoopContext {
     policy_local_ctx: Option<Arc<openshell_supervisor_network::policy_local::PolicyLocalContext>>,
 }
 
+/// Revoke credential authorization before a config transition that can alter
+/// either provider identity or endpoint ownership. The returned flag also
+/// requires the poller to fetch a fresh provider snapshot, including for a
+/// policy-only change whose provider environment revision is unchanged.
+fn prepare_provider_credential_refresh(
+    provider_credentials: &ProviderCredentialState,
+    opa_engine: &OpaEngine,
+    policy_changed: bool,
+    provider_env_changed: bool,
+) -> bool {
+    let policy_may_change_credential_authorization =
+        policy_changed && provider_credentials.has_reserved_credential_keys();
+    let refresh_required = provider_env_changed || policy_may_change_credential_authorization;
+    if refresh_required {
+        provider_credentials.deactivate_reserved_credentials();
+        opa_engine.invalidate_credential_generation();
+    }
+    refresh_required
+}
+
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
@@ -1598,26 +1710,14 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         openshell_core::proto::EffectiveSetting,
     > = std::collections::HashMap::new();
 
-    // Initialize revision from the first poll.
-    match client.poll_settings(&ctx.sandbox_id).await {
-        Ok(result) => {
-            apply_ocsf_json_setting(&ctx.ocsf_enabled, &result.settings);
-            current_config_revision = result.config_revision;
-            current_policy_hash = result.policy_hash.clone();
-            current_settings = result.settings;
-            debug!(
-                config_revision = current_config_revision,
-                "Settings poll: initial config revision"
-            );
-        }
-        Err(e) => {
-            warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
-        }
-    }
-
     let interval = Duration::from_secs(ctx.interval_secs);
+    let mut first_poll = true;
     loop {
-        tokio::time::sleep(interval).await;
+        if first_poll {
+            first_poll = false;
+        } else {
+            tokio::time::sleep(interval).await;
+        }
 
         let result = match client.poll_settings(&ctx.sandbox_id).await {
             Ok(r) => r,
@@ -1628,11 +1728,24 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         };
 
         let provider_env_changed = result.provider_env_revision != current_provider_env_revision;
-        if result.config_revision == current_config_revision && !provider_env_changed {
+        if result.config_revision == current_config_revision
+            && result.policy_hash == current_policy_hash
+            && !provider_env_changed
+        {
             continue;
         }
 
         let policy_changed = result.policy_hash != current_policy_hash;
+        let mut policy_ready_for_provider_install = !policy_changed;
+        let mut accept_policy_hash = !policy_changed;
+        let mut pending_provider_environment = None;
+
+        let provider_refresh_required = prepare_provider_credential_refresh(
+            &ctx.provider_credentials,
+            &ctx.opa_engine,
+            policy_changed,
+            provider_env_changed,
+        );
 
         // Log which settings changed.
         log_setting_changes(&current_settings, &result.settings);
@@ -1651,7 +1764,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             ))
             .build());
 
-        if provider_env_changed {
+        if provider_refresh_required {
+            // Revocation happened before this fetch. A failed or stale fetch,
+            // or a later policy reload failure, must leave the old binding
+            // inactive. Policy-only changes deliberately fetch even when the
+            // environment revision is unchanged.
             match openshell_core::grpc_client::fetch_provider_environment(
                 &ctx.endpoint,
                 &ctx.sandbox_id,
@@ -1659,27 +1776,28 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             .await
             {
                 Ok(env_result) => {
-                    let env_count = ctx.provider_credentials.install_environment(
-                        env_result.provider_env_revision,
-                        env_result.environment,
-                        env_result.credential_expires_at_ms,
-                        env_result.dynamic_credentials,
-                    );
-                    current_provider_env_revision = env_result.provider_env_revision;
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .unmapped(
-                                "provider_env_revision",
-                                serde_json::json!(current_provider_env_revision)
-                            )
-                            .message(format!(
-                                "Provider environment refreshed [revision:{current_provider_env_revision} env_count:{env_count}]"
-                            ))
-                            .build()
-                    );
+                    ctx.provider_credentials
+                        .reserve_credential_keys(&env_result.reserved_credential_keys);
+                    match ctx
+                        .opa_engine
+                        .reserve_credential_keys(&env_result.reserved_credential_keys)
+                    {
+                        Ok(()) => {
+                            if env_result.provider_env_revision == result.provider_env_revision {
+                                pending_provider_environment = Some(env_result);
+                            } else {
+                                warn!(
+                                    expected_revision = result.provider_env_revision,
+                                    fetched_revision = env_result.provider_env_revision,
+                                    "Settings poll: provider environment revision mismatch; keeping credentials deactivated"
+                                );
+                            }
+                        }
+                        Err(error) => warn!(
+                            error = %error,
+                            "Settings poll: failed to ingest durable credential reservations; deferring provider environment"
+                        ),
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -1701,7 +1819,6 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     .message("Settings poll: policy hash changed but no policy payload present; skipping reload")
                     .build());
                 current_config_revision = result.config_revision;
-                current_policy_hash = result.policy_hash;
                 current_settings = result.settings;
                 continue;
             };
@@ -1709,6 +1826,13 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
             match ctx.opa_engine.reload_from_proto_with_pid(policy, pid) {
                 Ok(()) => {
+                    policy_ready_for_provider_install = true;
+                    // A policy-only credential authorization change must keep
+                    // retrying if its same-revision environment fetch failed.
+                    // Otherwise the accepted hash would suppress all future
+                    // refresh attempts while credentials remain deactivated.
+                    accept_policy_hash =
+                        !provider_refresh_required || pending_provider_environment.is_some();
                     if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
                         policy_local_ctx.set_current_policy(policy.clone()).await;
                     }
@@ -1749,6 +1873,8 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    policy_ready_for_provider_install = false;
+                    accept_policy_hash = false;
                     ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
@@ -1775,6 +1901,41 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     }
                 }
             }
+        }
+
+        if policy_ready_for_provider_install {
+            if let Some(env_result) = pending_provider_environment.take() {
+                let env_count = ctx.provider_credentials.install_environment_with_scope(
+                    env_result.provider_env_revision,
+                    env_result.environment,
+                    env_result.credential_expires_at_ms,
+                    env_result.dynamic_credentials,
+                    &env_result.reserved_credential_keys,
+                    Some(env_result.credential_provider_ids),
+                    env_result.environment_provider_ids,
+                );
+                ctx.opa_engine.invalidate_credential_generation();
+                current_provider_env_revision = env_result.provider_env_revision;
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "loaded")
+                        .unmapped(
+                            "provider_env_revision",
+                            serde_json::json!(current_provider_env_revision)
+                        )
+                        .message(format!(
+                            "Provider environment refreshed [revision:{current_provider_env_revision} env_count:{env_count}]"
+                        ))
+                        .build()
+                );
+            }
+        } else if pending_provider_environment.is_some() {
+            warn!(
+                provider_env_revision = result.provider_env_revision,
+                "Settings poll: deferring provider environment until policy reload succeeds"
+            );
         }
 
         // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
@@ -1815,7 +1976,9 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         }
 
         current_config_revision = result.config_revision;
-        current_policy_hash = result.policy_hash;
+        if accept_policy_hash {
+            current_policy_hash = result.policy_hash;
+        }
         current_settings = result.settings;
     }
 }
@@ -1938,6 +2101,158 @@ mod tests {
             }),
             scope: openshell_core::proto::SettingScope::Global.into(),
         }
+    }
+
+    fn startup_snapshot(
+        policy_hash: &str,
+        config_revision: u64,
+        provider_env_revision: u64,
+    ) -> openshell_core::grpc_client::SandboxConfigSnapshot {
+        openshell_core::grpc_client::SandboxConfigSnapshot {
+            policy: Some(openshell_core::proto::SandboxPolicy::default()),
+            policy_hash: policy_hash.to_string(),
+            config_revision,
+            provider_env_revision,
+        }
+    }
+
+    #[test]
+    fn startup_credentials_require_stable_config_environment_config_pair() {
+        let initial = startup_snapshot("policy-a", 10, 20);
+        assert!(startup_config_provider_pair_is_coherent(
+            &initial,
+            20,
+            &startup_snapshot("policy-a", 10, 20)
+        ));
+        for final_snapshot in [
+            startup_snapshot("policy-b", 10, 20),
+            startup_snapshot("policy-a", 11, 20),
+            startup_snapshot("policy-a", 10, 21),
+        ] {
+            assert!(!startup_config_provider_pair_is_coherent(
+                &initial,
+                20,
+                &final_snapshot
+            ));
+        }
+        assert!(!startup_config_provider_pair_is_coherent(
+            &initial,
+            21,
+            &startup_snapshot("policy-a", 10, 21)
+        ));
+        let mut missing_policy = startup_snapshot("policy-a", 10, 20);
+        missing_policy.policy = None;
+        assert!(!startup_config_provider_pair_is_coherent(
+            &initial,
+            20,
+            &missing_policy
+        ));
+        assert!(provider_environment_without_config_snapshot_may_activate(
+            &[]
+        ));
+        assert!(!provider_environment_without_config_snapshot_may_activate(
+            &["MCP_TOKEN".to_string()]
+        ));
+    }
+
+    #[test]
+    fn policy_only_mcp_removal_with_reload_failure_revokes_credentials_first() {
+        use openshell_core::proto::{
+            L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule,
+        };
+
+        let mut initial_policy = openshell_policy::restrictive_default_policy();
+        initial_policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.test".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    tls: "require".to_string(),
+                    enforcement: "enforce".to_string(),
+                    path: "/mcp".to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "initialize".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    credential_keys: vec!["MCP_TOKEN".to_string()],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let engine = OpaEngine::from_proto(&initial_policy).expect("valid MCP policy");
+
+        let provider_credentials = ProviderCredentialState::from_environment_with_scope(
+            17,
+            std::collections::HashMap::from([("MCP_TOKEN".to_string(), "real-secret".to_string())]),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            vec!["MCP_TOKEN".to_string()],
+            std::collections::HashMap::from([("MCP_TOKEN".to_string(), "provider-A".to_string())]),
+            std::collections::HashMap::from([("MCP_TOKEN".to_string(), "provider-A".to_string())]),
+        );
+        let placeholder = openshell_core::secrets::placeholder_for_env_key("MCP_TOKEN");
+        let endpoint_resolver = provider_credentials
+            .resolver()
+            .expect("provider resolver")
+            .scoped_to_credential_keys(&["MCP_TOKEN".to_string()], true);
+        assert_eq!(
+            endpoint_resolver.resolve_placeholder(&placeholder),
+            Some("real-secret")
+        );
+
+        let old_generation = engine.current_generation();
+        let old_guard = engine
+            .generation_guard(old_generation)
+            .expect("current generation guard");
+        assert!(prepare_provider_credential_refresh(
+            &provider_credentials,
+            &engine,
+            true,
+            false,
+        ));
+        assert_eq!(provider_credentials.snapshot().revision, 17);
+        assert!(old_guard.ensure_current().is_err());
+        assert_eq!(endpoint_resolver.resolve_placeholder(&placeholder), None);
+
+        // The proposed policy removes the MCP endpoint but contains a separate
+        // invalid credential binding, forcing OPA to retain its old engine.
+        // The old resolver must nevertheless remain inactive until a later
+        // poll both reloads policy and reinstalls a coherent environment.
+        let mut removed_but_invalid = openshell_policy::restrictive_default_policy();
+        removed_but_invalid.network_policies.insert(
+            "invalid".to_string(),
+            NetworkPolicyRule {
+                name: "invalid".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.test".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    tls: "require".to_string(),
+                    enforcement: "enforce".to_string(),
+                    credential_keys: vec!["MCP_TOKEN".to_string()],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        assert!(
+            engine
+                .reload_from_proto_with_pid(&removed_but_invalid, 0)
+                .is_err()
+        );
+        assert_eq!(endpoint_resolver.resolve_placeholder(&placeholder), None);
     }
 
     #[test]

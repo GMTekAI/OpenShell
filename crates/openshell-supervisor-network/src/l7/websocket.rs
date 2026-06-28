@@ -1268,6 +1268,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "realtime.graphql.test".into(),
             port: 443,
+            http_default_port: 80,
             policy_name: "graphql_ws".into(),
             binary_path: "/usr/bin/node".into(),
             ancestors: vec![],
@@ -1276,6 +1277,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            upstream_ip: None,
         };
         let (mut client_write, mut relay_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
         let (mut relay_write, mut upstream_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);

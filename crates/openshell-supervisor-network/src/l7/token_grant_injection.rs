@@ -116,6 +116,7 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                 return Ok(L7Request {
                     action: req.action,
                     target: req.target,
+                    raw_target: req.raw_target,
                     query_params: req.query_params,
                     raw_header: modified_raw_header,
                     body_length: req.body_length,
@@ -727,6 +728,7 @@ mod tests {
         let ctx = L7EvalContext {
             host: "api.example.com".into(),
             port: 443,
+            http_default_port: 80,
             policy_name: "api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -735,6 +737,7 @@ mod tests {
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            upstream_ip: None,
         };
         let req = L7Request {
             action: "GET".to_string(),
@@ -742,6 +745,7 @@ mod tests {
             query_params: std::collections::HashMap::new(),
             raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
 
         let rewritten = inject_if_needed(req, &ctx)
@@ -764,6 +768,7 @@ mod tests {
         let ctx = L7EvalContext {
             host: "api.example.com".into(),
             port: 443,
+            http_default_port: 80,
             policy_name: "api".into(),
             binary_path: "/usr/bin/curl".into(),
             ancestors: vec![],
@@ -772,6 +777,7 @@ mod tests {
             activity_tx: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
+            upstream_ip: None,
         };
         let req = L7Request {
             action: "GET".to_string(),
@@ -779,6 +785,7 @@ mod tests {
             query_params: std::collections::HashMap::new(),
             raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
 
         let err = inject_if_needed(req, &ctx)

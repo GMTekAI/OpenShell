@@ -45,6 +45,8 @@ struct ProviderState {
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
     delete_provider_requests: Arc<Mutex<Vec<String>>>,
+    update_provider_preconditions: Arc<Mutex<Vec<(String, u64)>>>,
+    delete_provider_preconditions: Arc<Mutex<Vec<(String, u64)>>>,
     fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
     fail_rotate_refresh_message: Arc<Mutex<Option<String>>>,
     fail_delete_provider_message: Arc<Mutex<Option<String>>>,
@@ -82,10 +84,14 @@ enum SandboxProviderRequestLog {
     Attach {
         sandbox_name: String,
         provider_name: String,
+        expected_provider_id: String,
+        expected_provider_resource_version: u64,
     },
     Detach {
         sandbox_name: String,
         provider_name: String,
+        expected_provider_id: String,
+        expected_provider_resource_version: u64,
     },
 }
 
@@ -103,6 +109,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
+            capabilities: Vec::new(),
         }))
     }
 
@@ -166,7 +173,11 @@ impl OpenShell for TestOpenShell {
             .iter()
             .filter_map(|name| providers_by_name.get(name).cloned())
             .collect();
-        Ok(Response::new(ListSandboxProvidersResponse { providers }))
+        Ok(Response::new(ListSandboxProvidersResponse {
+            providers,
+            provider_credential_bindings: Vec::new(),
+            attached_provider_names: provider_names,
+        }))
     }
 
     async fn attach_sandbox_provider(
@@ -181,6 +192,8 @@ impl OpenShell for TestOpenShell {
             .push(SandboxProviderRequestLog::Attach {
                 sandbox_name: request.sandbox_name.clone(),
                 provider_name: request.provider_name.clone(),
+                expected_provider_id: request.expected_provider_id.clone(),
+                expected_provider_resource_version: request.expected_provider_resource_version,
             });
         if !self
             .state
@@ -230,6 +243,8 @@ impl OpenShell for TestOpenShell {
             .push(SandboxProviderRequestLog::Detach {
                 sandbox_name: request.sandbox_name.clone(),
                 provider_name: request.provider_name.clone(),
+                expected_provider_id: request.expected_provider_id.clone(),
+                expected_provider_resource_version: request.expected_provider_resource_version,
             });
         let mut sandbox_providers = self.state.sandbox_providers.lock().await;
         let providers = sandbox_providers
@@ -554,8 +569,12 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
+        let request = request.into_inner();
+        self.state.update_provider_preconditions.lock().await.push((
+            request.expected_provider_id.clone(),
+            request.expected_resource_version,
+        ));
         let provider = request
-            .into_inner()
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
 
@@ -771,7 +790,12 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        self.state.delete_provider_preconditions.lock().await.push((
+            request.expected_provider_id.clone(),
+            request.expected_resource_version,
+        ));
+        let name = request.name;
         self.state
             .delete_provider_requests
             .lock()
@@ -1078,12 +1102,14 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         &["API_KEY=rotated".to_string()],
         &["profile=prod".to_string()],
         &[],
+        None,
+        0,
         &ts.tls,
     )
     .await
     .expect("provider update");
 
-    run::provider_delete(&ts.endpoint, &["my-claude".to_string()], &ts.tls)
+    run::provider_delete(&ts.endpoint, &["my-claude".to_string()], None, 0, &ts.tls)
         .await
         .expect("provider delete");
 }
@@ -1120,9 +1146,15 @@ async fn provider_list_json_output() {
         .await
         .expect("provider list json should succeed");
 
-    run::provider_delete(&ts.endpoint, &["test-provider".to_string()], &ts.tls)
-        .await
-        .expect("provider delete");
+    run::provider_delete(
+        &ts.endpoint,
+        &["test-provider".to_string()],
+        None,
+        0,
+        &ts.tls,
+    )
+    .await
+    .expect("provider delete");
 }
 
 #[tokio::test]
@@ -1148,9 +1180,15 @@ async fn provider_list_yaml_output() {
         .await
         .expect("provider list yaml should succeed");
 
-    run::provider_delete(&ts.endpoint, &["test-provider".to_string()], &ts.tls)
-        .await
-        .expect("provider delete");
+    run::provider_delete(
+        &ts.endpoint,
+        &["test-provider".to_string()],
+        None,
+        0,
+        &ts.tls,
+    )
+    .await
+    .expect("provider delete");
 }
 
 #[tokio::test]
@@ -1336,19 +1374,35 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
     .await
     .expect("provider create");
 
-    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
-        .await
-        .expect("sandbox provider attach");
-    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
-        .await
-        .expect("sandbox provider attach is idempotent");
-    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", &ts.tls)
+    run::sandbox_provider_attach(
+        &ts.endpoint,
+        "dev-sandbox",
+        "work-github",
+        None,
+        0,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox provider attach");
+    run::sandbox_provider_attach(
+        &ts.endpoint,
+        "dev-sandbox",
+        "work-github",
+        None,
+        0,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("sandbox provider attach is idempotent");
+    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", false, &ts.tls)
         .await
         .expect("sandbox provider list");
-    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", None, 0, &ts.tls)
         .await
         .expect("sandbox provider detach");
-    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", None, 0, &ts.tls)
         .await
         .expect("sandbox provider detach is idempotent");
 
@@ -1359,10 +1413,14 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
             SandboxProviderRequestLog::Attach {
                 sandbox_name: "dev-sandbox".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             },
             SandboxProviderRequestLog::Attach {
                 sandbox_name: "dev-sandbox".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             },
             SandboxProviderRequestLog::List {
                 sandbox_name: "dev-sandbox".to_string(),
@@ -1370,10 +1428,14 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
             SandboxProviderRequestLog::Detach {
                 sandbox_name: "dev-sandbox".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             },
             SandboxProviderRequestLog::Detach {
                 sandbox_name: "dev-sandbox".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             },
         ]
     );
@@ -1386,10 +1448,17 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
 async fn sandbox_provider_attach_cli_surfaces_server_errors() {
     let ts = run_server().await;
 
-    let err =
-        run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "missing-provider", &ts.tls)
-            .await
-            .expect_err("missing provider should fail");
+    let err = run::sandbox_provider_attach(
+        &ts.endpoint,
+        "dev-sandbox",
+        "missing-provider",
+        None,
+        0,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("missing provider should fail");
 
     assert!(
         err.to_string().contains("provider not found"),
@@ -1400,6 +1469,8 @@ async fn sandbox_provider_attach_cli_surfaces_server_errors() {
         [SandboxProviderRequestLog::Attach {
             sandbox_name: "dev-sandbox".to_string(),
             provider_name: "missing-provider".to_string(),
+            expected_provider_id: String::new(),
+            expected_provider_resource_version: 0,
         }]
     );
 }
@@ -1490,9 +1561,15 @@ binaries: [/usr/bin/custom]
         .expect("custom provider should be stored");
     assert_eq!(provider.r#type, "custom-api");
 
-    run::provider_delete(&ts.endpoint, &["custom-provider".to_string()], &ts.tls)
-        .await
-        .expect("custom provider delete");
+    run::provider_delete(
+        &ts.endpoint,
+        &["custom-provider".to_string()],
+        None,
+        0,
+        &ts.tls,
+    )
+    .await
+    .expect("custom provider delete");
     run::provider_profile_delete(&ts.endpoint, "custom-api", &ts.tls)
         .await
         .expect("profile delete");
@@ -1759,9 +1836,19 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
     );
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
 
-    run::provider_update(&ts.endpoint, "custom-update", true, &[], &[], &[], &ts.tls)
-        .await
-        .expect("profile-backed provider update --from-existing");
+    run::provider_update(
+        &ts.endpoint,
+        "custom-update",
+        true,
+        &[],
+        &[],
+        &[],
+        None,
+        0,
+        &ts.tls,
+    )
+    .await
+    .expect("profile-backed provider update --from-existing");
 
     let provider = ts
         .state

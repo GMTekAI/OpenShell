@@ -69,8 +69,13 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
     max_body_bytes: usize,
     canonicalize_options: crate::l7::path::CanonicalizeOptions,
     inspection_options: JsonRpcInspectionOptions,
+    require_origin_form: bool,
 ) -> Result<Option<JsonRpcHttpRequest>> {
-    let provider = crate::l7::rest::RestProvider::with_options(canonicalize_options);
+    let provider = if require_origin_form {
+        crate::l7::rest::RestProvider::with_credential_boundary(canonicalize_options)
+    } else {
+        crate::l7::rest::RestProvider::with_options(canonicalize_options)
+    };
     let Some(mut request) = provider.parse_request(client).await? else {
         return Ok(None);
     };
@@ -80,6 +85,12 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
             info: JsonRpcRequestInfo::receive_stream(),
         }));
     }
+    if inspection_options.mode == JsonRpcInspectionMode::Mcp
+        && request.action.eq_ignore_ascii_case("DELETE")
+    {
+        let info = JsonRpcRequestInfo::session_termination(&request);
+        return Ok(Some(JsonRpcHttpRequest { request, info }));
+    }
     let body =
         crate::l7::http::read_body_for_inspection(client, &mut request, max_body_bytes).await?;
     let info = parse_jsonrpc_body_with_options(&body, inspection_options);
@@ -87,12 +98,20 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "JSON-RPC transport metadata exposes independent wire properties to policy evaluation"
+)]
 pub struct JsonRpcRequestInfo {
     /// Calls found in the request body. Responses and receive-stream GETs have
     /// no calls but are still represented so policy can allow relay behavior.
     pub calls: Vec<JsonRpcCallInfo>,
     pub is_batch: bool,
     pub receive_stream: bool,
+    /// MCP Streamable HTTP session termination (`DELETE` with exactly one
+    /// valid `MCP-Session-Id` header). This transport control is authorized by
+    /// the MCP endpoint binding, independently of JSON-RPC method rules.
+    pub session_termination: bool,
     pub has_response: bool,
     pub error: Option<String>,
 }
@@ -118,10 +137,82 @@ impl JsonRpcRequestInfo {
             calls: Vec::new(),
             is_batch: false,
             receive_stream: true,
+            session_termination: false,
             has_response: false,
             error: None,
         }
     }
+
+    /// Classify MCP Streamable HTTP session termination without trying to
+    /// parse an intentionally empty request body as JSON.
+    pub(crate) fn session_termination(request: &L7Request) -> Self {
+        let error = validate_mcp_session_termination(request).err();
+        Self {
+            calls: Vec::new(),
+            is_batch: false,
+            receive_stream: false,
+            session_termination: error.is_none(),
+            has_response: false,
+            error,
+        }
+    }
+}
+
+fn validate_mcp_session_termination(request: &L7Request) -> std::result::Result<(), String> {
+    if !matches!(
+        request.body_length,
+        crate::l7::provider::BodyLength::None | crate::l7::provider::BodyLength::ContentLength(0)
+    ) {
+        return Err("MCP session termination must not include a request body".to_string());
+    }
+
+    let header_end = request
+        .raw_header
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map_or(request.raw_header.len(), |position| position + 2);
+    let mut values = request.raw_header[..header_end]
+        .split(|byte| *byte == b'\n')
+        .skip(1)
+        .filter_map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            let colon = line.iter().position(|byte| *byte == b':')?;
+            let (name, value) = line.split_at(colon);
+            name.eq_ignore_ascii_case(b"MCP-Session-Id")
+                .then_some(trim_http_ows(&value[1..]))
+        });
+
+    let Some(value) = values.next() else {
+        return Err("MCP session termination requires an MCP-Session-Id header".to_string());
+    };
+    if values.next().is_some() {
+        return Err(
+            "MCP session termination requires exactly one MCP-Session-Id header".to_string(),
+        );
+    }
+    if value.is_empty() || !value.iter().all(|byte| (0x21..=0x7e).contains(byte)) {
+        return Err(
+            "MCP-Session-Id must be non-empty and contain only visible ASCII characters"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn trim_http_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 pub(crate) fn jsonrpc_receive_stream_request(request: &L7Request) -> bool {
@@ -171,6 +262,7 @@ pub fn parse_jsonrpc_body_with_options(
             calls: Vec::new(),
             is_batch: false,
             receive_stream: false,
+            session_termination: false,
             has_response: false,
             error: Some("invalid JSON".to_string()),
         };
@@ -182,6 +274,7 @@ pub fn parse_jsonrpc_body_with_options(
                 calls: Vec::new(),
                 is_batch: true,
                 receive_stream: false,
+                session_termination: false,
                 has_response: false,
                 error: Some("empty batch".to_string()),
             };
@@ -197,6 +290,7 @@ pub fn parse_jsonrpc_body_with_options(
                         calls: Vec::new(),
                         is_batch: true,
                         receive_stream: false,
+                        session_termination: false,
                         has_response: false,
                         error: Some(format!("batch item invalid: {error}")),
                     };
@@ -207,6 +301,7 @@ pub fn parse_jsonrpc_body_with_options(
             calls,
             is_batch: true,
             receive_stream: false,
+            session_termination: false,
             has_response,
             error: None,
         };
@@ -217,6 +312,7 @@ pub fn parse_jsonrpc_body_with_options(
             calls: vec![call],
             is_batch: false,
             receive_stream: false,
+            session_termination: false,
             has_response: false,
             error: None,
         },
@@ -224,6 +320,7 @@ pub fn parse_jsonrpc_body_with_options(
             calls: Vec::new(),
             is_batch: false,
             receive_stream: false,
+            session_termination: false,
             has_response: true,
             error: None,
         },
@@ -231,6 +328,7 @@ pub fn parse_jsonrpc_body_with_options(
             calls: Vec::new(),
             is_batch: false,
             receive_stream: false,
+            session_termination: false,
             has_response: false,
             error: Some(error),
         },
@@ -604,6 +702,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: b"GET /rpc HTTP/1.1\r\nHost: jsonrpc.test\r\nAccept: application/json, text/event-stream\r\n\r\n".to_vec(),
             body_length: crate::l7::provider::BodyLength::None,
+            raw_target: String::new(),
         };
 
         assert!(jsonrpc_receive_stream_request(&request));
@@ -624,9 +723,90 @@ mod tests {
                 b"GET /rpc HTTP/1.1\r\nHost: jsonrpc.test\r\nAccept: application/json\r\n\r\n"
                     .to_vec(),
             body_length: crate::l7::provider::BodyLength::None,
+            raw_target: String::new(),
         };
 
         assert!(!jsonrpc_receive_stream_request(&request));
+    }
+
+    fn mcp_delete_request(
+        raw_header: &[u8],
+        body_length: crate::l7::provider::BodyLength,
+    ) -> L7Request {
+        L7Request {
+            action: "DELETE".to_string(),
+            target: "/mcp".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw_header.to_vec(),
+            body_length,
+            raw_target: "/mcp".to_string(),
+        }
+    }
+
+    #[test]
+    fn recognizes_valid_mcp_session_termination() {
+        let request = mcp_delete_request(
+            b"DELETE /mcp HTTP/1.1\r\nHost: mcp.test\r\nMCP-Session-Id: session-123_ABC\r\nContent-Length: 0\r\n\r\n",
+            crate::l7::provider::BodyLength::ContentLength(0),
+        );
+
+        let info = JsonRpcRequestInfo::session_termination(&request);
+
+        assert!(info.session_termination);
+        assert!(info.error.is_none());
+        assert!(!info.receive_stream);
+        assert!(info.calls.is_empty());
+    }
+
+    #[test]
+    fn rejects_mcp_session_termination_without_exactly_one_session_header() {
+        for raw_header in [
+            b"DELETE /mcp HTTP/1.1\r\nHost: mcp.test\r\n\r\n".as_slice(),
+            b"DELETE /mcp HTTP/1.1\r\nHost: mcp.test\r\nMCP-Session-Id: one\r\nmcp-session-id: two\r\n\r\n".as_slice(),
+        ] {
+            let request = mcp_delete_request(
+                raw_header,
+                crate::l7::provider::BodyLength::None,
+            );
+
+            let info = JsonRpcRequestInfo::session_termination(&request);
+
+            assert!(!info.session_termination);
+            assert!(info.error.is_some());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_mcp_session_id_or_delete_body() {
+        for raw_header in [
+            b"DELETE /mcp HTTP/1.1\r\nHost: mcp.test\r\nMCP-Session-Id: \r\n\r\n".as_slice(),
+            b"DELETE /mcp HTTP/1.1\r\nHost: mcp.test\r\nMCP-Session-Id: has space\r\n\r\n"
+                .as_slice(),
+            b"DELETE /mcp HTTP/1.1\r\nHost: mcp.test\r\nMCP-Session-Id: bad\x7fvalue\r\n\r\n"
+                .as_slice(),
+        ] {
+            let request = mcp_delete_request(raw_header, crate::l7::provider::BodyLength::None);
+            assert!(
+                JsonRpcRequestInfo::session_termination(&request)
+                    .error
+                    .is_some()
+            );
+        }
+
+        for body_length in [
+            crate::l7::provider::BodyLength::ContentLength(1),
+            crate::l7::provider::BodyLength::Chunked,
+        ] {
+            let request = mcp_delete_request(
+                b"DELETE /mcp HTTP/1.1\r\nHost: mcp.test\r\nMCP-Session-Id: valid\r\n\r\n",
+                body_length,
+            );
+            assert!(
+                JsonRpcRequestInfo::session_termination(&request)
+                    .error
+                    .is_some()
+            );
+        }
     }
 
     #[test]

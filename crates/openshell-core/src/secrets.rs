@@ -3,8 +3,9 @@
 
 use crate::time::now_ms;
 use base64::Engine as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::{Arc, RwLock};
 
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 const PROVIDER_ALIAS_MARKER: &str = "OPENSHELL-RESOLVE-ENV-";
@@ -83,13 +84,26 @@ pub struct RewriteTargetResult {
 // SecretResolver
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Default)]
+pub struct CredentialScopeState {
+    pub reserved_credential_keys: HashSet<String>,
+    pub active_provider_ids: HashMap<String, String>,
+}
+
+pub type SharedCredentialScopeState = Arc<RwLock<CredentialScopeState>>;
+
 #[derive(Clone, Default)]
 pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
+    reserved_credential_keys: Arc<HashSet<String>>,
+    authorized_credential_keys: Arc<HashSet<String>>,
+    credential_scope: SharedCredentialScopeState,
 }
 
 #[derive(Clone)]
 struct SecretValue {
+    env_key: String,
+    source_provider_id: Option<String>,
     value: String,
     expires_at_ms: i64,
 }
@@ -127,6 +141,8 @@ impl SecretResolver {
             credential_expires_at_ms,
             revision,
             false,
+            &HashMap::new(),
+            Arc::new(RwLock::new(CredentialScopeState::default())),
         )
     }
 
@@ -135,6 +151,22 @@ impl SecretResolver {
         credential_expires_at_ms: HashMap<String, i64>,
         revision: u64,
     ) -> (HashMap<String, String>, Option<Self>, Option<Self>) {
+        Self::from_provider_env_for_current_revision_with_scope(
+            provider_env,
+            credential_expires_at_ms,
+            revision,
+            &HashMap::new(),
+            Arc::new(RwLock::new(CredentialScopeState::default())),
+        )
+    }
+
+    pub fn from_provider_env_for_current_revision_with_scope(
+        provider_env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        revision: u64,
+        environment_provider_ids: &HashMap<String, String>,
+        credential_scope: SharedCredentialScopeState,
+    ) -> (HashMap<String, String>, Option<Self>, Option<Self>) {
         if revision == 0 {
             let (child_env, current_resolver) =
                 Self::from_provider_env_for_revision_with_current_aliases(
@@ -142,6 +174,8 @@ impl SecretResolver {
                     credential_expires_at_ms,
                     0,
                     true,
+                    environment_provider_ids,
+                    credential_scope,
                 );
             return (child_env, None, current_resolver);
         }
@@ -153,12 +187,16 @@ impl SecretResolver {
                 credential_expires_at_ms,
                 revision,
                 false,
+                environment_provider_ids,
+                Arc::clone(&credential_scope),
             );
         let (_, current_resolver) = Self::from_provider_env_for_revision_with_current_aliases(
             provider_env_for_current,
             credential_expires_at_ms_for_current,
             revision,
             true,
+            environment_provider_ids,
+            credential_scope,
         );
         (child_env, revision_resolver, current_resolver)
     }
@@ -168,6 +206,8 @@ impl SecretResolver {
         credential_expires_at_ms: HashMap<String, i64>,
         revision: u64,
         include_current_aliases: bool,
+        environment_provider_ids: &HashMap<String, String>,
+        credential_scope: SharedCredentialScopeState,
     ) -> (HashMap<String, String>, Option<Self>) {
         if provider_env.is_empty() {
             return (HashMap::new(), None);
@@ -179,6 +219,8 @@ impl SecretResolver {
         for (key, value) in provider_env {
             let placeholder = placeholder_for_env_key_for_revision(&key, revision);
             let secret = SecretValue {
+                env_key: key.clone(),
+                source_provider_id: environment_provider_ids.get(&key).cloned(),
                 value,
                 expires_at_ms: credential_expires_at_ms
                     .get(&key)
@@ -192,18 +234,83 @@ impl SecretResolver {
             }
         }
 
-        (child_env, Some(Self { by_placeholder }))
+        (
+            child_env,
+            Some(Self {
+                by_placeholder,
+                reserved_credential_keys: Arc::new(HashSet::new()),
+                authorized_credential_keys: Arc::new(HashSet::new()),
+                credential_scope,
+            }),
+        )
     }
 
     pub fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
         let mut by_placeholder = HashMap::new();
+        let mut reserved_credential_keys = HashSet::new();
+        let mut credential_scope = None;
         for resolver in resolvers {
             by_placeholder.extend(resolver.by_placeholder.clone());
+            reserved_credential_keys.extend(resolver.reserved_credential_keys.iter().cloned());
+            credential_scope.get_or_insert_with(|| Arc::clone(&resolver.credential_scope));
         }
         if by_placeholder.is_empty() {
             None
         } else {
-            Some(Self { by_placeholder })
+            Some(Self {
+                by_placeholder,
+                reserved_credential_keys: Arc::new(reserved_credential_keys),
+                authorized_credential_keys: Arc::new(HashSet::new()),
+                credential_scope: credential_scope.unwrap_or_default(),
+            })
+        }
+    }
+
+    /// Attach the supervisor's sticky credential reservation set to this
+    /// resolver before selecting a policy endpoint.
+    #[must_use]
+    pub fn with_reserved_credential_keys(&self, reserved_keys: &HashSet<String>) -> Self {
+        Self {
+            by_placeholder: self.by_placeholder.clone(),
+            reserved_credential_keys: Arc::new(reserved_keys.clone()),
+            authorized_credential_keys: Arc::clone(&self.authorized_credential_keys),
+            credential_scope: Arc::clone(&self.credential_scope),
+        }
+    }
+
+    /// Restrict globally reserved credential keys to those owned by the
+    /// selected policy endpoint. Keys that are not reserved retain legacy
+    /// resolver behavior; reserved keys disappear from this resolver unless
+    /// the endpoint explicitly declares them.
+    #[must_use]
+    pub fn scoped_to_credential_keys(&self, endpoint_keys: &[String], exclusive: bool) -> Self {
+        let live_reserved = self
+            .credential_scope
+            .read()
+            .expect("credential scope state poisoned")
+            .reserved_credential_keys
+            .clone();
+        if self.reserved_credential_keys.is_empty() && live_reserved.is_empty() && !exclusive {
+            return self.clone();
+        }
+        let endpoint_keys: HashSet<&str> = endpoint_keys.iter().map(String::as_str).collect();
+        Self {
+            by_placeholder: self
+                .by_placeholder
+                .iter()
+                .filter(|(_, secret)| {
+                    endpoint_keys.contains(secret.env_key.as_str())
+                        || !(exclusive
+                            || self.reserved_credential_keys.contains(&secret.env_key)
+                            || live_reserved.contains(&secret.env_key))
+                })
+                .map(|(placeholder, secret)| (placeholder.clone(), secret.clone()))
+                .collect(),
+            reserved_credential_keys: Arc::clone(&self.reserved_credential_keys),
+            authorized_credential_keys: Arc::new(
+                endpoint_keys.iter().map(|key| (*key).to_string()).collect(),
+            ),
+            credential_scope: Arc::clone(&self.credential_scope),
         }
     }
 
@@ -219,6 +326,22 @@ impl SecretResolver {
             let canonical = placeholder_for_env_key(key);
             self.by_placeholder.get(&canonical)?
         };
+        {
+            let scope = self
+                .credential_scope
+                .read()
+                .expect("credential scope state poisoned");
+            let reserved = self.reserved_credential_keys.contains(&secret.env_key)
+                || scope.reserved_credential_keys.contains(&secret.env_key);
+            if self.authorized_credential_keys.contains(&secret.env_key) {
+                let active_provider_id = scope.active_provider_ids.get(&secret.env_key)?;
+                if secret.source_provider_id.as_ref() != Some(active_provider_id) {
+                    return None;
+                }
+            } else if reserved {
+                return None;
+            }
+        }
         if secret.expires_at_ms > 0 && secret.expires_at_ms <= now_ms() {
             tracing::warn!(
                 location = "resolve_placeholder",
@@ -943,6 +1066,78 @@ pub fn rewrite_http_header_block(
     Ok(RewriteResult {
         rewritten: output,
         redacted_target: rl_result.redacted_target,
+    })
+}
+
+/// Rewrite the single credential use site supported by authenticated MCP v1.
+///
+/// Credential-bound MCP requests may resolve exactly one
+/// `Authorization: Bearer <placeholder>` header. Reserved markers in the
+/// request target, session header, custom headers, Basic auth, or duplicate
+/// Authorization fields fail closed before any upstream write.
+pub fn rewrite_mcp_bearer_header_block(
+    raw: &[u8],
+    resolver: &SecretResolver,
+) -> Result<RewriteResult, UnresolvedPlaceholderError> {
+    let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4) else {
+        return Err(UnresolvedPlaceholderError { location: "header" });
+    };
+    let header_str = std::str::from_utf8(&raw[..header_end])
+        .map_err(|_| UnresolvedPlaceholderError { location: "header" })?;
+    let mut lines = header_str.split("\r\n");
+    let request_line = lines
+        .next()
+        .ok_or(UnresolvedPlaceholderError { location: "header" })?;
+    if contains_reserved_credential_marker(request_line) {
+        return Err(UnresolvedPlaceholderError { location: "path" });
+    }
+
+    let mut output = Vec::with_capacity(raw.len());
+    output.extend_from_slice(request_line.as_bytes());
+    output.extend_from_slice(b"\r\n");
+    let mut authorization_count = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(UnresolvedPlaceholderError { location: "header" });
+        };
+        if name.eq_ignore_ascii_case("authorization") {
+            authorization_count += 1;
+            if authorization_count != 1 {
+                return Err(UnresolvedPlaceholderError { location: "header" });
+            }
+            let value = value.trim();
+            let placeholder = value
+                .strip_prefix("Bearer ")
+                .filter(|placeholder| {
+                    !placeholder.is_empty()
+                        && !placeholder.bytes().any(|byte| byte.is_ascii_whitespace())
+                })
+                .ok_or(UnresolvedPlaceholderError { location: "header" })?;
+            let secret = resolver
+                .resolve_placeholder(placeholder)
+                .ok_or(UnresolvedPlaceholderError { location: "header" })?;
+            output.extend_from_slice(name.as_bytes());
+            output.extend_from_slice(b": Bearer ");
+            output.extend_from_slice(secret.as_bytes());
+        } else {
+            if contains_reserved_credential_marker(line) {
+                return Err(UnresolvedPlaceholderError { location: "header" });
+            }
+            output.extend_from_slice(line.as_bytes());
+        }
+        output.extend_from_slice(b"\r\n");
+    }
+    if authorization_count != 1 {
+        return Err(UnresolvedPlaceholderError { location: "header" });
+    }
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(&raw[header_end..]);
+    Ok(RewriteResult {
+        rewritten: output,
+        redacted_target: None,
     })
 }
 

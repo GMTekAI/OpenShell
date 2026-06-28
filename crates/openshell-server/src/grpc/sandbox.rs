@@ -19,8 +19,9 @@ use openshell_core::proto::{
     ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
-    TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
+    SandboxProviderCredentialBinding, SandboxResponse, SandboxStreamEvent, SshRelayTarget,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
+    tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
@@ -44,6 +45,7 @@ use russh::client::AuthResult;
 
 use super::provider::{
     get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
+    validate_provider_preconditions,
 };
 use super::validation::{
     level_matches, source_matches, validate_exec_request_fields,
@@ -124,6 +126,11 @@ async fn handle_create_sandbox_inner(
     let spec = request
         .spec
         .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+    if !spec.provider_credential_bindings.is_empty() {
+        return Err(Status::invalid_argument(
+            "provider_credential_bindings are gateway-owned and must be empty at sandbox creation",
+        ));
+    }
 
     // Validate field sizes before any I/O (fail fast on oversized payloads).
     validate_sandbox_spec(&request.name, &spec)?;
@@ -134,11 +141,10 @@ async fn handle_create_sandbox_inner(
         crate::grpc::validation::validate_label_value(value)?;
     }
 
-    let _sandbox_sync_guard = if spec.providers.is_empty() {
-        None
-    } else {
-        Some(state.compute.sandbox_sync_guard().await)
-    };
+    // Sandbox creation is also the reset boundary for durable credential
+    // reservations, so serialize it with policy/provider mutations even when
+    // no provider is initially attached.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
 
     // Validate provider names exist (fail fast).
     for name in &spec.providers {
@@ -199,6 +205,21 @@ async fn handle_create_sandbox_inner(
             warn!(error = %status, "Rejecting sandbox create request");
             status
         })?;
+
+    if let Some(policy) = sandbox.spec.as_ref().and_then(|spec| spec.policy.as_ref()) {
+        let reservations = super::credential_reservations::persist_policy_credential_reservations(
+            state.store.as_ref(),
+            &id,
+            policy,
+        )
+        .await?;
+        info!(
+            sandbox_id = %id,
+            credential_reservation_revision = reservations.revision,
+            reserved_credential_key_count = reservations.reserved_credential_keys.len(),
+            "persisted initial sandbox credential reservations"
+        );
+    }
 
     // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
     // this mint and bootstrap via `IssueSandboxToken` at supervisor
@@ -284,7 +305,21 @@ pub(super) async fn handle_list_sandbox_providers(
 ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
     let sandbox = sandbox_by_name(state, &request.into_inner().sandbox_name).await?;
     let providers = providers_for_sandbox(state, &sandbox).await?;
-    Ok(Response::new(ListSandboxProvidersResponse { providers }))
+    let (provider_credential_bindings, attached_provider_names) =
+        sandbox.spec.as_ref().map_or_else(
+            || (Vec::new(), Vec::new()),
+            |spec| {
+                (
+                    spec.provider_credential_bindings.clone(),
+                    spec.providers.clone(),
+                )
+            },
+        );
+    Ok(Response::new(ListSandboxProvidersResponse {
+        providers,
+        provider_credential_bindings,
+        attached_provider_names,
+    }))
 }
 
 pub(super) async fn handle_attach_sandbox_provider(
@@ -294,6 +329,38 @@ pub(super) async fn handle_attach_sandbox_provider(
     let request = request.into_inner();
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
+    }
+    if request.credential_keys.len() > 64 {
+        return Err(Status::invalid_argument(
+            "scoped attachment supports at most 64 credential keys",
+        ));
+    }
+    let mut seen_credential_keys = std::collections::HashSet::new();
+    for key in &request.credential_keys {
+        if !seen_credential_keys.insert(key.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "credential key '{key}' is duplicated in scoped attachment request"
+            )));
+        }
+    }
+    let mut credential_keys = request.credential_keys.clone();
+    credential_keys.sort();
+    credential_keys.dedup();
+    for key in &credential_keys {
+        if !is_valid_env_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "credential key '{key}' is not a valid environment variable name"
+            )));
+        }
+    }
+    if !credential_keys.is_empty()
+        && (request.expected_resource_version == 0
+            || request.expected_provider_id.is_empty()
+            || request.expected_provider_resource_version == 0)
+    {
+        return Err(Status::invalid_argument(
+            "scoped credential attachment requires sandbox resource version, expected provider ID, and expected provider resource version",
+        ));
     }
 
     // Validate provider name would not violate sandbox spec constraints if added
@@ -306,7 +373,10 @@ pub(super) async fn handle_attach_sandbox_provider(
         )));
     }
 
-    get_provider_record(state.store.as_ref(), &request.provider_name)
+    // Serialize provider identity checks with provider update/delete handlers.
+    // This closes the inspect-by-name race before the sandbox CAS mutation.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let provider = get_provider_record(state.store.as_ref(), &request.provider_name)
         .await
         .map_err(|err| {
             if err.code() == tonic::Code::NotFound {
@@ -318,8 +388,11 @@ pub(super) async fn handle_attach_sandbox_provider(
                 err
             }
         })?;
-
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    validate_provider_preconditions(
+        &provider,
+        &request.expected_provider_id,
+        request.expected_provider_resource_version,
+    )?;
     let sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
     let sandbox_id = sandbox
         .metadata
@@ -333,6 +406,56 @@ pub(super) async fn handle_attach_sandbox_provider(
         .spec
         .as_ref()
         .ok_or_else(|| Status::internal("sandbox spec is missing"))?;
+
+    if !credential_keys.is_empty() {
+        let base_policy =
+            super::policy::sandbox_base_policy_for_credential_binding(state.as_ref(), &sandbox)
+                .await?;
+        let policy_keys = super::credential_reservations::policy_credential_keys(&base_policy);
+        let durable_reservations = super::credential_reservations::load_credential_reservations(
+            state.store.as_ref(),
+            &sandbox_id,
+        )
+        .await?;
+        for key in &credential_keys {
+            if !policy_keys.contains(key) {
+                return Err(Status::failed_precondition(format!(
+                    "credential key '{key}' is not reserved by the current sandbox-scoped base policy"
+                )));
+            }
+            if !durable_reservations
+                .reserved_credential_keys
+                .iter()
+                .any(|reserved| reserved == key)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "credential key '{key}' has no durable sandbox reservation; reapply the sandbox policy before scoped attachment"
+                )));
+            }
+        }
+
+        let provider_environment = super::provider::resolve_provider_environment(
+            state.store.as_ref(),
+            std::slice::from_ref(&request.provider_name),
+        )
+        .await?;
+        for key in &credential_keys {
+            if provider_environment.environment_provider_ids.get(key)
+                != Some(&request.expected_provider_id)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "credential key '{key}' is not supplied by provider '{}' with ID '{}'",
+                    request.provider_name, request.expected_provider_id
+                )));
+            }
+        }
+        validate_credential_binding_ownership(
+            &spec.provider_credential_bindings,
+            &request.provider_name,
+            &request.expected_provider_id,
+            &credential_keys,
+        )?;
+    }
 
     // Pre-check: fail fast if already at MAX_PROVIDERS limit (avoid spurious CAS conflicts)
     // Note: This is an optimization; the CAS closure rechecks after dedupe in case of races
@@ -355,11 +478,21 @@ pub(super) async fn handle_attach_sandbox_provider(
     {
         candidate_spec.providers.push(request.provider_name.clone());
     }
+    if !credential_keys.is_empty() {
+        upsert_provider_credential_binding(
+            &mut candidate_spec.provider_credential_bindings,
+            &request.provider_name,
+            &request.expected_provider_id,
+            &credential_keys,
+        );
+    }
     validate_sandbox_spec(&request.sandbox_name, &candidate_spec)?;
     validate_provider_environment_keys_unique(state.store.as_ref(), &candidate_spec.providers)
         .await?;
 
     let provider_name = request.provider_name.clone();
+    let provider_id = request.expected_provider_id.clone();
+    let binding_credential_keys = credential_keys.clone();
     let attached = Arc::new(AtomicBool::new(false));
     let attached_clone = attached.clone();
 
@@ -381,12 +514,38 @@ pub(super) async fn handle_attach_sandbox_provider(
                     spec.providers.push(provider_name.clone());
                     attached_clone.store(true, Ordering::Relaxed);
                 }
+                if !binding_credential_keys.is_empty()
+                    && upsert_provider_credential_binding(
+                        &mut spec.provider_credential_bindings,
+                        &provider_name,
+                        &provider_id,
+                        &binding_credential_keys,
+                    )
+                {
+                    attached_clone.store(true, Ordering::Relaxed);
+                }
             },
         )
         .await
         .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
 
     let attached = attached.load(Ordering::Relaxed);
+
+    if !credential_keys.is_empty() {
+        let current_provider = get_provider_record(state.store.as_ref(), &request.provider_name)
+            .await
+            .map_err(|_| {
+                Status::aborted(format!(
+                    "provider '{}' changed after scoped attachment; exact binding remains fail-closed and must be reconciled",
+                    request.provider_name
+                ))
+            })?;
+        validate_provider_preconditions(
+            &current_provider,
+            &request.expected_provider_id,
+            request.expected_provider_resource_version,
+        )?;
+    }
 
     info!(
         sandbox_name = %request.sandbox_name,
@@ -421,6 +580,36 @@ pub(super) async fn handle_detach_sandbox_provider(
 
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
+    if !request.expected_provider_id.is_empty() || request.expected_provider_resource_version != 0 {
+        let requested_provider_name = request.provider_name.as_str();
+        let expected_provider_id = request.expected_provider_id.as_str();
+        let binding_proves_identity = sandbox.spec.as_ref().is_some_and(|spec| {
+            spec.provider_credential_bindings.iter().any(|binding| {
+                binding.provider_name == requested_provider_name
+                    && binding.provider_id == expected_provider_id
+            })
+        });
+        match get_provider_record(state.store.as_ref(), &request.provider_name).await {
+            Ok(provider) => {
+                if let Err(error) = validate_provider_preconditions(
+                    &provider,
+                    &request.expected_provider_id,
+                    request.expected_provider_resource_version,
+                ) && !binding_proves_identity
+                {
+                    return Err(error);
+                }
+            }
+            Err(error) if error.code() == tonic::Code::NotFound && binding_proves_identity => {}
+            Err(error) if error.code() == tonic::Code::NotFound => {
+                return Err(Status::aborted(format!(
+                    "provider '{}' disappeared before detach and no exact scoped binding proves ownership",
+                    request.provider_name
+                )));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let sandbox_id = sandbox
         .metadata
         .as_ref()
@@ -455,6 +644,12 @@ pub(super) async fn handle_detach_sandbox_provider(
                     detached_clone.store(true, Ordering::Relaxed);
                     // Only dedupe after making a change
                     dedupe_provider_names(&mut spec.providers);
+                }
+                let binding_count = spec.provider_credential_bindings.len();
+                spec.provider_credential_bindings
+                    .retain(|binding| binding.provider_name != provider_name);
+                if spec.provider_credential_bindings.len() != binding_count {
+                    detached_clone.store(true, Ordering::Relaxed);
                 }
             },
         )
@@ -512,6 +707,18 @@ async fn handle_delete_sandbox_inner(
     let deleted = state.compute.delete_sandbox(&name).await?;
     if deleted && let Some(sandbox_id) = sandbox_id {
         state.telemetry.end_sandbox_session(&sandbox_id);
+        if let Err(error) = super::credential_reservations::delete_credential_reservations(
+            state.store.as_ref(),
+            &sandbox_id,
+        )
+        .await
+        {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %error,
+                "sandbox deleted but credential reservation cleanup failed; orphan remains fail-closed"
+            );
+        }
     }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse { deleted }))
@@ -542,16 +749,13 @@ async fn providers_for_sandbox(
 
     let mut providers = Vec::with_capacity(provider_names.len());
     for name in provider_names {
-        let provider = get_provider_record(state.store.as_ref(), name)
-            .await
-            .map_err(|err| {
-                if err.code() == tonic::Code::NotFound {
-                    Status::failed_precondition(format!("provider '{name}' not found"))
-                } else {
-                    err
-                }
-            })?;
-        providers.push(provider);
+        match get_provider_record(state.store.as_ref(), name).await {
+            Ok(provider) => providers.push(provider),
+            Err(err) if err.code() == tonic::Code::NotFound => {
+                warn!(provider_name = %name, "attached provider record is missing");
+            }
+            Err(err) => return Err(err),
+        }
     }
     Ok(providers)
 }
@@ -565,6 +769,62 @@ fn dedupe_provider_names(provider_names: &mut Vec<String>) {
             index += 1;
         }
     }
+}
+
+fn validate_credential_binding_ownership(
+    bindings: &[SandboxProviderCredentialBinding],
+    provider_name: &str,
+    provider_id: &str,
+    credential_keys: &[String],
+) -> Result<(), Status> {
+    if let Some(binding) = bindings.iter().find(|binding| {
+        binding.provider_name == provider_name && binding.provider_id != provider_id
+    }) {
+        return Err(Status::failed_precondition(format!(
+            "provider name '{provider_name}' is already bound to immutable provider ID '{}'",
+            binding.provider_id
+        )));
+    }
+    for key in credential_keys {
+        if let Some(binding) = bindings.iter().find(|binding| {
+            binding
+                .credential_keys
+                .iter()
+                .any(|bound_key| bound_key == key)
+                && (binding.provider_name != provider_name || binding.provider_id != provider_id)
+        }) {
+            return Err(Status::failed_precondition(format!(
+                "credential key '{key}' is already bound to provider '{}' with ID '{}'",
+                binding.provider_name, binding.provider_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn upsert_provider_credential_binding(
+    bindings: &mut Vec<SandboxProviderCredentialBinding>,
+    provider_name: &str,
+    provider_id: &str,
+    credential_keys: &[String],
+) -> bool {
+    let before = bindings.clone();
+    let mut merged_keys = credential_keys.to_vec();
+    for binding in bindings.iter().filter(|binding| {
+        binding.provider_name == provider_name && binding.provider_id == provider_id
+    }) {
+        merged_keys.extend(binding.credential_keys.iter().cloned());
+    }
+    merged_keys.sort();
+    merged_keys.dedup();
+    bindings.retain(|binding| binding.provider_name != provider_name);
+    bindings.push(SandboxProviderCredentialBinding {
+        provider_name: provider_name.to_string(),
+        provider_id: provider_id.to_string(),
+        credential_keys: merged_keys,
+    });
+    bindings.sort_by(|left, right| left.provider_name.cmp(&right.provider_name));
+    *bindings != before
 }
 
 // ---------------------------------------------------------------------------
@@ -2304,6 +2564,9 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             }),
         )
         .await
@@ -2347,6 +2610,9 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             }),
         )
         .await
@@ -2388,6 +2654,8 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             }),
         )
         .await
@@ -2412,12 +2680,97 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             }),
         )
         .await
         .unwrap()
         .into_inner();
         assert!(!response.detached);
+    }
+
+    #[tokio::test]
+    async fn sandbox_provider_mutations_reject_same_name_replacement() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("github", "github"))
+            .await
+            .unwrap();
+        let original: Provider = state
+            .store
+            .get_message_by_name("github")
+            .await
+            .unwrap()
+            .unwrap();
+        let original_id = original.object_id().to_string();
+        let original_version = original.metadata.as_ref().unwrap().resource_version;
+        assert!(
+            state
+                .store
+                .delete_if(Provider::object_type(), &original_id, original_version)
+                .await
+                .unwrap()
+        );
+        let mut replacement = test_provider("github", "github");
+        replacement.metadata.as_mut().unwrap().id = "provider-github-replacement".to_string();
+        state.store.put_message(&replacement).await.unwrap();
+
+        state
+            .store
+            .put_message(&test_sandbox("attach-target", Vec::new()))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("detach-target", vec!["github".to_string()]))
+            .await
+            .unwrap();
+
+        let attach_error = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "attach-target".to_string(),
+                provider_name: "github".to_string(),
+                expected_resource_version: 0,
+                expected_provider_id: original_id.clone(),
+                expected_provider_resource_version: original_version,
+                credential_keys: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(attach_error.code(), tonic::Code::Aborted);
+
+        let detach_error = handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "detach-target".to_string(),
+                provider_name: "github".to_string(),
+                expected_resource_version: 0,
+                expected_provider_id: original_id,
+                expected_provider_resource_version: original_version,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(detach_error.code(), tonic::Code::Aborted);
+
+        let attach_target: Sandbox = state
+            .store
+            .get_message_by_name("attach-target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(attach_target.spec.unwrap().providers.is_empty());
+        let detach_target: Sandbox = state
+            .store
+            .get_message_by_name("detach-target")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detach_target.spec.unwrap().providers, vec!["github"]);
     }
 
     #[tokio::test]
@@ -2467,6 +2820,9 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "missing".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             }),
         )
         .await
@@ -2752,6 +3108,9 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-b".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             }),
         )
         .await
@@ -2798,6 +3157,9 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-31".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             }),
         )
         .await
@@ -2852,6 +3214,9 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "provider-32".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             }),
         )
         .await
@@ -2898,6 +3263,9 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: long_name,
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             }),
         )
         .await
@@ -2924,6 +3292,8 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: long_name,
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             }),
         )
         .await
@@ -3088,6 +3458,9 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             }),
         )
         .await
@@ -3139,6 +3512,9 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             }),
         )
         .await
@@ -3201,6 +3577,8 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: current_version,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             }),
         )
         .await
@@ -3252,6 +3630,8 @@ mod tests {
                 sandbox_name: "work".to_string(),
                 provider_name: "github".to_string(),
                 expected_resource_version: 99,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             }),
         )
         .await
@@ -3332,6 +3712,9 @@ mod tests {
                         sandbox_name: "work".to_string(),
                         provider_name: format!("provider-{i}"),
                         expected_resource_version: initial_version,
+                        expected_provider_id: String::new(),
+                        expected_provider_resource_version: 0,
+                        credential_keys: Vec::new(),
                     }),
                 )
                 .await

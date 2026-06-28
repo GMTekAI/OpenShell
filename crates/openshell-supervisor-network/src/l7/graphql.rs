@@ -44,7 +44,28 @@ pub async fn parse_graphql_http_request<C: AsyncRead + AsyncWrite + Unpin + Send
     max_body_bytes: usize,
     canonicalize_options: crate::l7::path::CanonicalizeOptions,
 ) -> Result<Option<GraphqlHttpRequest>> {
-    let provider = crate::l7::rest::RestProvider::with_options(canonicalize_options);
+    parse_graphql_http_request_with_origin_requirement(
+        client,
+        max_body_bytes,
+        canonicalize_options,
+        false,
+    )
+    .await
+}
+
+pub(crate) async fn parse_graphql_http_request_with_origin_requirement<
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+>(
+    client: &mut C,
+    max_body_bytes: usize,
+    canonicalize_options: crate::l7::path::CanonicalizeOptions,
+    require_origin_form: bool,
+) -> Result<Option<GraphqlHttpRequest>> {
+    let provider = if require_origin_form {
+        crate::l7::rest::RestProvider::with_credential_boundary(canonicalize_options)
+    } else {
+        crate::l7::rest::RestProvider::with_options(canonicalize_options)
+    };
     let Some(mut request) = provider.parse_request(client).await? else {
         return Ok(None);
     };
@@ -587,6 +608,7 @@ mod tests {
             raw_header: format!("{method} {target} HTTP/1.1\r\nHost: example.com\r\n\r\n")
                 .into_bytes(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         }
     }
 
@@ -690,6 +712,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header,
             body_length: BodyLength::Chunked,
+            raw_target: String::new(),
         };
         let mut client = tokio::io::empty();
 
@@ -726,6 +749,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header,
             body_length: BodyLength::Chunked,
+            raw_target: String::new(),
         };
         let mut client = tokio::io::empty();
 
@@ -754,6 +778,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header,
             body_length: BodyLength::Chunked,
+            raw_target: String::new(),
         };
         let mut client = tokio::io::empty();
         let info = inspect_graphql_request(&mut client, &mut req, DEFAULT_MAX_BODY_BYTES)
@@ -796,6 +821,7 @@ network_policies:
         let ctx = crate::l7::relay::L7EvalContext {
             host: "host.openshell.internal".to_string(),
             port: 8080,
+            http_default_port: 80,
             policy_name: "test_graphql_l7".to_string(),
             binary_path: "/usr/bin/python3".to_string(),
             ancestors: Vec::new(),
@@ -804,6 +830,7 @@ network_policies:
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
+            upstream_ip: None,
         };
         let request_info = crate::l7::L7RequestInfo {
             action: req.action,

@@ -71,6 +71,10 @@ pub struct SandboxConfig {
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
     generation: Arc<AtomicU64>,
+    /// Monotonic credential reservations for this supervisor lifetime. Policy
+    /// removal revokes endpoint authorization but must not make retained old
+    /// resolver generations available to unrelated endpoints.
+    sticky_reserved_credential_keys: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
@@ -147,12 +151,14 @@ impl OpaEngine {
             .add_policy_from_file(policy_path)
             .map_err(|e| miette::miette!("{e}"))?;
         let data_json = preprocess_yaml_data(&yaml_str)?;
+        let reserved_keys = credential_keys_from_data_json(&data_json)?;
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
             generation: Arc::new(AtomicU64::new(0)),
+            sticky_reserved_credential_keys: Arc::new(Mutex::new(reserved_keys)),
         })
     }
 
@@ -165,12 +171,14 @@ impl OpaEngine {
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|e| miette::miette!("{e}"))?;
         let data_json = preprocess_yaml_data(data_yaml)?;
+        let reserved_keys = credential_keys_from_data_json(&data_json)?;
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
             generation: Arc::new(AtomicU64::new(0)),
+            sticky_reserved_credential_keys: Arc::new(Mutex::new(reserved_keys)),
         })
     }
 
@@ -225,6 +233,7 @@ impl OpaEngine {
         crate::l7::expand_access_presets(&mut data);
 
         let data_json = data.to_string();
+        let reserved_keys = credential_keys_from_data_json(&data_json)?;
         let mut engine = regorus::Engine::new();
         engine
             .add_policy("policy.rego".into(), BAKED_POLICY_RULES.into())
@@ -235,6 +244,7 @@ impl OpaEngine {
         Ok(Self {
             engine: Mutex::new(engine),
             generation: Arc::new(AtomicU64::new(0)),
+            sticky_reserved_credential_keys: Arc::new(Mutex::new(reserved_keys)),
         })
     }
 
@@ -379,6 +389,11 @@ impl OpaEngine {
     /// expansion) to maintain consistency with `from_strings()`.
     pub fn reload(&self, policy: &str, data_yaml: &str) -> Result<()> {
         let new = Self::from_strings(policy, data_yaml)?;
+        let new_reserved_keys = new
+            .sticky_reserved_credential_keys
+            .lock()
+            .map_err(|_| miette::miette!("reserved credential key lock poisoned"))?
+            .clone();
         let new_engine = new
             .engine
             .into_inner()
@@ -387,7 +402,12 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let mut reserved_keys = self
+            .sticky_reserved_credential_keys
+            .lock()
+            .map_err(|_| miette::miette!("reserved credential key lock poisoned"))?;
         *engine = new_engine;
+        reserved_keys.extend(new_reserved_keys);
         self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -414,6 +434,11 @@ impl OpaEngine {
     ) -> Result<()> {
         // Build a complete new engine through the same validated pipeline.
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
+        let new_reserved_keys = new
+            .sticky_reserved_credential_keys
+            .lock()
+            .map_err(|_| miette::miette!("reserved credential key lock poisoned"))?
+            .clone();
         let new_engine = new
             .engine
             .into_inner()
@@ -422,7 +447,12 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let mut reserved_keys = self
+            .sticky_reserved_credential_keys
+            .lock()
+            .map_err(|_| miette::miette!("reserved credential key lock poisoned"))?;
         *engine = new_engine;
+        reserved_keys.extend(new_reserved_keys);
         self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
@@ -546,6 +576,90 @@ impl OpaEngine {
             regorus::Value::Array(values) => Ok((values.to_vec(), generation)),
             other => Ok((vec![other], generation)),
         }
+    }
+
+    /// Query endpoint configs that control transport security for a host:port.
+    /// MCP origins deliberately include every matching MCP config regardless
+    /// of caller binary so a broader policy cannot hide a TLS requirement.
+    pub fn query_transport_endpoint_configs_with_generation(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(Vec<regorus::Value>, u64)> {
+        let ancestor_strs: Vec<String> = input
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let cmdline_strs: Vec<String> = input
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let input_json = serde_json::json!({
+            "exec": {
+                "path": input.binary_path.to_string_lossy(),
+                "ancestors": ancestor_strs,
+                "cmdline_paths": cmdline_strs,
+            },
+            "network": {
+                "host": input.host,
+                "port": input.port,
+            }
+        });
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+        let value = engine
+            .eval_rule("data.openshell.sandbox._transport_endpoint_configs".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        match value {
+            regorus::Value::Undefined => Ok((Vec::new(), generation)),
+            regorus::Value::Array(values) => Ok((values.to_vec(), generation)),
+            other => Ok((vec![other], generation)),
+        }
+    }
+
+    /// Return all credential env keys reserved by the effective policy.
+    pub fn query_reserved_credential_keys_with_generation(&self) -> Result<(Vec<String>, u64)> {
+        let generation = self.current_generation();
+        let mut keys: Vec<String> = self
+            .sticky_reserved_credential_keys
+            .lock()
+            .map_err(|_| miette::miette!("reserved credential key lock poisoned"))?
+            .iter()
+            .cloned()
+            .collect();
+        keys.sort();
+        Ok((keys, generation))
+    }
+
+    /// Ingest gateway-persisted credential reservations. This union is
+    /// intentionally monotonic for the supervisor lifetime; policy removal
+    /// revokes authorization but never restores legacy global resolution.
+    pub fn reserve_credential_keys(&self, keys: &[String]) -> Result<()> {
+        let mut reserved = self
+            .sticky_reserved_credential_keys
+            .lock()
+            .map_err(|_| miette::miette!("reserved credential key lock poisoned"))?;
+        let changed = keys.iter().any(|key| reserved.insert(key.clone()));
+        if changed {
+            // Existing tunnels may hold resolver snapshots from before this
+            // reservation existed. Invalidate them even if policy reload is
+            // deferred or fails.
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(())
+    }
+
+    /// Invalidate active tunnels around credential binding/environment swaps.
+    pub fn invalidate_credential_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Query `allowed_ips` from the matched endpoint config for a given request.
@@ -760,6 +874,41 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     crate::l7::expand_access_presets(&mut data);
 
     serde_json::to_string(&data).map_err(|e| miette::miette!("failed to serialize data: {e}"))
+}
+
+fn credential_keys_from_data_json(data_json: &str) -> Result<std::collections::HashSet<String>> {
+    let data: serde_json::Value = serde_json::from_str(data_json)
+        .map_err(|error| miette::miette!("failed to inspect credential reservations: {error}"))?;
+    let mut keys = std::collections::HashSet::new();
+    let Some(policies) = data
+        .get("network_policies")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Ok(keys);
+    };
+    for policy in policies.values() {
+        let Some(endpoints) = policy
+            .get("endpoints")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for endpoint in endpoints {
+            let Some(endpoint_keys) = endpoint
+                .get("credential_keys")
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for key in endpoint_keys {
+                let Some(key) = key.as_str() else {
+                    return Err(miette::miette!("credential key must be a string"));
+                };
+                keys.insert(key.to_string());
+            }
+        }
+    }
+    Ok(keys)
 }
 
 /// Normalize endpoint port/ports in JSON data.
@@ -1271,6 +1420,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     }
                     if e.request_body_credential_rewrite {
                         ep["request_body_credential_rewrite"] = true.into();
+                    }
+                    if !e.credential_keys.is_empty() {
+                        ep["credential_keys"] = e.credential_keys.clone().into();
                     }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
@@ -2564,6 +2716,9 @@ network_policies:
         let engine = OpaEngine {
             engine: Mutex::new(rego),
             generation: Arc::new(AtomicU64::new(0)),
+            sticky_reserved_credential_keys: Arc::new(Mutex::new(
+                std::collections::HashSet::default(),
+            )),
         };
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",

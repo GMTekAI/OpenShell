@@ -1714,6 +1714,8 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 credential_expires_at_ms: HashMap::default(),
             }),
             credential_expires_at_ms: HashMap::default(),
+            expected_provider_id: String::new(),
+            expected_resource_version: 0,
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
@@ -1741,7 +1743,11 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     };
 
     tokio::spawn(async move {
-        let req = openshell_core::proto::DeleteProviderRequest { name };
+        let req = openshell_core::proto::DeleteProviderRequest {
+            name,
+            expected_provider_id: String::new(),
+            expected_resource_version: 0,
+        };
         match tokio::time::timeout(Duration::from_secs(5), client.delete_provider(req)).await {
             Ok(Ok(resp)) => {
                 let _ = tx.send(Event::ProviderDeleteResult(Ok(resp.into_inner().deleted)));

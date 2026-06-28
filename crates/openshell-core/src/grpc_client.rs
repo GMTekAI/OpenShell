@@ -564,13 +564,32 @@ async fn connect_inference(endpoint: &str) -> Result<InferenceClient<AuthedChann
 /// or `Ok(None)` when the sandbox was created without a policy (the sandbox
 /// should discover one from disk or use the restrictive default).
 pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<ProtoSandboxPolicy>> {
+    Ok(fetch_policy_snapshot(endpoint, sandbox_id).await?.policy)
+}
+
+/// Coherent config metadata returned with a sandbox policy.
+///
+/// Startup callers retain this snapshot while fetching provider credentials,
+/// then re-read it before activation to detect policy/provider interleaving.
+#[derive(Debug, Clone)]
+pub struct SandboxConfigSnapshot {
+    pub policy: Option<ProtoSandboxPolicy>,
+    pub policy_hash: String,
+    pub config_revision: u64,
+    pub provider_env_revision: u64,
+}
+
+pub async fn fetch_policy_snapshot(
+    endpoint: &str,
+    sandbox_id: &str,
+) -> Result<SandboxConfigSnapshot> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to OpenShell server");
 
     let mut client = connect(endpoint).await?;
 
     debug!("Connected, fetching sandbox policy");
 
-    fetch_policy_with_client(&mut client, sandbox_id).await
+    fetch_policy_snapshot_with_client(&mut client, sandbox_id).await
 }
 
 /// Fetch sandbox policy using an existing client connection.
@@ -578,6 +597,15 @@ async fn fetch_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
     sandbox_id: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
+    Ok(fetch_policy_snapshot_with_client(client, sandbox_id)
+        .await?
+        .policy)
+}
+
+async fn fetch_policy_snapshot_with_client(
+    client: &mut OpenShellClient<AuthedChannel>,
+    sandbox_id: &str,
+) -> Result<SandboxConfigSnapshot> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -587,14 +615,17 @@ async fn fetch_policy_with_client(
 
     let inner = response.into_inner();
 
-    // version 0 with no policy means the sandbox was created without one.
-    if inner.version == 0 && inner.policy.is_none() {
-        return Ok(None);
+    if inner.version != 0 && inner.policy.is_none() {
+        return Err(miette::miette!(
+            "Server returned non-zero version but empty policy"
+        ));
     }
-
-    Ok(Some(inner.policy.ok_or_else(|| {
-        miette::miette!("Server returned non-zero version but empty policy")
-    })?))
+    Ok(SandboxConfigSnapshot {
+        policy: inner.policy,
+        policy_hash: inner.policy_hash,
+        config_revision: inner.config_revision,
+        provider_env_revision: inner.provider_env_revision,
+    })
 }
 
 /// Sync a locally-discovered policy using an existing client connection.
@@ -687,6 +718,10 @@ pub async fn fetch_provider_environment(
         provider_env_revision: inner.provider_env_revision,
         credential_expires_at_ms: inner.credential_expires_at_ms,
         dynamic_credentials: inner.dynamic_credentials,
+        reserved_credential_keys: inner.reserved_credential_keys,
+        credential_reservation_revision: inner.credential_reservation_revision,
+        credential_provider_ids: inner.credential_provider_ids,
+        environment_provider_ids: inner.environment_provider_ids,
     })
 }
 
@@ -718,6 +753,10 @@ pub struct ProviderEnvironmentResult {
     pub provider_env_revision: u64,
     pub credential_expires_at_ms: HashMap<String, i64>,
     pub dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+    pub reserved_credential_keys: Vec<String>,
+    pub credential_reservation_revision: u64,
+    pub credential_provider_ids: HashMap<String, String>,
+    pub environment_provider_ids: HashMap<String, String>,
 }
 
 impl CachedOpenShellClient {

@@ -12,9 +12,11 @@
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
-use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
+use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
 use openshell_core::net::is_internal_ip;
+#[cfg(test)]
+use openshell_core::proto::SandboxProviderCredentialBinding;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -70,6 +72,10 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
+use super::credential_reservations::{
+    load_credential_reservations, persist_policy_credential_reservations,
+    reject_credential_keys_outside_sandbox_policy,
+};
 use super::validation::{
     level_matches, source_matches, validate_no_reserved_provider_policy_keys,
     validate_policy_safety, validate_static_fields_unchanged,
@@ -896,6 +902,7 @@ async fn auto_approve_chunk(
     // touching state; the calling site logs this as `warn!` and leaves the
     // chunk pending.
     require_no_global_policy(state).await?;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
 
     let chunk = state
         .store
@@ -1005,6 +1012,35 @@ async fn current_effective_policy_for_sandbox(
     Ok(policy)
 }
 
+/// Load only the sandbox-owned base policy used to establish an exact
+/// credential/provider binding. Global policy and provider-derived layers are
+/// deliberately excluded; `credential_keys` are rejected in those sources.
+pub(super) async fn sandbox_base_policy_for_credential_binding(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<ProtoSandboxPolicy, Status> {
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
+        return Err(Status::failed_precondition(
+            "endpoint-scoped credential activation requires a sandbox-scoped base policy; a global policy is active",
+        ));
+    }
+    if let Some(record) = state
+        .store
+        .get_latest_policy(sandbox.object_id())
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox policy failed: {error}")))?
+    {
+        return ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+            .map_err(|error| Status::internal(format!("decode sandbox policy failed: {error}")));
+    }
+    Ok(sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy.clone())
+        .unwrap_or_default())
+}
+
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
     let mut chars = input.chars();
     let truncated: String = chars.by_ref().take(max_chars).collect();
@@ -1096,16 +1132,30 @@ pub(super) async fn handle_get_sandbox_config(
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
+    // This also serializes legacy reservation backfill with live policy
+    // mutations. The reservation write is intentionally ordered before the
+    // policy is returned to the runtime.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let sandbox = state
         .store
         .get_message::<Sandbox>(&sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox_object_id = sandbox.object_id().to_string();
+    let sandbox_resource_version = sandbox
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
     let sandbox_provider_names = sandbox
         .spec
         .as_ref()
         .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
+    let credential_bindings = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.provider_credential_bindings.clone())
         .unwrap_or_default();
 
     // Try to get the latest policy from the policy history table.
@@ -1145,6 +1195,17 @@ pub(super) async fn handle_get_sandbox_config(
                 (None, 0, String::new())
             }
             Some(spec_policy) => {
+                // This policy is already authoritative in SandboxSpec but has
+                // no history row yet. Expand the durable reservation union
+                // before making that policy discoverable through version-1
+                // history so another gateway/runtime can never observe the
+                // credential-bearing policy first.
+                persist_policy_credential_reservations(
+                    state.store.as_ref(),
+                    &sandbox_id,
+                    &spec_policy,
+                )
+                .await?;
                 let hash = deterministic_policy_hash(&spec_policy);
                 let payload = spec_policy.encode_to_vec();
                 let policy_id = uuid::Uuid::new_v4().to_string();
@@ -1181,6 +1242,25 @@ pub(super) async fn handle_get_sandbox_config(
         }
     };
 
+    if let Some(base_policy) = policy.as_ref() {
+        persist_policy_credential_reservations(state.store.as_ref(), &sandbox_id, base_policy)
+            .await?;
+    }
+
+    let credential_reservations =
+        load_credential_reservations(state.store.as_ref(), &sandbox_id).await?;
+    let expected_provider_ids = credential_bindings
+        .iter()
+        .map(|binding| (binding.provider_name.clone(), binding.provider_id.clone()))
+        .collect::<HashMap<_, _>>();
+    let provider_snapshot = super::provider::load_provider_environment_snapshot(
+        state.store.as_ref(),
+        &sandbox_provider_names,
+        &expected_provider_ids,
+        credential_reservations.revision,
+        &credential_bindings,
+    )
+    .await?;
     let global_settings = load_global_settings(state.store.as_ref()).await?;
     let sandbox_settings =
         load_sandbox_settings(state.store.as_ref(), sandbox.object_name()).await?;
@@ -1209,8 +1289,7 @@ pub(super) async fn handle_get_sandbox_config(
         && !matches!(policy_source, PolicySource::Global)
         && let Some(source_policy) = policy.as_ref()
     {
-        let provider_layers =
-            profile_provider_policy_layers(state.store.as_ref(), &sandbox_provider_names).await?;
+        let provider_layers = provider_snapshot.policy_layers();
         if !provider_layers.is_empty() {
             let effective_policy = compose_effective_policy(source_policy, &provider_layers);
             policy_hash = deterministic_policy_hash(&effective_policy);
@@ -1220,8 +1299,36 @@ pub(super) async fn handle_get_sandbox_config(
 
     let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
     let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
-    let provider_env_revision =
-        compute_provider_env_revision(state.store.as_ref(), &sandbox_provider_names).await?;
+    let provider_env_revision = provider_snapshot.provider_env_revision;
+
+    provider_snapshot.revalidate(state.store.as_ref()).await?;
+    let current_reservations =
+        load_credential_reservations(state.store.as_ref(), &sandbox_id).await?;
+    if current_reservations != credential_reservations {
+        return Err(Status::aborted(
+            "credential reservations changed while sandbox config snapshot was assembled; retry",
+        ));
+    }
+    let current_sandbox = state
+        .store
+        .get_message::<Sandbox>(&sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("revalidate sandbox failed: {error}")))?
+        .ok_or_else(|| {
+            Status::aborted("sandbox was deleted while config snapshot was assembled; retry")
+        })?;
+    let current_sandbox_resource_version = current_sandbox
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    if current_sandbox.object_id() != sandbox_object_id
+        || current_sandbox_resource_version != sandbox_resource_version
+    {
+        return Err(Status::aborted(
+            "sandbox attachments changed while config snapshot was assembled; retry",
+        ));
+    }
+    provider_snapshot.revalidate(state.store.as_ref()).await?;
 
     Ok(Response::new(GetSandboxConfigResponse {
         policy,
@@ -1235,88 +1342,26 @@ pub(super) async fn handle_get_sandbox_config(
     }))
 }
 
+#[cfg(test)]
 pub(super) async fn compute_provider_env_revision(
     store: &Store,
     provider_names: &[String],
+    credential_reservation_revision: u64,
+    credential_bindings: &[SandboxProviderCredentialBinding],
 ) -> Result<u64, Status> {
-    let mut hasher = Sha256::new();
-    hasher.update(b"openshell-provider-env-revision-v1");
-
-    for provider_name in provider_names {
-        hasher.update(provider_name.as_bytes());
-        match store
-            .get_by_name(Provider::object_type(), provider_name)
-            .await
-            .map_err(|e| {
-                Status::internal(format!("fetch provider '{provider_name}' failed: {e}"))
-            })? {
-            Some(record) => {
-                hasher.update(record.id.as_bytes());
-                hasher.update(record.updated_at_ms.to_le_bytes());
-
-                let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
-                    Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
-                })?;
-                hasher.update(provider.r#type.as_bytes());
-                hash_provider_profile_revision(store, &provider.r#type, &mut hasher).await?;
-
-                let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
-                credential_keys.sort();
-                for key in credential_keys {
-                    hasher.update(key.as_bytes());
-                }
-                let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
-                expiry_keys.sort();
-                for key in expiry_keys {
-                    hasher.update(key.as_bytes());
-                    hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
-                }
-            }
-            None => {
-                hasher.update(b"missing");
-            }
-        }
-    }
-
-    let digest = hasher.finalize();
-    Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
-        |_| Status::internal("provider env revision digest too short"),
-    )?))
-}
-
-async fn hash_provider_profile_revision(
-    store: &Store,
-    provider_type: &str,
-    hasher: &mut Sha256,
-) -> Result<(), Status> {
-    if let Some(profile) = get_default_profile(provider_type) {
-        hasher.update(b"builtin-profile");
-        hasher.update(profile.to_proto().encode_to_vec());
-        return Ok(());
-    }
-
-    hasher.update(b"custom-profile");
-    match store
-        .get_by_name(
-            openshell_core::proto::StoredProviderProfile::object_type(),
-            provider_type,
-        )
-        .await
-        .map_err(|e| {
-            Status::internal(format!(
-                "fetch provider profile '{provider_type}' failed: {e}"
-            ))
-        })? {
-        Some(record) => {
-            hasher.update(record.id.as_bytes());
-            hasher.update(record.updated_at_ms.to_le_bytes());
-            hasher.update(record.payload.as_slice());
-        }
-        None => {
-            hasher.update(b"missing");
-        }
-    }
-    Ok(())
+    let expected_provider_ids = credential_bindings
+        .iter()
+        .map(|binding| (binding.provider_name.clone(), binding.provider_id.clone()))
+        .collect::<HashMap<_, _>>();
+    Ok(super::provider::load_provider_environment_snapshot(
+        store,
+        provider_names,
+        &expected_provider_ids,
+        credential_reservation_revision,
+        credential_bindings,
+    )
+    .await?
+    .provider_env_revision)
 }
 
 async fn profile_provider_policy_layers(
@@ -1397,23 +1442,99 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     drop(request);
 
+    // A policy mutation cannot interleave between reservation load and
+    // provider resolution. The response carries reservations alongside the
+    // credentials so the runtime can install the former first.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let sandbox = state
         .store
         .get_message::<Sandbox>(&sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox_object_id = sandbox.object_id().to_string();
+    let sandbox_resource_version = sandbox
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
 
     let spec = sandbox
         .spec
         .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
     let provider_names = spec.providers;
-    let provider_env_revision =
-        compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let provider_environment =
-        super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
-            .await?;
+    let credential_bindings = spec.provider_credential_bindings;
+    let credential_reservations =
+        load_credential_reservations(state.store.as_ref(), &sandbox_id).await?;
+    let expected_provider_ids = credential_bindings
+        .iter()
+        .map(|binding| (binding.provider_name.clone(), binding.provider_id.clone()))
+        .collect::<HashMap<_, _>>();
+    let provider_snapshot = super::provider::load_provider_environment_snapshot(
+        state.store.as_ref(),
+        &provider_names,
+        &expected_provider_ids,
+        credential_reservations.revision,
+        &credential_bindings,
+    )
+    .await?;
+    let provider_env_revision = provider_snapshot.provider_env_revision;
+    let provider_environment = &provider_snapshot.environment;
+    let mut credential_provider_ids = HashMap::new();
+    for binding in &credential_bindings {
+        for key in &binding.credential_keys {
+            if provider_environment.environment_provider_ids.get(key) == Some(&binding.provider_id)
+            {
+                credential_provider_ids.insert(key.clone(), binding.provider_id.clone());
+            } else {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    provider_name = %binding.provider_name,
+                    provider_id = %binding.provider_id,
+                    credential_key = %key,
+                    "ignoring stale or unavailable credential provider binding"
+                );
+            }
+        }
+    }
+
+    // Cross-replica mutations do not share the local sandbox sync guard. Check
+    // every object record that contributed bytes to this response, then check
+    // the reservation and sandbox CAS versions. A changed input aborts the
+    // snapshot instead of returning credentials under a mismatched revision.
+    provider_snapshot.revalidate(state.store.as_ref()).await?;
+    let current_reservations =
+        load_credential_reservations(state.store.as_ref(), &sandbox_id).await?;
+    if current_reservations != credential_reservations {
+        return Err(Status::aborted(
+            "credential reservations changed while provider environment snapshot was assembled; retry",
+        ));
+    }
+    let current_sandbox = state
+        .store
+        .get_message::<Sandbox>(&sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("revalidate sandbox failed: {error}")))?
+        .ok_or_else(|| {
+            Status::aborted(
+                "sandbox was deleted while provider environment snapshot was assembled; retry",
+            )
+        })?;
+    let current_sandbox_resource_version = current_sandbox
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    if current_sandbox.object_id() != sandbox_object_id
+        || current_sandbox_resource_version != sandbox_resource_version
+    {
+        return Err(Status::aborted(
+            "sandbox attachments changed while provider environment snapshot was assembled; retry",
+        ));
+    }
+    // Revalidate provider/profile records once more after the sandbox check so
+    // a provider mutation racing that check cannot be mislabeled as this
+    // response's immutable snapshot.
+    provider_snapshot.revalidate(state.store.as_ref()).await?;
 
     info!(
         sandbox_id = %sandbox_id,
@@ -1424,10 +1545,14 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     );
 
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
-        environment: provider_environment.environment,
+        environment: provider_snapshot.environment.environment,
         provider_env_revision,
-        credential_expires_at_ms: provider_environment.credential_expires_at_ms,
-        dynamic_credentials: provider_environment.dynamic_credentials,
+        credential_expires_at_ms: provider_snapshot.environment.credential_expires_at_ms,
+        dynamic_credentials: provider_snapshot.environment.dynamic_credentials,
+        reserved_credential_keys: credential_reservations.reserved_credential_keys,
+        credential_reservation_revision: credential_reservations.revision,
+        credential_provider_ids,
+        environment_provider_ids: provider_snapshot.environment.environment_provider_ids,
     }))
 }
 
@@ -1510,6 +1635,7 @@ async fn handle_update_config_inner(
             openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             validate_policy_safety(&new_policy)?;
+            reject_credential_keys_outside_sandbox_policy(&new_policy, "global policy")?;
 
             let payload = new_policy.encode_to_vec();
             let hash = deterministic_policy_hash(&new_policy);
@@ -1735,6 +1861,7 @@ async fn handle_update_config_inner(
     }
 
     if has_merge_ops {
+        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
         let global_settings = load_global_settings(state.store.as_ref()).await?;
         if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
             return Err(Status::failed_precondition(
@@ -1799,6 +1926,7 @@ async fn handle_update_config_inner(
     }
 
     // Sandbox-scoped policy update.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let mut new_policy = req
         .policy
         .ok_or_else(|| Status::invalid_argument("policy is required"))?;
@@ -1827,12 +1955,20 @@ async fn handle_update_config_inner(
         validate_no_reserved_provider_policy_keys(&new_policy)?;
     }
 
+    validate_policy_safety(&new_policy)?;
     if let Some(baseline_policy) = spec.policy.as_ref() {
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
-        validate_policy_safety(&new_policy)?;
-    } else {
+    }
+
+    // Persist first. A crash after this write can only over-reserve; the
+    // inverse ordering could expose a policy through spec/history without a
+    // durable restart reservation.
+    let reservation_snapshot =
+        persist_policy_credential_reservations(state.store.as_ref(), &sandbox_id, &new_policy)
+            .await?;
+
+    if spec.policy.is_none() {
         // Backfill spec.policy using CAS (first-time policy discovery)
-        let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
         let sandbox_id = sandbox.object_id().to_string();
         let new_policy_clone = new_policy.clone();
         state
@@ -1896,6 +2032,8 @@ async fn handle_update_config_inner(
         sandbox_id = %sandbox_id,
         version = next_version,
         policy_hash = %hash,
+        credential_reservation_revision = reservation_snapshot.revision,
+        reserved_credential_key_count = reservation_snapshot.reserved_credential_keys.len(),
         "UpdateConfig: new policy version persisted"
     );
     emit_full_policy_update_success(sandbox_caller, next_version);
@@ -2541,6 +2679,7 @@ async fn handle_approve_draft_chunk_inner(
     }
 
     require_no_global_policy(state).await?;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
 
     let sandbox = state
         .store
@@ -2735,6 +2874,7 @@ async fn handle_approve_all_draft_chunks_inner(
     }
 
     require_no_global_policy(state).await?;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
 
     let sandbox = state
         .store
@@ -3490,6 +3630,7 @@ fn map_policy_merge_error(error: openshell_policy::PolicyMergeError) -> Status {
     match error {
         openshell_policy::PolicyMergeError::MissingRuleNameForAddRule
         | openshell_policy::PolicyMergeError::InvalidEndpointReference { .. }
+        | openshell_policy::PolicyMergeError::DuplicateCredentialKey { .. }
         | openshell_policy::PolicyMergeError::UnsupportedAccessPreset { .. } => {
             Status::invalid_argument(error.to_string())
         }
@@ -3529,6 +3670,10 @@ async fn apply_merge_operations_with_retry(
             validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         }
         validate_policy_safety(&new_policy)?;
+
+        // See the full-policy path above: reservation expansion is always
+        // persisted before a policy revision that introduced it.
+        persist_policy_credential_reservations(store, sandbox_id, &new_policy).await?;
 
         if let Some(ref current) = latest
             && current.policy_hash == hash
@@ -3609,6 +3754,7 @@ async fn remove_chunk_from_policy(
     sandbox_id: &str,
     chunk: &DraftChunkRecord,
 ) -> Result<(i64, String), Status> {
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     apply_merge_operations_with_retry(
         state.store.as_ref(),
         sandbox_id,
@@ -4756,11 +4902,10 @@ mod tests {
             .put_message(&test_provider("legacy-generic", "generic"))
             .await
             .unwrap();
-        state
-            .store
-            .put_message(&test_provider("custom-provider", "custom"))
-            .await
-            .unwrap();
+        let mut custom_provider = test_provider("custom-provider", "custom");
+        custom_provider.credentials =
+            HashMap::from([("CUSTOM_TOKEN".to_string(), "custom-test".to_string())]);
+        state.store.put_message(&custom_provider).await.unwrap();
         state
             .store
             .put_message(&test_sandbox(
@@ -4826,6 +4971,43 @@ mod tests {
             !persisted_policy
                 .network_policies
                 .contains_key("_provider_work_github")
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_lazy_backfill_persists_credential_reservation() {
+        let state = test_server_state().await;
+        let mut policy = test_policy_with_rule("mcp", "mcp.example.com");
+        policy.network_policies.get_mut("mcp").unwrap().endpoints[0].credential_keys =
+            vec!["MCP_TOKEN".to_string()];
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-reservation-backfill",
+                "reservation-backfill",
+                policy,
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let _ = get_sandbox_policy(&state, "sb-reservation-backfill").await;
+
+        let reservations =
+            load_credential_reservations(state.store.as_ref(), "sb-reservation-backfill")
+                .await
+                .unwrap();
+        assert_eq!(reservations.reserved_credential_keys, vec!["MCP_TOKEN"]);
+        assert!(reservations.revision > 0);
+        assert!(reservations.object_id.is_some());
+        assert!(
+            state
+                .store
+                .get_latest_policy("sb-reservation-backfill")
+                .await
+                .unwrap()
+                .is_some(),
+            "version-1 history should be visible only after reservation persistence"
         );
     }
 
@@ -5171,10 +5353,14 @@ mod tests {
             .await
             .unwrap();
 
-        let first =
-            compute_provider_env_revision(state.store.as_ref(), &["work-custom-token".to_string()])
-                .await
-                .unwrap();
+        let first = compute_provider_env_revision(
+            state.store.as_ref(),
+            &["work-custom-token".to_string()],
+            0,
+            &[],
+        )
+        .await
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(2)).await;
         let mut rotated_profile = token_grant_profile("https://auth.example.com/rotated-token")
@@ -5204,10 +5390,14 @@ mod tests {
         .await
         .unwrap();
 
-        let second =
-            compute_provider_env_revision(state.store.as_ref(), &["work-custom-token".to_string()])
-                .await
-                .unwrap();
+        let second = compute_provider_env_revision(
+            state.store.as_ref(),
+            &["work-custom-token".to_string()],
+            0,
+            &[],
+        )
+        .await
+        .unwrap();
 
         assert_ne!(
             first, second,
@@ -5221,7 +5411,7 @@ mod tests {
             handle_attach_sandbox_provider, handle_detach_sandbox_provider,
         };
         use openshell_core::proto::{
-            AttachSandboxProviderRequest, DetachSandboxProviderRequest,
+            AttachSandboxProviderRequest, DetachSandboxProviderRequest, GetSandboxConfigRequest,
             GetSandboxProviderEnvironmentRequest,
         };
 
@@ -5265,6 +5455,9 @@ mod tests {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             })),
         )
         .await
@@ -5294,6 +5487,19 @@ mod tests {
             attached_env.environment.get("GITHUB_TOKEN"),
             Some(&"ghp-test".to_string())
         );
+        let attached_config = handle_get_sandbox_config(
+            &state,
+            with_user(Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-attach-lifecycle".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            attached_config.provider_env_revision, attached_env.provider_env_revision,
+            "config and environment must attest the same immutable provider snapshot"
+        );
 
         handle_detach_sandbox_provider(
             &state,
@@ -5301,6 +5507,8 @@ mod tests {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             }),
         )
         .await
@@ -5427,6 +5635,9 @@ mod tests {
                 sandbox_name: "custom-attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
+                credential_keys: Vec::new(),
             })),
         )
         .await
@@ -5466,6 +5677,8 @@ mod tests {
                 sandbox_name: "custom-attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
+                expected_provider_id: String::new(),
+                expected_provider_resource_version: 0,
             }),
         )
         .await

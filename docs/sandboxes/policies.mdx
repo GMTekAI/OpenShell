@@ -584,7 +584,11 @@ REST rules can also constrain query parameter values:
 
 MCP endpoints use `protocol: mcp`. The proxy parses sandbox-to-server MCP Streamable HTTP request bodies, validates known MCP request and notification params, can evaluate the MCP method against rule `method`, and can match tool calls with the `tool` alias. Unknown extension methods stay addressable as literal method strings. Until OpenShell exposes MCP version profiles, `mcp.allow_all_known_mcp_methods` defaults to `false`, so endpoints require explicit MCP method rules. Set `mcp.allow_all_known_mcp_methods: true` to enable the endpoint method profile; in that mode, rules can omit `method`, and tool selectors are normalized to `tools/call` internally. By default, MCP `tools/call` tool names must match `^[A-Za-z0-9_.-]{1,128}$`; set `mcp.strict_tool_names: false` on that endpoint only when a server intentionally uses names outside the MCP-recommended pattern. Wildcard `tool` matchers require `mcp.strict_tool_names` to remain enabled. Generic JSON-RPC endpoints use `protocol: json-rpc` and evaluate `method`.
 
-MCP endpoints must declare a concrete destination with `host` and `port` or `ports`. A policy entry that only sets `protocol: mcp` is invalid and is not treated as a wildcard MCP authorization. Use `path: /mcp` when the server's MCP endpoint is path-scoped; omitting `path` matches every HTTP path on that host and port.
+MCP endpoints must declare a concrete destination with `host` and `port` or `ports`. A policy entry that only sets `protocol: mcp` is invalid and is not treated as a wildcard MCP authorization. Use `path: /mcp` when the server's MCP endpoint is path-scoped; omitting `path` matches every HTTP path on that host and port. MCP request targets containing a query delimiter are rejected before credential replacement or any upstream write.
+
+Set `tls: require` on credential-bearing authenticated MCP endpoints. This mode accepts only CONNECT tunnels that begin with a TLS ClientHello, requires certificate-validated TLS to the upstream, and denies plaintext HTTP, h2c, unsupported tunnel protocols, unavailable TLS state, and non-CONNECT forward requests. OpenShell does not fall back to a raw relay when required TLS setup or validation fails. Before credential replacement, OpenShell also requires an origin-form request target and exactly one valid `Host` header that matches the policy-bound host and HTTPS effective port.
+
+Declare `credential_keys` only when the endpoint has one literal host, port, and path, uses `enforcement: enforce`, and sets `tls: require`. OpenShell durably reserves each declared key for the sandbox object's lifetime, including after policy removal. The key becomes active only when an exact provider ID and resource version is attached with the same credential key. It then resolves only as a single `Authorization: Bearer <placeholder>` value on a request authorized by that MCP endpoint. Global and provider-derived policies cannot declare `credential_keys`, and broader REST or L4 rules cannot authorize a reserved key.
 
 MCP policy enforcement is directional. It applies to HTTP request bodies sent by the sandboxed process to the configured endpoint. JSON-RPC responses and server-to-client MCP messages carried on response bodies or SSE streams are relayed but are not currently parsed for policy enforcement.
 
@@ -598,7 +602,9 @@ MCP and JSON-RPC endpoint policies currently require full policy YAML applied wi
         port: 443
         path: /mcp
         protocol: mcp
+        tls: require
         enforcement: enforce
+        credential_keys: [MCP_TOKEN]
         mcp:
           max_body_bytes: 131072
         rules:

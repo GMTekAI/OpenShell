@@ -3,7 +3,7 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::secrets::SecretResolver;
+use crate::secrets::{CredentialScopeState, SecretResolver, SharedCredentialScopeState};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 
@@ -23,6 +23,7 @@ struct ProviderCredentialStateInner {
     current_resolver: Option<Arc<SecretResolver>>,
     combined_resolver: Option<Arc<SecretResolver>>,
     suppressed_keys: HashSet<String>,
+    credential_scope: SharedCredentialScopeState,
 }
 
 #[derive(Debug, Clone)]
@@ -37,11 +38,37 @@ impl ProviderCredentialState {
         credential_expires_at_ms: HashMap<String, i64>,
         dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> Self {
+        Self::from_environment_with_scope(
+            revision,
+            env,
+            credential_expires_at_ms,
+            dynamic_credentials,
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
+    pub fn from_environment_with_scope(
+        revision: u64,
+        env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+        reserved_credential_keys: Vec<String>,
+        credential_provider_ids: HashMap<String, String>,
+        environment_provider_ids: HashMap<String, String>,
+    ) -> Self {
+        let credential_scope = Arc::new(RwLock::new(CredentialScopeState {
+            reserved_credential_keys: reserved_credential_keys.into_iter().collect(),
+            active_provider_ids: credential_provider_ids,
+        }));
         let (child_env, generation_resolver, current_resolver) =
-            SecretResolver::from_provider_env_for_current_revision(
+            SecretResolver::from_provider_env_for_current_revision_with_scope(
                 env,
                 credential_expires_at_ms,
                 revision,
+                &environment_provider_ids,
+                Arc::clone(&credential_scope),
             );
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             revision,
@@ -59,6 +86,7 @@ impl ProviderCredentialState {
                 current_resolver,
                 combined_resolver,
                 suppressed_keys: HashSet::new(),
+                credential_scope,
             })),
         }
     }
@@ -77,6 +105,59 @@ impl ProviderCredentialState {
             .expect("provider credential state poisoned")
             .combined_resolver
             .clone()
+    }
+
+    /// Whether this supervisor has observed any gateway-reserved credential
+    /// keys. Reservations are monotonic for the lifetime of the process, so a
+    /// policy change can revoke or reassign authorization for these keys even
+    /// when the provider environment revision itself is unchanged.
+    pub fn has_reserved_credential_keys(&self) -> bool {
+        let credential_scope = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned")
+            .credential_scope
+            .clone();
+        !credential_scope
+            .read()
+            .expect("credential scope state poisoned")
+            .reserved_credential_keys
+            .is_empty()
+    }
+
+    /// Monotonically reserve credential keys without activating provider
+    /// bindings or installing a new secret generation. Existing resolvers
+    /// consult this shared state on every resolution, so reservation takes
+    /// effect immediately even when a later policy reload fails.
+    pub fn reserve_credential_keys(&self, keys: &[String]) {
+        let credential_scope = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned")
+            .credential_scope
+            .clone();
+        credential_scope
+            .write()
+            .expect("credential scope state poisoned")
+            .reserved_credential_keys
+            .extend(keys.iter().cloned());
+    }
+
+    /// Fail closed while a fetched provider/binding revision waits for policy
+    /// validation. Activation resumes only when the complete environment is
+    /// installed successfully.
+    pub fn deactivate_reserved_credentials(&self) {
+        let credential_scope = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned")
+            .credential_scope
+            .clone();
+        credential_scope
+            .write()
+            .expect("credential scope state poisoned")
+            .active_provider_ids
+            .clear();
     }
 
     /// Remove a key from the credential snapshot's child env.
@@ -205,11 +286,59 @@ impl ProviderCredentialState {
         credential_expires_at_ms: HashMap<String, i64>,
         dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
     ) -> usize {
+        self.install_environment_with_scope(
+            revision,
+            env,
+            credential_expires_at_ms,
+            dynamic_credentials,
+            &[],
+            None,
+            HashMap::new(),
+        )
+    }
+
+    /// Install a credential generation after atomically updating the live
+    /// reservation/provider binding state. Retained resolvers and active
+    /// connections share this state, so detach or rebind takes effect on the
+    /// next placeholder resolution without reconnecting.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the complete provider snapshot must be installed atomically"
+    )]
+    pub fn install_environment_with_scope(
+        &self,
+        revision: u64,
+        env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        dynamic_credentials: HashMap<String, crate::proto::ProviderProfileCredential>,
+        reserved_credential_keys: &[String],
+        credential_provider_ids: Option<HashMap<String, String>>,
+        environment_provider_ids: HashMap<String, String>,
+    ) -> usize {
+        let credential_scope = self
+            .inner
+            .read()
+            .expect("provider credential state poisoned")
+            .credential_scope
+            .clone();
+        {
+            let mut scope = credential_scope
+                .write()
+                .expect("credential scope state poisoned");
+            scope
+                .reserved_credential_keys
+                .extend(reserved_credential_keys.iter().cloned());
+            if let Some(active_provider_ids) = credential_provider_ids {
+                scope.active_provider_ids = active_provider_ids;
+            }
+        }
         let (mut child_env, generation_resolver, current_resolver) =
-            SecretResolver::from_provider_env_for_current_revision(
+            SecretResolver::from_provider_env_for_current_revision_with_scope(
                 env,
                 credential_expires_at_ms,
                 revision,
+                &environment_provider_ids,
+                credential_scope,
             );
         let mut inner = self
             .inner
@@ -591,6 +720,176 @@ mod tests {
         assert!(
             !state.snapshot().child_env.contains_key("GCE_METADATA_HOST"),
             "suppressed key must not reappear after install_environment"
+        );
+    }
+
+    fn bound_credential_state(
+        active_provider_id: Option<&str>,
+        source_provider_id: &str,
+    ) -> ProviderCredentialState {
+        ProviderCredentialState::from_environment_with_scope(
+            1,
+            HashMap::from([
+                ("MCP_TOKEN".to_string(), "provider-a-secret".to_string()),
+                ("OTHER_KEY".to_string(), "unbound-secret".to_string()),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            vec!["MCP_TOKEN".to_string()],
+            active_provider_id
+                .map(|provider_id| {
+                    HashMap::from([("MCP_TOKEN".to_string(), provider_id.to_string())])
+                })
+                .unwrap_or_default(),
+            HashMap::from([("MCP_TOKEN".to_string(), source_provider_id.to_string())]),
+        )
+    }
+
+    #[test]
+    fn bound_credential_requires_exact_live_provider_binding() {
+        for active_provider_id in [None, Some("provider-B")] {
+            let state = bound_credential_state(active_provider_id, "provider-A");
+            let placeholder = state.snapshot().child_env["MCP_TOKEN"].clone();
+            let scoped = state
+                .resolver()
+                .expect("resolver")
+                .scoped_to_credential_keys(&["MCP_TOKEN".to_string()], true);
+            assert_eq!(
+                scoped.resolve_placeholder(&placeholder),
+                None,
+                "missing or mismatched live binding must fail closed"
+            );
+        }
+
+        let state = bound_credential_state(Some("provider-A"), "provider-A");
+        let placeholder = state.snapshot().child_env["MCP_TOKEN"].clone();
+        let scoped = state
+            .resolver()
+            .expect("resolver")
+            .scoped_to_credential_keys(&["MCP_TOKEN".to_string()], true);
+        assert_eq!(
+            scoped.resolve_placeholder(&placeholder),
+            Some("provider-a-secret")
+        );
+    }
+
+    #[test]
+    fn credential_bound_scope_is_exclusive_but_legacy_scope_remains_compatible() {
+        let state = bound_credential_state(Some("provider-A"), "provider-A");
+        let snapshot = state.snapshot();
+        let token_placeholder = snapshot.child_env["MCP_TOKEN"].clone();
+        let other_placeholder = snapshot.child_env["OTHER_KEY"].clone();
+        let resolver = state.resolver().expect("resolver");
+
+        let exclusive = resolver.scoped_to_credential_keys(&["MCP_TOKEN".to_string()], true);
+        assert_eq!(
+            exclusive.resolve_placeholder(&token_placeholder),
+            Some("provider-a-secret")
+        );
+        assert_eq!(exclusive.resolve_placeholder(&other_placeholder), None);
+
+        let legacy = resolver.scoped_to_credential_keys(&[], false);
+        assert_eq!(
+            legacy.resolve_placeholder(&other_placeholder),
+            Some("unbound-secret")
+        );
+        assert_eq!(legacy.resolve_placeholder(&token_placeholder), None);
+    }
+
+    #[test]
+    fn retained_generation_cannot_cross_provider_rebind_or_detach() {
+        let state = bound_credential_state(Some("provider-A"), "provider-A");
+        let old_placeholder = state.snapshot().child_env["MCP_TOKEN"].clone();
+        let retained_connection = state
+            .resolver()
+            .expect("resolver")
+            .scoped_to_credential_keys(&["MCP_TOKEN".to_string()], true);
+        assert_eq!(
+            retained_connection.resolve_placeholder(&old_placeholder),
+            Some("provider-a-secret")
+        );
+
+        state.install_environment_with_scope(
+            2,
+            HashMap::from([("MCP_TOKEN".to_string(), "provider-b-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            &["MCP_TOKEN".to_string()],
+            Some(HashMap::from([(
+                "MCP_TOKEN".to_string(),
+                "provider-B".to_string(),
+            )])),
+            HashMap::from([("MCP_TOKEN".to_string(), "provider-B".to_string())]),
+        );
+
+        assert_eq!(
+            retained_connection.resolve_placeholder(&old_placeholder),
+            None,
+            "provider-A generation must stop resolving immediately after rebind"
+        );
+        let new_placeholder = state.snapshot().child_env["MCP_TOKEN"].clone();
+        let rebound_connection = state
+            .resolver()
+            .expect("resolver")
+            .scoped_to_credential_keys(&["MCP_TOKEN".to_string()], true);
+        assert_eq!(
+            rebound_connection.resolve_placeholder(&new_placeholder),
+            Some("provider-b-secret")
+        );
+
+        state.deactivate_reserved_credentials();
+        assert_eq!(
+            rebound_connection.resolve_placeholder(&new_placeholder),
+            None
+        );
+        assert_eq!(
+            retained_connection.resolve_placeholder(&old_placeholder),
+            None
+        );
+    }
+
+    #[test]
+    fn credential_reservations_are_monotonic_for_state_lifetime() {
+        let state = ProviderCredentialState::from_environment(
+            1,
+            HashMap::from([("MCP_TOKEN".to_string(), "legacy-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let placeholder = state.snapshot().child_env["MCP_TOKEN"].clone();
+        assert_eq!(
+            state
+                .resolver()
+                .expect("resolver")
+                .resolve_placeholder(&placeholder),
+            Some("legacy-secret")
+        );
+
+        state.reserve_credential_keys(&["MCP_TOKEN".to_string()]);
+        assert_eq!(
+            state
+                .resolver()
+                .expect("resolver")
+                .resolve_placeholder(&placeholder),
+            None
+        );
+        state.install_environment_with_scope(
+            2,
+            HashMap::from([("MCP_TOKEN".to_string(), "new-secret".to_string())]),
+            HashMap::new(),
+            HashMap::new(),
+            &[],
+            Some(HashMap::new()),
+            HashMap::new(),
+        );
+        let new_placeholder = state.snapshot().child_env["MCP_TOKEN"].clone();
+        assert_eq!(
+            state
+                .resolver()
+                .expect("resolver")
+                .resolve_placeholder(&new_placeholder),
+            None,
+            "policy or provider removal must not unreserve the key"
         );
     }
 }

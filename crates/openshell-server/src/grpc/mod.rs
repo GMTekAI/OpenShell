@@ -4,6 +4,7 @@
 //! gRPC service implementation.
 
 mod auth_rpc;
+mod credential_reservations;
 pub mod policy;
 pub mod provider;
 mod sandbox;
@@ -201,6 +202,7 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
+            capabilities: vec!["authenticated-mcp-policy-bound-credential-rewrite-v1".to_string()],
         }))
     }
 

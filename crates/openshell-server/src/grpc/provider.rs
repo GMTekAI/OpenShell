@@ -6,16 +6,19 @@
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
 use crate::persistence::{
-    ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
+    ObjectId, ObjectLabels, ObjectName, ObjectRecord, ObjectType, SetResourceVersion, Store,
+    WriteCondition, generate_name,
 };
 use openshell_core::proto::{
     Provider, ProviderCredentialTokenGrantAudienceOverride, ProviderProfile,
-    ProviderProfileCredential, Sandbox,
+    ProviderProfileCredential, Sandbox, SandboxProviderCredentialBinding,
+    StoredProviderCredentialRefreshState,
 };
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
 };
 use prost::Message;
+use sha2::{Digest, Sha256};
 use tonic::Status;
 use tracing::warn;
 
@@ -42,8 +45,239 @@ fn redact_provider_credentials(mut provider: Provider) -> Provider {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ProviderEnvironment {
     pub environment: std::collections::HashMap<String, String>,
+    pub environment_provider_ids: std::collections::HashMap<String, String>,
     pub credential_expires_at_ms: std::collections::HashMap<String, i64>,
     pub dynamic_credentials: std::collections::HashMap<String, ProviderProfileCredential>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionedObjectSnapshot {
+    object_type: String,
+    name: String,
+    record: Option<VersionedObjectRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VersionedObjectRecord {
+    id: String,
+    resource_version: u64,
+    updated_at_ms: i64,
+    payload: Vec<u8>,
+}
+
+impl VersionedObjectSnapshot {
+    fn from_record(object_type: &str, name: &str, record: Option<&ObjectRecord>) -> Self {
+        Self {
+            object_type: object_type.to_string(),
+            name: name.to_string(),
+            record: record.map(|record| VersionedObjectRecord {
+                id: record.id.clone(),
+                resource_version: record.resource_version,
+                updated_at_ms: record.updated_at_ms,
+                payload: record.payload.clone(),
+            }),
+        }
+    }
+
+    async fn revalidate(&self, store: &Store) -> Result<(), Status> {
+        let current = store
+            .get_by_name(&self.object_type, &self.name)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "revalidate '{}' '{}' failed: {error}",
+                    self.object_type, self.name
+                ))
+            })?;
+        let current = Self::from_record(&self.object_type, &self.name, current.as_ref());
+        if current != *self {
+            return Err(Status::aborted(format!(
+                "{} '{}' changed while provider environment snapshot was assembled; retry",
+                self.object_type, self.name
+            )));
+        }
+        Ok(())
+    }
+
+    fn hash_into(&self, hasher: &mut Sha256, prefix: &[u8]) {
+        hash_snapshot_bytes(hasher, b"object-prefix", prefix);
+        hash_snapshot_bytes(hasher, b"object-type", self.object_type.as_bytes());
+        hash_snapshot_bytes(hasher, b"object-name", self.name.as_bytes());
+        match &self.record {
+            Some(record) => {
+                hash_snapshot_bytes(hasher, b"object-state", b"present");
+                hash_snapshot_bytes(hasher, b"object-id", record.id.as_bytes());
+                hash_snapshot_u64(hasher, b"object-resource-version", record.resource_version);
+                hash_snapshot_bytes(
+                    hasher,
+                    b"object-updated-at-ms",
+                    &record.updated_at_ms.to_le_bytes(),
+                );
+                hash_snapshot_bytes(hasher, b"object-payload", &record.payload);
+            }
+            None => hash_snapshot_bytes(hasher, b"object-state", b"missing"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum ProviderProfileSnapshotSource {
+    Builtin(Vec<u8>),
+    Custom(VersionedObjectSnapshot),
+}
+
+#[derive(Debug, Clone)]
+struct ProviderProfileSnapshot {
+    id: String,
+    profile: Option<ProviderProfile>,
+    source: ProviderProfileSnapshotSource,
+}
+
+impl ProviderProfileSnapshot {
+    async fn revalidate(&self, store: &Store) -> Result<(), Status> {
+        if let ProviderProfileSnapshotSource::Custom(record) = &self.source {
+            record.revalidate(store).await?;
+        }
+        Ok(())
+    }
+
+    fn hash_into(&self, hasher: &mut Sha256) {
+        hash_snapshot_bytes(hasher, b"profile-id", self.id.as_bytes());
+        match &self.source {
+            ProviderProfileSnapshotSource::Builtin(payload) => {
+                hash_snapshot_bytes(hasher, b"profile-source", b"builtin");
+                hash_snapshot_bytes(hasher, b"profile-payload", payload);
+            }
+            ProviderProfileSnapshotSource::Custom(record) => {
+                hash_snapshot_bytes(hasher, b"profile-source", b"custom");
+                record.hash_into(hasher, b"profile-record");
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefreshScopeSnapshot {
+    provider_id: String,
+    records: Vec<VersionedObjectSnapshot>,
+}
+
+impl RefreshScopeSnapshot {
+    async fn load(store: &Store, provider_id: &str) -> Result<Self, Status> {
+        let object_type = StoredProviderCredentialRefreshState::object_type();
+        let mut records = store
+            .list_by_scope(object_type, provider_id, 1000, 0)
+            .await
+            .map_err(|error| {
+                Status::internal(format!(
+                    "list provider refresh state snapshot failed: {error}"
+                ))
+            })?;
+        records.sort_by(|left, right| (&left.name, &left.id).cmp(&(&right.name, &right.id)));
+        Ok(Self {
+            provider_id: provider_id.to_string(),
+            records: records
+                .iter()
+                .map(|record| {
+                    VersionedObjectSnapshot::from_record(object_type, &record.name, Some(record))
+                })
+                .collect(),
+        })
+    }
+
+    async fn revalidate(&self, store: &Store) -> Result<(), Status> {
+        let current = Self::load(store, &self.provider_id).await?;
+        if current != *self {
+            return Err(Status::aborted(format!(
+                "provider refresh state for '{}' changed while provider environment snapshot was assembled; retry",
+                self.provider_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn credential_keys(&self) -> Result<Vec<String>, Status> {
+        let mut keys = Vec::new();
+        for record in &self.records {
+            let Some(record) = &record.record else {
+                continue;
+            };
+            let state = StoredProviderCredentialRefreshState::decode(record.payload.as_slice())
+                .map_err(|error| {
+                    Status::internal(format!(
+                        "decode provider refresh state snapshot failed: {error}"
+                    ))
+                })?;
+            if is_valid_env_key(&state.credential_key) {
+                keys.push(state.credential_key);
+            }
+        }
+        Ok(keys)
+    }
+
+    fn hash_into(&self, hasher: &mut Sha256) {
+        hash_snapshot_bytes(hasher, b"refresh-provider-id", self.provider_id.as_bytes());
+        hash_snapshot_u64(hasher, b"refresh-record-count", self.records.len() as u64);
+        for record in &self.records {
+            record.hash_into(hasher, b"refresh-record");
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProviderEnvironmentSnapshot {
+    pub environment: ProviderEnvironment,
+    pub provider_env_revision: u64,
+    providers: Vec<Provider>,
+    provider_records: Vec<VersionedObjectSnapshot>,
+    profiles: std::collections::BTreeMap<String, ProviderProfileSnapshot>,
+    refresh_scopes: Vec<RefreshScopeSnapshot>,
+}
+
+impl ProviderEnvironmentSnapshot {
+    pub fn policy_layers(&self) -> Vec<openshell_policy::ProviderPolicyLayer> {
+        let mut layers = Vec::new();
+        for provider in &self.providers {
+            let Some(profile) = self
+                .profiles
+                .get(&provider_profile_id(provider))
+                .and_then(|snapshot| snapshot.profile.as_ref())
+            else {
+                continue;
+            };
+            let profile = ProviderTypeProfile::from_proto(profile);
+            let rule_name = openshell_policy::provider_rule_name(provider.object_name());
+            layers.push(openshell_policy::ProviderPolicyLayer {
+                rule: profile.network_policy_rule(&rule_name),
+                rule_name,
+            });
+        }
+        layers
+    }
+
+    pub async fn revalidate(&self, store: &Store) -> Result<(), Status> {
+        for provider in &self.provider_records {
+            provider.revalidate(store).await?;
+        }
+        for profile in self.profiles.values() {
+            profile.revalidate(store).await?;
+        }
+        for refresh_scope in &self.refresh_scopes {
+            refresh_scope.revalidate(store).await?;
+        }
+        Ok(())
+    }
+}
+
+fn hash_snapshot_bytes(hasher: &mut Sha256, tag: &[u8], value: &[u8]) {
+    hasher.update((tag.len() as u64).to_le_bytes());
+    hasher.update(tag);
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn hash_snapshot_u64(hasher: &mut Sha256, tag: &[u8], value: u64) {
+    hash_snapshot_bytes(hasher, tag, &value.to_le_bytes());
 }
 
 impl ProviderEnvironment {
@@ -177,6 +411,35 @@ pub(super) async fn update_provider_record(
     store: &Store,
     provider: Provider,
 ) -> Result<Provider, Status> {
+    update_provider_record_with_preconditions(store, provider, "", 0).await
+}
+
+pub(super) fn validate_provider_preconditions(
+    provider: &Provider,
+    expected_provider_id: &str,
+    expected_resource_version: u64,
+) -> Result<(), Status> {
+    if !expected_provider_id.is_empty() && provider.object_id() != expected_provider_id {
+        return Err(Status::aborted(format!(
+            "provider identity changed concurrently (expected id: {expected_provider_id}, current id: {})",
+            provider.object_id()
+        )));
+    }
+    let current_resource_version = provider.metadata.as_ref().map_or(0, |m| m.resource_version);
+    if expected_resource_version != 0 && current_resource_version != expected_resource_version {
+        return Err(Status::aborted(format!(
+            "provider was modified concurrently (expected resource_version: {expected_resource_version}, current resource_version: {current_resource_version})"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) async fn update_provider_record_with_preconditions(
+    store: &Store,
+    provider: Provider,
+    expected_provider_id: &str,
+    explicit_expected_resource_version: u64,
+) -> Result<Provider, Status> {
     use crate::persistence::{ObjectId, ObjectName};
 
     if provider.object_name().is_empty() {
@@ -184,7 +447,13 @@ pub(super) async fn update_provider_record(
     }
 
     // Extract expected version from provider metadata
-    let expected_resource_version = provider.metadata.as_ref().map_or(0, |m| m.resource_version);
+    let metadata_expected_resource_version =
+        provider.metadata.as_ref().map_or(0, |m| m.resource_version);
+    let expected_resource_version = if explicit_expected_resource_version == 0 {
+        metadata_expected_resource_version
+    } else {
+        explicit_expected_resource_version
+    };
 
     // Resolve provider ID from name for CAS update
     let existing = store
@@ -195,6 +464,7 @@ pub(super) async fn update_provider_record(
     let Some(existing) = existing else {
         return Err(Status::not_found("provider not found"));
     };
+    validate_provider_preconditions(&existing, expected_provider_id, expected_resource_version)?;
 
     // Provider type is immutable after creation. Reject if the caller
     // sends a non-empty type that differs from the existing one.
@@ -282,6 +552,15 @@ pub(super) async fn update_provider_record(
 }
 
 pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<bool, Status> {
+    delete_provider_record_with_preconditions(store, name, "", 0).await
+}
+
+pub(super) async fn delete_provider_record_with_preconditions(
+    store: &Store,
+    name: &str,
+    expected_provider_id: &str,
+    expected_resource_version: u64,
+) -> Result<bool, Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -293,6 +572,7 @@ pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<
     else {
         return Ok(false);
     };
+    validate_provider_preconditions(&provider, expected_provider_id, expected_resource_version)?;
 
     let blocking_sandboxes = sandboxes_using_provider(store, name).await?;
     if !blocking_sandboxes.is_empty() {
@@ -302,13 +582,26 @@ pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<
         )));
     }
 
-    crate::provider_refresh::delete_refresh_states_for_provider(store, provider.object_id())
-        .await?;
-
-    store
-        .delete_by_name(Provider::object_type(), name)
+    let provider_id = provider.object_id().to_string();
+    let current_resource_version = provider.metadata.as_ref().map_or(0, |m| m.resource_version);
+    let cas_version = if expected_resource_version == 0 {
+        current_resource_version
+    } else {
+        expected_resource_version
+    };
+    let deleted = store
+        .delete_if(Provider::object_type(), &provider_id, cas_version)
         .await
-        .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
+        .map_err(|e| super::persistence_error_to_status(e, "delete provider"))?;
+    if !deleted && (!expected_provider_id.is_empty() || expected_resource_version != 0) {
+        return Err(Status::aborted(
+            "provider identity changed concurrently before delete",
+        ));
+    }
+    if deleted {
+        crate::provider_refresh::delete_refresh_states_for_provider(store, &provider_id).await?;
+    }
+    Ok(deleted)
 }
 
 /// Iterate over every `Sandbox` in the store and collect items produced by
@@ -435,25 +728,244 @@ pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
 ) -> Result<ProviderEnvironment, Status> {
-    if provider_names.is_empty() {
-        return Ok(ProviderEnvironment::default());
-    }
+    resolve_provider_environment_with_expected_ids(
+        store,
+        provider_names,
+        &std::collections::HashMap::new(),
+    )
+    .await
+}
 
-    let mut env = std::collections::HashMap::new();
-    let mut expires = std::collections::HashMap::new();
-    let now_ms = crate::persistence::current_time_ms();
-    validate_provider_environment_keys_unique_at(store, provider_names, None, now_ms).await?;
-    let registry = openshell_providers::ProviderRegistry::new();
+pub(super) async fn resolve_provider_environment_with_expected_ids(
+    store: &Store,
+    provider_names: &[String],
+    expected_provider_ids: &std::collections::HashMap<String, String>,
+) -> Result<ProviderEnvironment, Status> {
+    let snapshot =
+        load_provider_environment_snapshot(store, provider_names, expected_provider_ids, 0, &[])
+            .await?;
+    if let Some(missing) = snapshot
+        .provider_records
+        .iter()
+        .find(|record| record.record.is_none())
+    {
+        return Err(Status::failed_precondition(format!(
+            "provider '{}' not found",
+            missing.name
+        )));
+    }
+    Ok(snapshot.environment)
+}
+
+pub(super) async fn load_provider_environment_snapshot(
+    store: &Store,
+    provider_names: &[String],
+    expected_provider_ids: &std::collections::HashMap<String, String>,
+    credential_reservation_revision: u64,
+    credential_bindings: &[SandboxProviderCredentialBinding],
+) -> Result<ProviderEnvironmentSnapshot, Status> {
+    let mut provider_records = Vec::with_capacity(provider_names.len());
+    let mut providers = Vec::with_capacity(provider_names.len());
+    let mut profiles = std::collections::BTreeMap::new();
+    let mut refresh_scopes = Vec::with_capacity(provider_names.len());
 
     for name in provider_names {
-        let provider = store
-            .get_message_by_name::<Provider>(name)
+        let record = store
+            .get_by_name(Provider::object_type(), name)
             .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+            .map_err(|error| {
+                Status::internal(format!("failed to fetch provider '{name}': {error}"))
+            })?;
+        provider_records.push(VersionedObjectSnapshot::from_record(
+            Provider::object_type(),
+            name,
+            record.as_ref(),
+        ));
+        let Some(record) = record else {
+            warn!(
+                provider_name = %name,
+                "excluding missing provider from fail-closed environment snapshot"
+            );
+            continue;
+        };
+
+        let mut provider = Provider::decode(record.payload.as_slice()).map_err(|error| {
+            Status::internal(format!("decode provider '{name}' failed: {error}"))
+        })?;
+        provider.set_resource_version(record.resource_version);
+        if provider.object_id() != record.id || provider.object_name() != record.name {
+            return Err(Status::internal(format!(
+                "provider '{name}' persistence metadata does not match its object record"
+            )));
+        }
+
+        if let Some(expected_provider_id) = expected_provider_ids.get(name)
+            && record.id != *expected_provider_id
+        {
+            warn!(
+                provider_name = %name,
+                expected_provider_id = %expected_provider_id,
+                current_provider_id = %record.id,
+                "excluding provider whose immutable ID does not match scoped binding"
+            );
+            continue;
+        }
+
+        let profile_id = provider_profile_id(&provider);
+        if !profiles.contains_key(&profile_id) {
+            profiles.insert(
+                profile_id.clone(),
+                load_provider_profile_snapshot(store, &profile_id).await?,
+            );
+        }
+        refresh_scopes.push(RefreshScopeSnapshot::load(store, provider.object_id()).await?);
+        providers.push(provider);
+    }
+
+    let now_ms = crate::persistence::current_time_ms();
+    validate_provider_environment_snapshot_unique(&providers, &profiles, &refresh_scopes, now_ms)?;
+
+    let environment = build_provider_environment_from_snapshot(&providers, &profiles, now_ms);
+    let provider_env_revision = compute_provider_environment_snapshot_revision(
+        provider_names,
+        expected_provider_ids,
+        credential_reservation_revision,
+        credential_bindings,
+        &provider_records,
+        &profiles,
+        &refresh_scopes,
+    )?;
+
+    Ok(ProviderEnvironmentSnapshot {
+        environment,
+        provider_env_revision,
+        providers,
+        provider_records,
+        profiles,
+        refresh_scopes,
+    })
+}
+
+fn provider_profile_id(provider: &Provider) -> String {
+    normalize_provider_type(&provider.r#type)
+        .unwrap_or(provider.r#type.as_str())
+        .to_string()
+}
+
+async fn load_provider_profile_snapshot(
+    store: &Store,
+    profile_id: &str,
+) -> Result<ProviderProfileSnapshot, Status> {
+    if let Some(profile) = get_default_profile(profile_id) {
+        let profile = profile.to_proto();
+        return Ok(ProviderProfileSnapshot {
+            id: profile_id.to_string(),
+            source: ProviderProfileSnapshotSource::Builtin(profile.encode_to_vec()),
+            profile: Some(profile),
+        });
+    }
+
+    let Some(normalized_id) = normalize_profile_id(profile_id) else {
+        return Ok(ProviderProfileSnapshot {
+            id: profile_id.to_string(),
+            source: ProviderProfileSnapshotSource::Builtin(Vec::new()),
+            profile: None,
+        });
+    };
+    let record = store
+        .get_by_name(StoredProviderProfile::object_type(), &normalized_id)
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "fetch provider profile '{normalized_id}' failed: {error}"
+            ))
+        })?;
+    let object_snapshot = VersionedObjectSnapshot::from_record(
+        StoredProviderProfile::object_type(),
+        &normalized_id,
+        record.as_ref(),
+    );
+    let profile = if let Some(record) = record {
+        let mut stored =
+            StoredProviderProfile::decode(record.payload.as_slice()).map_err(|error| {
+                Status::internal(format!(
+                    "decode provider profile '{normalized_id}' failed: {error}"
+                ))
+            })?;
+        stored.set_resource_version(record.resource_version);
+        if stored.object_id() != record.id || stored.object_name() != record.name {
+            return Err(Status::internal(format!(
+                "provider profile '{normalized_id}' persistence metadata does not match its object record"
+            )));
+        }
+        stored
+            .profile
+            .map(|profile| profile_response_payload(profile, record.resource_version))
+    } else {
+        None
+    };
+    Ok(ProviderProfileSnapshot {
+        id: normalized_id,
+        profile,
+        source: ProviderProfileSnapshotSource::Custom(object_snapshot),
+    })
+}
+
+fn validate_provider_environment_snapshot_unique(
+    providers: &[Provider],
+    profiles: &std::collections::BTreeMap<String, ProviderProfileSnapshot>,
+    refresh_scopes: &[RefreshScopeSnapshot],
+    now_ms: i64,
+) -> Result<(), Status> {
+    let mut seen = std::collections::HashMap::<String, String>::new();
+    let mut dynamic_bindings = Vec::new();
+    for (provider, refresh_scope) in providers.iter().zip(refresh_scopes) {
+        let provider_name = provider.object_name().to_string();
+        let mut keys = active_provider_credential_keys(provider, now_ms);
+        keys.extend(refresh_scope.credential_keys()?);
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            if let Some(first_provider) = seen.get(&key) {
+                if first_provider != &provider_name {
+                    return Err(Status::failed_precondition(format!(
+                        "credential env key '{key}' is provided by both provider '{first_provider}' and provider '{provider_name}'; use provider-specific env names"
+                    )));
+                }
+            } else {
+                seen.insert(key, provider_name.clone());
+            }
+        }
+
+        if let Some(profile) = profiles
+            .get(&provider_profile_id(provider))
+            .and_then(|snapshot| snapshot.profile.as_ref())
+        {
+            dynamic_bindings.extend(dynamic_token_grant_bindings_for_profile(
+                &provider_name,
+                profile,
+            ));
+        }
+    }
+    validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)
+}
+
+fn build_provider_environment_from_snapshot(
+    providers: &[Provider],
+    profiles: &std::collections::BTreeMap<String, ProviderProfileSnapshot>,
+    now_ms: i64,
+) -> ProviderEnvironment {
+    let mut env = std::collections::HashMap::new();
+    let mut environment_provider_ids = std::collections::HashMap::new();
+    let mut expires = std::collections::HashMap::new();
+    let registry = openshell_providers::ProviderRegistry::new();
+
+    for provider in providers {
+        let name = provider.object_name();
+        let provider_id = provider.object_id().to_string();
 
         for (key, value) in &provider.credentials {
-            if is_non_injectable_provider_credential(&provider, key) {
+            if is_non_injectable_provider_credential(provider, key) {
                 warn!(
                     provider_name = %name,
                     key = %key,
@@ -479,7 +991,10 @@ pub(super) async fn resolve_provider_environment(
                 if expires_at_ms > 0 {
                     expires.entry(key.clone()).or_insert(expires_at_ms);
                 }
-                env.entry(key.clone()).or_insert_with(|| value.clone());
+                if let std::collections::hash_map::Entry::Vacant(entry) = env.entry(key.clone()) {
+                    entry.insert(value.clone());
+                    environment_provider_ids.insert(key.clone(), provider_id.clone());
+                }
             } else {
                 warn!(
                     provider_name = %name,
@@ -489,56 +1004,132 @@ pub(super) async fn resolve_provider_environment(
             }
         }
 
-        registry.inject_env(&provider, &mut env);
+        let keys_before_profile_injection = env
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        registry.inject_env(provider, &mut env);
+        for key in env.keys() {
+            if !keys_before_profile_injection.contains(key) {
+                environment_provider_ids.insert(key.clone(), provider_id.clone());
+            }
+        }
     }
 
-    Ok(ProviderEnvironment {
+    ProviderEnvironment {
         environment: env,
+        environment_provider_ids,
         credential_expires_at_ms: expires,
-        dynamic_credentials: resolve_dynamic_credentials(store, provider_names).await?,
-    })
+        dynamic_credentials: resolve_dynamic_credentials_from_snapshot(providers, profiles),
+    }
 }
 
-/// Resolve dynamic credentials (token grants) from provider profiles.
-///
-/// Returns a map of endpoint-bound keys to credential metadata for credentials
-/// that have `token_grant` configuration. Keys are internal supervisor metadata:
-/// host, port, endpoint path, and provider credential identity.
-pub(super) async fn resolve_dynamic_credentials(
-    store: &Store,
-    provider_names: &[String],
-) -> Result<std::collections::HashMap<String, ProviderProfileCredential>, Status> {
-    if provider_names.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
+fn resolve_dynamic_credentials_from_snapshot(
+    providers: &[Provider],
+    profiles: &std::collections::BTreeMap<String, ProviderProfileSnapshot>,
+) -> std::collections::HashMap<String, ProviderProfileCredential> {
     let mut dynamic_creds = std::collections::HashMap::new();
-
-    for provider_name in provider_names {
-        let provider = store
-            .get_message_by_name::<Provider>(provider_name)
-            .await
-            .map_err(|e| {
-                Status::internal(format!("failed to fetch provider '{provider_name}': {e}"))
-            })?
-            .ok_or_else(|| {
-                Status::failed_precondition(format!("provider '{provider_name}' not found"))
-            })?;
-
-        let profile_id =
-            normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
-        let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
+    for provider in providers {
+        let Some(profile) = profiles
+            .get(&provider_profile_id(provider))
+            .and_then(|snapshot| snapshot.profile.as_ref())
+        else {
             continue;
         };
+        insert_dynamic_credentials_for_profile(&mut dynamic_creds, profile, provider.object_name());
+    }
+    dynamic_creds
+}
 
-        insert_dynamic_credentials_for_profile(
-            &mut dynamic_creds,
-            &profile.to_proto(),
-            provider_name,
+fn compute_provider_environment_snapshot_revision(
+    provider_names: &[String],
+    expected_provider_ids: &std::collections::HashMap<String, String>,
+    credential_reservation_revision: u64,
+    credential_bindings: &[SandboxProviderCredentialBinding],
+    provider_records: &[VersionedObjectSnapshot],
+    profiles: &std::collections::BTreeMap<String, ProviderProfileSnapshot>,
+    refresh_scopes: &[RefreshScopeSnapshot],
+) -> Result<u64, Status> {
+    let mut hasher = Sha256::new();
+    hash_snapshot_bytes(
+        &mut hasher,
+        b"domain",
+        b"openshell-provider-environment-snapshot-v1",
+    );
+    hash_snapshot_u64(
+        &mut hasher,
+        b"credential-reservation-revision",
+        credential_reservation_revision,
+    );
+
+    let mut bindings = credential_bindings.to_vec();
+    bindings.sort_by(|left, right| {
+        (&left.provider_name, &left.provider_id).cmp(&(&right.provider_name, &right.provider_id))
+    });
+    hash_snapshot_u64(&mut hasher, b"binding-count", bindings.len() as u64);
+    for binding in bindings {
+        hash_snapshot_bytes(
+            &mut hasher,
+            b"binding-provider-name",
+            binding.provider_name.as_bytes(),
         );
+        hash_snapshot_bytes(
+            &mut hasher,
+            b"binding-provider-id",
+            binding.provider_id.as_bytes(),
+        );
+        let mut keys = binding.credential_keys;
+        keys.sort();
+        hash_snapshot_u64(&mut hasher, b"binding-key-count", keys.len() as u64);
+        for key in keys {
+            hash_snapshot_bytes(&mut hasher, b"binding-key", key.as_bytes());
+        }
     }
 
-    Ok(dynamic_creds)
+    let mut expected_ids = expected_provider_ids.iter().collect::<Vec<_>>();
+    expected_ids.sort();
+    hash_snapshot_u64(
+        &mut hasher,
+        b"expected-provider-id-count",
+        expected_ids.len() as u64,
+    );
+    for (name, id) in expected_ids {
+        hash_snapshot_bytes(&mut hasher, b"expected-provider-name", name.as_bytes());
+        hash_snapshot_bytes(&mut hasher, b"expected-provider-id", id.as_bytes());
+    }
+
+    if provider_names.len() != provider_records.len() {
+        return Err(Status::internal(
+            "provider environment snapshot record count mismatch",
+        ));
+    }
+    hash_snapshot_u64(
+        &mut hasher,
+        b"provider-record-count",
+        provider_records.len() as u64,
+    );
+    for (name, record) in provider_names.iter().zip(provider_records) {
+        hash_snapshot_bytes(&mut hasher, b"requested-provider-name", name.as_bytes());
+        record.hash_into(&mut hasher, b"provider-record");
+    }
+
+    hash_snapshot_u64(&mut hasher, b"profile-count", profiles.len() as u64);
+    for profile in profiles.values() {
+        profile.hash_into(&mut hasher);
+    }
+    hash_snapshot_u64(
+        &mut hasher,
+        b"refresh-scope-count",
+        refresh_scopes.len() as u64,
+    );
+    for refresh_scope in refresh_scopes {
+        refresh_scope.hash_into(&mut hasher);
+    }
+
+    let digest = hasher.finalize();
+    Ok(u64::from_le_bytes(digest[..8].try_into().map_err(
+        |_| Status::internal("provider environment snapshot digest too short"),
+    )?))
 }
 
 fn insert_dynamic_credentials_for_profile(
@@ -846,6 +1437,8 @@ pub async fn validate_provider_update_against_attached_sandboxes(
     provider: &Provider,
 ) -> Result<(), Status> {
     let provider_name = provider.object_name().to_string();
+    let now_ms = crate::persistence::current_time_ms();
+    let active_keys = active_provider_environment_keys(store, provider, now_ms).await?;
     for sandbox in sandboxes_using_provider_records(store, &provider_name).await? {
         let sandbox_name = sandbox.object_name().to_string();
         let Some(spec) = sandbox.spec.as_ref() else {
@@ -855,7 +1448,7 @@ pub async fn validate_provider_update_against_attached_sandboxes(
             store,
             &spec.providers,
             Some(provider),
-            crate::persistence::current_time_ms(),
+            now_ms,
         )
         .await
         .map_err(|err| {
@@ -864,6 +1457,17 @@ pub async fn validate_provider_update_against_attached_sandboxes(
                 err.message()
             ))
         })?;
+        if let Some(binding) = spec.provider_credential_bindings.iter().find(|binding| {
+            binding.provider_name == provider_name && binding.provider_id == provider.object_id()
+        }) {
+            for key in &binding.credential_keys {
+                if !active_keys.contains(key) {
+                    return Err(Status::failed_precondition(format!(
+                        "provider update would remove or expire bound credential key '{key}' on sandbox '{sandbox_name}'; detach the scoped provider binding first"
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1258,6 +1862,7 @@ pub(super) async fn handle_import_provider_profiles(
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(credential_scoping_profile_diagnostics(&profiles));
     if !has_errors(&diagnostics) {
         diagnostics.extend(
             profile_attached_sandbox_diagnostics(state.store.as_ref(), &profiles, "import").await?,
@@ -1317,6 +1922,7 @@ pub(super) async fn handle_update_provider_profiles(
         profile_update_target_diagnostics(state.store.as_ref(), &profiles, &target_id).await?,
     );
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(credential_scoping_profile_diagnostics(&profiles));
     let expected_resource_version = if request.expected_resource_version != 0 {
         Some(request.expected_resource_version)
     } else {
@@ -1418,6 +2024,7 @@ pub(super) async fn handle_lint_provider_profiles(
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
+    diagnostics.extend(credential_scoping_profile_diagnostics(&profiles));
     let valid = !has_errors(&diagnostics);
 
     Ok(Response::new(LintProviderProfilesResponse {
@@ -1621,6 +2228,27 @@ fn add_empty_profile_set_diagnostic(
             severity: "error".to_string(),
         });
     }
+}
+
+fn credential_scoping_profile_diagnostics(
+    profiles: &[(String, ProviderTypeProfile)],
+) -> Vec<ProfileValidationDiagnostic> {
+    let mut diagnostics = Vec::new();
+    for (source, profile) in profiles {
+        for (index, endpoint) in profile.to_proto().endpoints.iter().enumerate() {
+            if endpoint.credential_keys.is_empty() {
+                continue;
+            }
+            diagnostics.push(ProfileValidationDiagnostic {
+                source: source.clone(),
+                profile_id: profile.id.clone(),
+                field: format!("endpoints[{index}].credential_keys"),
+                message: "credential_keys are supported only in sandbox-scoped base policies; provider profile layers cannot reserve credentials".to_string(),
+                severity: "error".to_string(),
+            });
+        }
+    }
+    diagnostics
 }
 
 async fn profile_conflict_diagnostics(
@@ -1892,6 +2520,8 @@ pub(super) async fn handle_update_provider(
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
     let req = request.into_inner();
+    let expected_provider_id = req.expected_provider_id.clone();
+    let expected_resource_version = req.expected_resource_version;
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
             "custom",
@@ -1904,7 +2534,17 @@ pub(super) async fn handle_update_provider(
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
-    let result = update_provider_record(state.store.as_ref(), provider).await;
+    // Provider CRUD and sandbox attachment mutations share this guard. The
+    // immutable-ID check and the store CAS therefore form one same-gateway
+    // critical section instead of a client-side inspect-then-name mutation.
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
+    let result = update_provider_record_with_preconditions(
+        state.store.as_ref(),
+        provider,
+        &expected_provider_id,
+        expected_resource_version,
+    )
+    .await;
     match result {
         Ok(provider) => {
             emit_provider_lifecycle(
@@ -2262,9 +2902,22 @@ pub(super) async fn handle_delete_provider(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
-    let name = request.into_inner().name;
+    let request = request.into_inner();
+    let name = request.name;
+    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &name).await;
-    let result = delete_provider_record(state.store.as_ref(), &name).await;
+    let result =
+        if request.expected_provider_id.is_empty() && request.expected_resource_version == 0 {
+            delete_provider_record(state.store.as_ref(), &name).await
+        } else {
+            delete_provider_record_with_preconditions(
+                state.store.as_ref(),
+                &name,
+                &request.expected_provider_id,
+                request.expected_resource_version,
+            )
+            .await
+        };
     match result {
         Ok(deleted) => {
             let outcome = TelemetryOutcome::from_success(deleted);
@@ -4350,6 +5003,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_update_preconditions_reject_same_name_replacement() {
+        let store = test_store().await;
+        let original =
+            create_provider_record(&store, provider_with_values("replaceable", "gitlab"))
+                .await
+                .unwrap();
+        let original_id = original.object_id().to_string();
+        let original_version = original.metadata.as_ref().unwrap().resource_version;
+        assert!(
+            store
+                .delete_if(Provider::object_type(), &original_id, original_version)
+                .await
+                .unwrap()
+        );
+        let replacement =
+            create_provider_record(&store, provider_with_values("replaceable", "gitlab"))
+                .await
+                .unwrap();
+        assert_ne!(replacement.object_id(), original_id);
+
+        let mut update = provider_with_values("replaceable", "gitlab");
+        update
+            .credentials
+            .insert("API_TOKEN".to_string(), "must-not-apply".to_string());
+        let err = update_provider_record_with_preconditions(
+            &store,
+            update,
+            &original_id,
+            original_version,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::Aborted);
+
+        let persisted: Provider = store
+            .get_message_by_name("replaceable")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.object_id(), replacement.object_id());
+        assert_ne!(
+            persisted.credentials.get("API_TOKEN").map(String::as_str),
+            Some("must-not-apply")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_delete_preconditions_reject_same_name_replacement() {
+        let store = test_store().await;
+        let original =
+            create_provider_record(&store, provider_with_values("replaceable", "gitlab"))
+                .await
+                .unwrap();
+        let original_id = original.object_id().to_string();
+        let original_version = original.metadata.as_ref().unwrap().resource_version;
+        assert!(
+            store
+                .delete_if(Provider::object_type(), &original_id, original_version)
+                .await
+                .unwrap()
+        );
+        let replacement =
+            create_provider_record(&store, provider_with_values("replaceable", "gitlab"))
+                .await
+                .unwrap();
+
+        let err = delete_provider_record_with_preconditions(
+            &store,
+            "replaceable",
+            &original_id,
+            original_version,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::Aborted);
+        let persisted: Provider = store
+            .get_message_by_name("replaceable")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.object_id(), replacement.object_id());
+    }
+
+    #[tokio::test]
     async fn delete_provider_removes_scoped_refresh_states() {
         let store = test_store().await;
 
@@ -4980,6 +5717,175 @@ mod tests {
         let store = test_store().await;
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn provider_environment_snapshot_hash_is_sequence_unambiguous() {
+        let mut left = Sha256::new();
+        hash_snapshot_bytes(&mut left, b"first", b"ab");
+        hash_snapshot_bytes(&mut left, b"second", b"c");
+
+        let mut right = Sha256::new();
+        hash_snapshot_bytes(&mut right, b"first", b"a");
+        hash_snapshot_bytes(&mut right, b"second", b"bc");
+
+        assert_ne!(left.finalize(), right.finalize());
+    }
+
+    #[tokio::test]
+    async fn provider_environment_snapshot_rejects_same_name_replacement_identity() {
+        let store = test_store().await;
+        let original = create_provider_record(
+            &store,
+            provider_with_values("snapshot-provider", "unprofiled-static-api"),
+        )
+        .await
+        .unwrap();
+        delete_provider_record_with_preconditions(
+            &store,
+            "snapshot-provider",
+            original.object_id(),
+            original.metadata.as_ref().unwrap().resource_version,
+        )
+        .await
+        .unwrap();
+        create_provider_record(
+            &store,
+            provider_with_values("snapshot-provider", "unprofiled-static-api"),
+        )
+        .await
+        .unwrap();
+
+        let snapshot = load_provider_environment_snapshot(
+            &store,
+            &["snapshot-provider".to_string()],
+            &HashMap::from([(
+                "snapshot-provider".to_string(),
+                original.object_id().to_string(),
+            )]),
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert!(snapshot.environment.environment.is_empty());
+        assert!(snapshot.environment.environment_provider_ids.is_empty());
+        assert!(snapshot.environment.dynamic_credentials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_environment_snapshot_detects_provider_update_before_response() {
+        let store = test_store().await;
+        let original = create_provider_record(
+            &store,
+            provider_with_values("snapshot-update", "unprofiled-static-api"),
+        )
+        .await
+        .unwrap();
+        let expected_ids = HashMap::from([(
+            "snapshot-update".to_string(),
+            original.object_id().to_string(),
+        )]);
+        let snapshot = load_provider_environment_snapshot(
+            &store,
+            &["snapshot-update".to_string()],
+            &expected_ids,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        update_provider_record_with_preconditions(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: original.object_id().to_string(),
+                    name: "snapshot-update".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: original.metadata.as_ref().unwrap().resource_version,
+                }),
+                r#type: String::new(),
+                credentials: HashMap::from([("API_TOKEN".to_string(), "rotated".to_string())]),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+            original.object_id(),
+            original.metadata.as_ref().unwrap().resource_version,
+        )
+        .await
+        .unwrap();
+
+        let error = snapshot.revalidate(&store).await.unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+
+        let updated = load_provider_environment_snapshot(
+            &store,
+            &["snapshot-update".to_string()],
+            &expected_ids,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert_ne!(
+            snapshot.provider_env_revision,
+            updated.provider_env_revision
+        );
+        assert_eq!(
+            updated.environment.environment.get("API_TOKEN"),
+            Some(&"rotated".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_environment_snapshot_hashes_missing_provider_as_revocation() {
+        let store = test_store().await;
+        let original = create_provider_record(
+            &store,
+            provider_with_values("snapshot-revoked", "unprofiled-static-api"),
+        )
+        .await
+        .unwrap();
+        let expected_ids = HashMap::from([(
+            "snapshot-revoked".to_string(),
+            original.object_id().to_string(),
+        )]);
+        let active = load_provider_environment_snapshot(
+            &store,
+            &["snapshot-revoked".to_string()],
+            &expected_ids,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(active.environment.environment.contains_key("API_TOKEN"));
+
+        delete_provider_record_with_preconditions(
+            &store,
+            "snapshot-revoked",
+            original.object_id(),
+            original.metadata.as_ref().unwrap().resource_version,
+        )
+        .await
+        .unwrap();
+        let revoked = load_provider_environment_snapshot(
+            &store,
+            &["snapshot-revoked".to_string()],
+            &expected_ids,
+            1,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert!(revoked.environment.environment.is_empty());
+        assert!(revoked.environment.dynamic_credentials.is_empty());
+        assert_ne!(active.provider_env_revision, revoked.provider_env_revision);
+        revoked.revalidate(&store).await.unwrap();
     }
 
     #[tokio::test]
@@ -5843,6 +6749,8 @@ mod tests {
             Request::new(UpdateProviderRequest {
                 provider: Some(updated_provider.clone()),
                 credential_expires_at_ms: HashMap::new(),
+                expected_provider_id: String::new(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -5911,6 +6819,8 @@ mod tests {
             Request::new(UpdateProviderRequest {
                 provider: Some(stale_provider),
                 credential_expires_at_ms: HashMap::new(),
+                expected_provider_id: String::new(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -5981,6 +6891,8 @@ mod tests {
                     Request::new(UpdateProviderRequest {
                         provider: Some(updated),
                         credential_expires_at_ms: HashMap::new(),
+                        expected_provider_id: String::new(),
+                        expected_resource_version: 0,
                     }),
                 )
                 .await

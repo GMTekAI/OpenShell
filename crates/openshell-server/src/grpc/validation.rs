@@ -110,6 +110,78 @@ pub(super) fn validate_sandbox_spec(
         )));
     }
 
+    // --- gateway-owned scoped provider credential bindings ---
+    if spec.provider_credential_bindings.len() > MAX_PROVIDERS {
+        return Err(Status::invalid_argument(format!(
+            "provider_credential_bindings exceeds maximum ({} > {MAX_PROVIDERS})",
+            spec.provider_credential_bindings.len()
+        )));
+    }
+    let mut bound_provider_names = std::collections::HashSet::new();
+    let mut bound_credential_keys = std::collections::HashSet::new();
+    for binding in &spec.provider_credential_bindings {
+        if binding.provider_name.is_empty()
+            || binding.provider_name.len() > MAX_NAME_LEN
+            || !binding.provider_name.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || character == '-'
+                    || character == '_'
+                    || character == '.'
+            })
+        {
+            return Err(Status::invalid_argument(
+                "provider credential binding has invalid provider_name",
+            ));
+        }
+        if !spec.providers.contains(&binding.provider_name) {
+            return Err(Status::invalid_argument(format!(
+                "provider credential binding references unattached provider '{}'",
+                binding.provider_name
+            )));
+        }
+        if !bound_provider_names.insert(binding.provider_name.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "provider '{}' has more than one credential binding",
+                binding.provider_name
+            )));
+        }
+        let mut provider_id_chars = binding.provider_id.chars();
+        if binding.provider_id.len() > 128
+            || !provider_id_chars
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric())
+            || !provider_id_chars.all(|character| {
+                character.is_ascii_alphanumeric()
+                    || character == '-'
+                    || character == '_'
+                    || character == '.'
+                    || character == ':'
+            })
+        {
+            return Err(Status::invalid_argument(
+                "provider credential binding has invalid provider_id",
+            ));
+        }
+        if binding.credential_keys.is_empty() || binding.credential_keys.len() > 64 {
+            return Err(Status::invalid_argument(format!(
+                "provider credential binding for '{}' must contain 1 to 64 credential keys",
+                binding.provider_name
+            )));
+        }
+        for key in &binding.credential_keys {
+            if key.len() > MAX_MAP_KEY_LEN || !super::provider::is_valid_env_key(key) {
+                return Err(Status::invalid_argument(format!(
+                    "provider credential binding contains invalid credential key '{key}'"
+                )));
+            }
+            if !bound_credential_keys.insert(key.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "credential key '{key}' is bound more than once"
+                )));
+            }
+        }
+    }
+
     // --- spec.log_level ---
     if spec.log_level.len() > MAX_LOG_LEVEL_LEN {
         return Err(Status::invalid_argument(format!(

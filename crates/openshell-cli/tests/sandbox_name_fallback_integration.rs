@@ -55,6 +55,7 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: "test".to_string(),
+            capabilities: Vec::new(),
         }))
     }
 

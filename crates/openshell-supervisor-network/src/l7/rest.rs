@@ -14,6 +14,7 @@ use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::secrets::{
     SecretResolver, contains_reserved_credential_marker, rewrite_http_header_block,
+    rewrite_mcp_bearer_header_block,
 };
 use openshell_ocsf::ctx::ctx as ocsf_ctx;
 use sha1::{Digest, Sha1};
@@ -58,6 +59,7 @@ const RELAY_EOF_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[derive(Debug, Clone, Default)]
 pub struct RestProvider {
     canonicalize_options: crate::l7::path::CanonicalizeOptions,
+    require_origin_form: bool,
 }
 
 impl RestProvider {
@@ -67,6 +69,16 @@ impl RestProvider {
     pub fn with_options(canonicalize_options: crate::l7::path::CanonicalizeOptions) -> Self {
         Self {
             canonicalize_options,
+            require_origin_form: false,
+        }
+    }
+
+    pub(crate) fn with_credential_boundary(
+        canonicalize_options: crate::l7::path::CanonicalizeOptions,
+    ) -> Self {
+        Self {
+            canonicalize_options,
+            require_origin_form: true,
         }
     }
 }
@@ -76,7 +88,12 @@ impl L7Provider for RestProvider {
         &self,
         client: &mut C,
     ) -> Result<Option<L7Request>> {
-        parse_http_request(client, &self.canonicalize_options).await
+        parse_http_request_with_origin_requirement(
+            client,
+            &self.canonicalize_options,
+            self.require_origin_form,
+        )
+        .await
     }
 
     async fn relay<C, U>(
@@ -135,9 +152,18 @@ impl RestProvider {
 /// forwarded upstream without L7 policy evaluation -- a request
 /// smuggling vulnerability.  Byte-at-a-time overhead is negligible for
 /// the typical 200-800 byte headers on L7-inspected REST endpoints.
+#[cfg(test)]
 async fn parse_http_request<C: AsyncRead + Unpin>(
     client: &mut C,
     canonicalize_options: &crate::l7::path::CanonicalizeOptions,
+) -> Result<Option<L7Request>> {
+    parse_http_request_with_origin_requirement(client, canonicalize_options, false).await
+}
+
+async fn parse_http_request_with_origin_requirement<C: AsyncRead + Unpin>(
+    client: &mut C,
+    canonicalize_options: &crate::l7::path::CanonicalizeOptions,
+    require_origin_form: bool,
 ) -> Result<Option<L7Request>> {
     let mut buf = Vec::with_capacity(4096);
 
@@ -168,6 +194,8 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     // Parse request line
     let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
 
+    crate::l7::http::validate_http1_request_head(&buf[..header_end])?;
+
     // Reject bare LF in headers (must use \r\n line endings per RFC 7230).
     // Bare LF can cause parsing discrepancies between this proxy and upstream
     // servers, enabling request smuggling via header injection.
@@ -191,7 +219,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
         .next()
         .ok_or_else(|| miette!("Empty HTTP request"))?;
 
-    let mut parts = request_line.split_whitespace();
+    let mut parts = request_line.split(' ');
     let method = parts
         .next()
         .ok_or_else(|| miette!("Missing HTTP method"))?
@@ -200,11 +228,19 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
         .next()
         .ok_or_else(|| miette!("Missing HTTP path"))?
         .to_string();
+    if require_origin_form && (!target.starts_with('/') || target.starts_with("//")) {
+        return Err(miette!(
+            "credential rewrite requires an origin-form HTTP request target"
+        ));
+    }
     let version = parts
         .next()
         .ok_or_else(|| miette!("Missing HTTP version"))?;
     if version != "HTTP/1.1" && version != "HTTP/1.0" {
         return Err(miette!("Unsupported HTTP version: {version}"));
+    }
+    if parts.next().is_some() {
+        return Err(miette!("HTTP request line contains extra fields"));
     }
 
     // Determine body framing from headers
@@ -239,6 +275,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(
     Ok(Some(L7Request {
         action: method,
         target: canonical.path,
+        raw_target: target,
         query_params,
         raw_header: buf, // exact header bytes up to and including \r\n\r\n
         body_length,
@@ -399,11 +436,13 @@ where
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
+            credential_bearer_only: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: "",
             signing_region: "",
             host: "",
             port: 0,
+            http_default_port: 0,
         },
     )
     .await
@@ -422,11 +461,14 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
+    /// Restrict credential resolution to one canonical MCP Bearer auth header.
+    pub(crate) credential_bearer_only: bool,
     pub(crate) credential_signing: crate::l7::CredentialSigning,
     pub(crate) signing_service: &'a str,
     pub(crate) signing_region: &'a str,
     pub(crate) host: &'a str,
     pub(crate) port: u16,
+    pub(crate) http_default_port: u16,
 }
 
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
@@ -446,6 +488,18 @@ where
         .map_or(req.raw_header.len(), |p| p + 4);
     let header_str = std::str::from_utf8(&req.raw_header[..header_end])
         .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let credential_rewrite_active = options.resolver.is_some()
+        || options.request_body_credential_rewrite
+        || options.credential_signing.is_sigv4();
+    if credential_rewrite_active && !options.host.is_empty() && options.port > 0 {
+        crate::l7::http::validate_origin_form_request_target(&req.raw_header[..header_end])?;
+        crate::l7::http::validate_bound_host_header(
+            &req.raw_header[..header_end],
+            options.host,
+            options.port,
+            options.http_default_port,
+        )?;
+    }
     let client_requested_upgrade = client_requested_upgrade(header_str);
     let websocket_request = if options.websocket_extensions == WebSocketExtensionMode::Preserve {
         None
@@ -478,8 +532,15 @@ where
                 offered_subprotocols: request.subprotocols.clone(),
             });
 
-    let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
-        .map_err(|e| miette!("credential injection failed: {e}"))?;
+    let rewrite_result = if options.credential_bearer_only {
+        let resolver = options
+            .resolver
+            .ok_or_else(|| miette!("credential-bound MCP request has no authorized resolver"))?;
+        rewrite_mcp_bearer_header_block(&header_bytes, resolver)
+    } else {
+        rewrite_http_header_block(&header_bytes, options.resolver)
+    }
+    .map_err(|e| miette!("credential injection failed: {e}"))?;
 
     if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
@@ -1689,15 +1750,17 @@ fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
 /// `Content-Length` and `Transfer-Encoding` headers to prevent request
 /// smuggling via CL/TE ambiguity.
 pub(crate) fn parse_body_length(headers: &str) -> Result<BodyLength> {
-    let mut has_te_chunked = false;
+    let mut transfer_encoding: Option<String> = None;
     let mut cl_value: Option<u64> = None;
 
     for line in headers.lines().skip(1) {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("transfer-encoding:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            if val.split(',').any(|enc| enc.trim() == "chunked") {
-                has_te_chunked = true;
+            if transfer_encoding.replace(val.to_string()).is_some() {
+                return Err(miette!(
+                    "Request contains multiple Transfer-Encoding headers"
+                ));
             }
         }
         if lower.starts_with("content-length:") {
@@ -1716,13 +1779,23 @@ pub(crate) fn parse_body_length(headers: &str) -> Result<BodyLength> {
         }
     }
 
-    if has_te_chunked && cl_value.is_some() {
+    if transfer_encoding.is_some() && cl_value.is_some() {
         return Err(miette!(
             "Request contains both Transfer-Encoding and Content-Length headers"
         ));
     }
 
-    if has_te_chunked {
+    if let Some(transfer_encoding) = transfer_encoding {
+        let codings: Vec<&str> = transfer_encoding
+            .split(',')
+            .map(str::trim)
+            .filter(|coding| !coding.is_empty())
+            .collect();
+        if codings != ["chunked"] {
+            return Err(miette!(
+                "Request contains unsupported or ambiguous Transfer-Encoding; only a single final 'chunked' coding is supported"
+            ));
+        }
         return Ok(BodyLength::Chunked);
     }
     if let Some(len) = cl_value {
@@ -2602,6 +2675,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: raw_header.into_bytes(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         }
     }
 
@@ -2705,6 +2779,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: Vec::new(),
             body_length: BodyLength::ContentLength(128),
+            raw_target: String::new(),
         };
 
         let body = deny_response_body(
@@ -2770,6 +2845,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: Vec::new(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
 
         let body = deny_response_body(
@@ -2805,6 +2881,7 @@ mod tests {
                 query_params: HashMap::new(),
                 raw_header: Vec::new(),
                 body_length: BodyLength::ContentLength(64),
+                raw_target: String::new(),
             };
             send_deny_response(
                 &req,
@@ -3019,13 +3096,31 @@ mod tests {
         );
     }
 
-    /// SEC: Transfer-Encoding substring match must not match partial tokens.
+    /// SEC: Unsupported Transfer-Encoding tokens must fail closed.
     #[test]
-    fn te_substring_not_chunked() {
+    fn reject_unsupported_transfer_encoding() {
         let headers = "POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunkedx\r\n\r\n";
-        match parse_body_length(headers).unwrap() {
-            BodyLength::None => {}
-            other => panic!("Expected None for non-matching TE, got {other:?}"),
+        assert!(parse_body_length(headers).is_err());
+        for coding in ["gzip", "identity", "gzip, chunked", "chunked, chunked"] {
+            let headers =
+                format!("POST /api HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: {coding}\r\n\r\n");
+            assert!(
+                parse_body_length(&headers).is_err(),
+                "unsupported transfer coding was accepted: {coding}"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_content_length_with_any_transfer_encoding() {
+        for coding in ["gzip", "identity", "chunked"] {
+            let headers = format!(
+                "DELETE /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nTransfer-Encoding: {coding}\r\n\r\n"
+            );
+            assert!(
+                parse_body_length(&headers).is_err(),
+                "CL plus Transfer-Encoding was accepted: {coding}"
+            );
         }
     }
 
@@ -3930,6 +4025,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
 
         let upstream_task = tokio::spawn(async move {
@@ -3989,6 +4085,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
 
         let upstream_task = tokio::spawn(async move {
@@ -4045,6 +4142,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
 
         let result = relay_http_request_with_options_guarded(
@@ -4085,6 +4183,7 @@ mod tests {
             )
             .into_bytes(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
 
         let upstream_task = tokio::spawn(async move {
@@ -4157,6 +4256,7 @@ mod tests {
             )
             .into_bytes(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
 
         let upstream_task = tokio::spawn(async move {
@@ -4321,6 +4421,7 @@ mod tests {
             )
             .into_bytes(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
 
         let upstream_task = tokio::spawn(async move {
@@ -4596,6 +4697,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
+            raw_target: String::new(),
         };
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
@@ -4801,6 +4903,7 @@ mod tests {
             )
             .into_bytes(),
             body_length: BodyLength::ContentLength(2),
+            raw_target: String::new(),
         };
 
         // Mock upstream: read the forwarded request, capture it, send response
@@ -4885,6 +4988,7 @@ mod tests {
             )
             .into_bytes(),
             body_length: BodyLength::ContentLength(2),
+            raw_target: String::new(),
         };
 
         let upstream_task = tokio::spawn(async move {
@@ -4970,6 +5074,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header,
             body_length,
+            raw_target: String::new(),
         };
 
         let content_len = match body_length {
@@ -5040,6 +5145,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header,
             body_length,
+            raw_target: String::new(),
         };
 
         let upstream_task = tokio::spawn(async move {
@@ -5192,6 +5298,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: raw.into_bytes(),
             body_length: BodyLength::ContentLength(body.len() as u64),
+            raw_target: String::new(),
         };
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
@@ -5242,6 +5349,7 @@ mod tests {
             query_params: HashMap::new(),
             raw_header: raw.into_bytes(),
             body_length: BodyLength::ContentLength(body.len() as u64),
+            raw_target: String::new(),
         };
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);

@@ -71,6 +71,37 @@ with the sandbox's ephemeral CA and inspect method/path or protocol-specific
 metadata before forwarding. The proxy also supports credential injection on
 terminated HTTP streams when policy allows the endpoint.
 
+`tls: require` makes TLS a security floor for an endpoint. The proxy accepts
+only CONNECT tunnels whose first bytes are a TLS ClientHello, terminates the
+sandbox-side connection, and establishes a certificate-validated TLS connection
+to the policy-bound upstream. Plaintext HTTP, h2c, unsupported tunnel protocols,
+missing TLS state, and failed upstream TLS validation are denied without a raw
+relay fallback. A non-CONNECT forward request to an endpoint with `tls: require`
+is also denied. If overlapping endpoint policy matches the same destination,
+`require` takes precedence over weaker TLS modes.
+
+Before a request eligible for credential replacement, token injection, or
+request signing reaches the upstream, the proxy requires exactly one valid
+`Host` header matching the policy-bound host and scheme-derived effective port.
+Credential-bearing requests inside CONNECT must use origin-form, so an absolute
+request target cannot name a second authority. MCP endpoints also reject any
+request target that contains a query delimiter. Credential-bound MCP resolves
+exactly one policy-authorized placeholder in an `Authorization: Bearer` header;
+duplicate authorization fields and reserved markers in every other request
+location fail closed. These checks bind the authenticated request to the
+destination and path selected by policy before any credential-bearing bytes are
+written upstream.
+
+An MCP endpoint can declare `credential_keys` only with an exact host, port,
+and path under enforced required TLS. The gateway durably reserves those keys
+for the sandbox object's lifetime before it persists or returns the policy.
+Resolution also requires an atomic sandbox attachment that binds the key to one
+immutable provider ID. Provider replacement, detach, disappearance, policy
+change, or snapshot mismatch deactivates the shared resolver state and
+invalidates existing credential generations before a replacement can become
+active. Startup activates credentials only when config, provider environment,
+and a second config snapshot carry the same policy and provider revisions.
+
 Raw streams and long-lived response bodies are connection scoped. Policy
 reloads affect the next connection or the next parsed HTTP request; they do not
 rewrite bytes already being relayed. HTTP upgrades switch to raw relay by
