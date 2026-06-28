@@ -830,6 +830,7 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     ProcessPolicy {
         run_as_user: get_str(val, "run_as_user"),
         run_as_group: get_str(val, "run_as_group"),
+        lifecycle_operations: get_str_array(val, "lifecycle_operations"),
     }
 }
 
@@ -1291,12 +1292,14 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             serde_json::json!({
                 "run_as_user": "sandbox",
                 "run_as_group": "sandbox",
+                "lifecycle_operations": [],
             })
         },
         |p| {
             serde_json::json!({
                 "run_as_user": p.run_as_user,
                 "run_as_group": p.run_as_group,
+                "lifecycle_operations": p.lifecycle_operations,
             })
         },
     );

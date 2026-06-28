@@ -119,8 +119,13 @@ Sets the OS-level identity for the agent process inside the sandbox.
 |---|---|---|---|
 | `run_as_user` | string | No | The user name or UID the agent process runs as. Default: `sandbox`. |
 | `run_as_group` | string | No | The group name or GID the agent process runs as. Default: `sandbox`. |
+| `lifecycle_operations` | list of strings | No | Closed, compiled fixed-path operation IDs that the gateway and supervisor may execute through `sandbox exec --lifecycle`. Arbitrary executable paths are not accepted. |
 
 **Validation constraint:** Neither `run_as_user` nor `run_as_group` can be set to `root` or `0`. Policies that request root process identity are rejected at creation or update time.
+
+Lifecycle operations are static and fail closed unless the ID is compiled into the matching gateway and supervisor. The current registry includes `nemoclaw.hermes-mcp-config-transaction-v1`. That operation keeps the complete non-root workload identity and sandbox policy, authenticates the child through an inherited Unix socket using root `SO_PEERCRED` plus an exact one-shot handshake, accepts only a read-only probe or the fixed mutation payload shape, and runs over the private gateway-to-supervisor stream without a host TCP listener.
+
+The supervisor requires the mapped helper and interpreter to be root-owned, non-writable, and FD-pinned so the running workload cannot replace them. This is runtime replacement protection, not image provenance or code signing. The operation receives no filesystem, process, network, or credential authority beyond the ordinary workload.
 
 Example:
 
@@ -128,6 +133,8 @@ Example:
 process:
   run_as_user: sandbox
   run_as_group: sandbox
+  lifecycle_operations:
+    - nemoclaw.hermes-mcp-config-transaction-v1
 ```
 
 ## Network Policies

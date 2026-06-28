@@ -306,6 +306,7 @@ pub async fn run_process(
             id.to_string(),
             socket.clone(),
             ssh_netns_fd,
+            policy.clone(),
         );
         info!("supervisor session task spawned");
     }

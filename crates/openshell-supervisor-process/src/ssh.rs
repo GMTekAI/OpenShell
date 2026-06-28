@@ -1549,6 +1549,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user: None,
                 run_as_group: None,
+                ..Default::default()
             },
         };
 
@@ -1577,6 +1578,7 @@ mod tests {
                     process: ProcessPolicy {
                         run_as_user: None,
                         run_as_group: None,
+                        ..Default::default()
                     },
                 },
                 None,

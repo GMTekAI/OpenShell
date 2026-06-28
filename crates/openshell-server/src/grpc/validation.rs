@@ -9,7 +9,8 @@
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
 use openshell_core::proto::{
-    ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
+    ExecSandboxMode, ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy,
+    SandboxTemplate,
 };
 use prost::Message;
 use tonic::Status;
@@ -35,6 +36,8 @@ pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
 /// Validate fields of an `ExecSandboxRequest` for control characters and size
 /// limits before constructing a shell command string.
 pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
+    let mode = ExecSandboxMode::try_from(req.mode)
+        .map_err(|_| Status::invalid_argument("unknown sandbox exec mode"))?;
     if req.command.len() > MAX_EXEC_COMMAND_ARGS {
         return Err(Status::invalid_argument(format!(
             "command array exceeds {MAX_EXEC_COMMAND_ARGS} argument limit"
@@ -64,6 +67,45 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
             )));
         }
         reject_control_chars(&req.workdir, "workdir")?;
+    }
+    if mode == ExecSandboxMode::Lifecycle {
+        let executable = req
+            .command
+            .first()
+            .ok_or_else(|| Status::invalid_argument("lifecycle exec requires an executable"))?;
+        if !executable.starts_with('/') {
+            return Err(Status::invalid_argument(
+                "lifecycle exec requires an exact absolute executable path",
+            ));
+        }
+        if !req.environment.is_empty() {
+            return Err(Status::invalid_argument(
+                "lifecycle exec does not accept environment overrides",
+            ));
+        }
+        if !req.workdir.is_empty() {
+            return Err(Status::invalid_argument(
+                "lifecycle exec does not accept a working-directory override",
+            ));
+        }
+        if !req.stdin.is_empty() {
+            return Err(Status::invalid_argument(
+                "lifecycle exec does not accept stdin",
+            ));
+        }
+        if req.tty || req.cols != 0 || req.rows != 0 {
+            return Err(Status::invalid_argument(
+                "lifecycle exec does not accept a TTY",
+            ));
+        }
+        if req.timeout_seconds == 0
+            || req.timeout_seconds > openshell_core::lifecycle_exec::MAX_LIFECYCLE_TIMEOUT_SECONDS
+        {
+            return Err(Status::invalid_argument(format!(
+                "lifecycle exec timeout must be between 1 and {} seconds",
+                openshell_core::lifecycle_exec::MAX_LIFECYCLE_TIMEOUT_SECONDS
+            )));
+        }
     }
     Ok(())
 }
@@ -1139,6 +1181,68 @@ mod tests {
     }
 
     #[test]
+    fn validate_lifecycle_exec_accepts_only_direct_minimal_requests() {
+        let request = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec![
+                "/usr/local/lib/example-maintenance".to_string(),
+                "apply".to_string(),
+            ],
+            mode: ExecSandboxMode::Lifecycle as i32,
+            timeout_seconds: 620,
+            ..Default::default()
+        };
+        assert!(validate_exec_request_fields(&request).is_ok());
+
+        for invalid in [
+            ExecSandboxRequest {
+                tty: true,
+                ..request.clone()
+            },
+            ExecSandboxRequest {
+                workdir: "/tmp".to_string(),
+                ..request.clone()
+            },
+            ExecSandboxRequest {
+                stdin: b"input".to_vec(),
+                ..request.clone()
+            },
+            ExecSandboxRequest {
+                environment: std::iter::once(("KEY".to_string(), "value".to_string())).collect(),
+                ..request.clone()
+            },
+            ExecSandboxRequest {
+                timeout_seconds: 0,
+                ..request.clone()
+            },
+            ExecSandboxRequest {
+                timeout_seconds: openshell_core::lifecycle_exec::MAX_LIFECYCLE_TIMEOUT_SECONDS + 1,
+                ..request
+            },
+        ] {
+            assert!(validate_exec_request_fields(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn validate_lifecycle_exec_rejects_relative_executable_and_unknown_mode() {
+        let relative = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["python".to_string()],
+            mode: ExecSandboxMode::Lifecycle as i32,
+            timeout_seconds: 620,
+            ..Default::default()
+        };
+        assert!(validate_exec_request_fields(&relative).is_err());
+
+        let unknown = ExecSandboxRequest {
+            mode: i32::MAX,
+            ..relative
+        };
+        assert!(validate_exec_request_fields(&unknown).is_err());
+    }
+
+    #[test]
     fn validate_sandbox_spec_rejects_template_env_value_with_control_chars() {
         let spec = SandboxSpec {
             template: Some(SandboxTemplate {
@@ -1621,6 +1725,7 @@ mod tests {
             process: Some(ProcessPolicy {
                 run_as_user: "root".into(),
                 run_as_group: "sandbox".into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1749,6 +1854,7 @@ mod tests {
             process: Some(ProcessPolicy {
                 run_as_user: "sandbox".into(),
                 run_as_group: "sandbox".into(),
+                ..Default::default()
             }),
             ..Default::default()
         };

@@ -7,14 +7,16 @@
 //! gateway. When the gateway sends `RelayOpen`, the supervisor dials the
 //! requested local target, initiates a `RelayStream` gRPC call (a new HTTP/2
 //! stream multiplexed over the same TCP+TLS connection as the control stream),
-//! and bridges bytes. The supervisor is a dumb byte bridge after target
-//! selection — it has no protocol awareness of the bytes flowing through.
+//! and bridges bytes. SSH and TCP targets are byte streams; the private
+//! lifecycle target terminates a closed, independently validated protocol in
+//! the supervisor without opening a listener.
 
 use std::net::IpAddr;
 #[cfg(target_os = "linux")]
 use std::os::fd::RawFd;
 use std::time::Duration;
 
+use openshell_core::policy::SandboxPolicy;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     GatewayMessage, RelayFrame, RelayInit, RelayOpen, RelayOpenResult, SupervisorHeartbeat,
@@ -109,6 +111,7 @@ fn relay_target_endpoint(open: &RelayOpen) -> Option<Endpoint> {
 fn relay_target_kind(open: &RelayOpen) -> &'static str {
     match open.target.as_ref() {
         Some(relay_open::Target::Tcp(_)) => "tcp relay",
+        Some(relay_open::Target::LifecycleExec(_)) => "lifecycle exec relay",
         Some(relay_open::Target::Ssh(_)) | None => "ssh relay",
     }
 }
@@ -122,6 +125,7 @@ fn relay_target_message(
         Some(relay_open::Target::Tcp(target)) => {
             format!("{}:{}", target.host.trim(), target.port)
         }
+        Some(relay_open::Target::LifecycleExec(_)) => "in-process:lifecycle-exec".to_string(),
         Some(relay_open::Target::Ssh(_)) | None => {
             format!("unix:{}", ssh_socket_path.display())
         }
@@ -235,12 +239,14 @@ pub fn spawn(
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
+    policy: SandboxPolicy,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_session_loop(
         endpoint,
         sandbox_id,
         ssh_socket_path,
         netns_fd,
+        policy,
     ))
 }
 
@@ -249,6 +255,7 @@ async fn run_session_loop(
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
     netns_fd: Option<i32>,
+    policy: SandboxPolicy,
 ) {
     let mut backoff = INITIAL_BACKOFF;
     let mut attempt: u64 = 0;
@@ -256,7 +263,8 @@ async fn run_session_loop(
     loop {
         attempt += 1;
 
-        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path, netns_fd).await {
+        match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path, netns_fd, &policy).await
+        {
             Ok(()) => {
                 let event =
                     session_closed_event(openshell_ocsf::ctx::ctx(), &endpoint, &sandbox_id);
@@ -283,6 +291,7 @@ async fn run_single_session(
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
+    policy: &SandboxPolicy,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
@@ -354,6 +363,7 @@ async fn run_single_session(
                     netns_fd,
                     &channel,
                     &tx,
+                    policy,
                 );
             }
             _ = heartbeat_interval.tick() => {
@@ -377,6 +387,7 @@ fn handle_gateway_message(
     netns_fd: Option<i32>,
     channel: &grpc_client::AuthedChannel,
     tx: &mpsc::Sender<SupervisorMessage>,
+    policy: &SandboxPolicy,
 ) {
     match &msg.payload {
         Some(gateway_message::Payload::Heartbeat(_)) => {
@@ -389,13 +400,16 @@ fn handle_gateway_message(
             let channel = channel.clone();
             let ssh_socket_path = ssh_socket_path.to_path_buf();
             let tx = tx.clone();
+            let policy = policy.clone();
 
             let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
                 let event_open = relay_open.clone();
-                match handle_relay_open(relay_open, &ssh_socket_path, netns_fd, channel, tx).await {
+                match handle_relay_open(relay_open, &ssh_socket_path, netns_fd, channel, tx, policy)
+                    .await
+                {
                     Ok(()) => {
                         let event = relay_closed_event(
                             openshell_ocsf::ctx::ctx(),
@@ -448,9 +462,10 @@ async fn handle_relay_open(
     netns_fd: Option<i32>,
     channel: grpc_client::AuthedChannel,
     tx: mpsc::Sender<SupervisorMessage>,
+    policy: SandboxPolicy,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = relay_open.channel_id.clone();
-    let target = match open_target(&relay_open, ssh_socket_path, netns_fd).await {
+    let target = match open_target(&relay_open, ssh_socket_path, netns_fd, policy).await {
         Ok(target) => target,
         Err(err) => {
             send_relay_open_result(&tx, &channel_id, false, err.to_string()).await;
@@ -576,9 +591,19 @@ async fn open_target(
     relay_open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
+    policy: SandboxPolicy,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     match relay_open.target.as_ref() {
         Some(relay_open::Target::Tcp(target)) => open_tcp_target(target, netns_fd).await,
+        Some(relay_open::Target::LifecycleExec(_)) => {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(async move {
+                if let Err(error) = crate::lifecycle_exec::serve(server, policy, netns_fd).await {
+                    warn!(error = %error, "lifecycle exec relay failed");
+                }
+            });
+            Ok(Box::new(client))
+        }
         Some(relay_open::Target::Ssh(_)) | None => {
             let stream = tokio::net::UnixStream::connect(ssh_socket_path).await?;
             Ok(Box::new(stream))

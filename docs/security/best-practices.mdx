@@ -203,6 +203,7 @@ The sandbox process runs as a non-root user after explicit privilege dropping.
 |---|---|
 | Default | `run_as_user: sandbox`, `run_as_group: sandbox`. The supervisor calls `setuid()`/`setgid()` with post-condition verification, disables core dumps with `RLIMIT_CORE=0`, and on Linux sets `PR_SET_DUMPABLE=0`. |
 | What you can change | Set `run_as_user` and `run_as_group` in the `process` section. Validation rejects root (`root` or `0`). |
+| Maintenance operations | `lifecycle_operations` accepts only compiled operation IDs. Gateway and supervisor both revalidate the operation and payload; execution uses the complete workload identity, the same Landlock/seccomp boundary, a one-shot supervisor-authenticated descriptor, no provider environment, no shell/TTY/stdin, and a hard timeout over the private stream. |
 | Risk if relaxed | Running as a higher-privilege user increases the impact of container escape vulnerabilities. |
 | Recommendation | Keep the `sandbox` user. Do not attempt to set root. |
 

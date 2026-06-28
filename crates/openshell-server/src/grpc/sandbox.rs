@@ -16,12 +16,13 @@ use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit,
-    ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxProviderCredentialBinding, SandboxResponse, SandboxStreamEvent, SshRelayTarget,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, WatchSandboxRequest, relay_open,
-    tcp_forward_init,
+    ExecSandboxInput, ExecSandboxMode, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
+    GetSandboxRequest, LifecycleExecRelayEvent, LifecycleExecRelayRequest,
+    LifecycleExecRelayTarget, ListSandboxProvidersRequest, ListSandboxProvidersResponse,
+    ListSandboxesRequest, ListSandboxesResponse, Provider, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxProviderCredentialBinding, SandboxResponse,
+    SandboxStreamEvent, SshRelayTarget, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    WatchSandboxRequest, lifecycle_exec_relay_event, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
 use openshell_core::telemetry::{
@@ -34,7 +35,6 @@ use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -55,6 +55,7 @@ use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit};
 use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
+const WORKLOAD_SSH_PRINCIPAL: &str = "sandbox";
 
 // ---------------------------------------------------------------------------
 // Sandbox lifecycle handlers
@@ -1060,6 +1061,36 @@ pub(super) async fn handle_watch_sandbox(
 // Exec handler
 // ---------------------------------------------------------------------------
 
+fn lifecycle_operation_declared(
+    sandbox: &Sandbox,
+    command: &[String],
+) -> Result<&'static openshell_core::lifecycle_exec::LifecycleOperationSpec, Status> {
+    let operation =
+        openshell_core::lifecycle_exec::operation_for_command(command).ok_or_else(|| {
+            Status::permission_denied("command is not a compiled lifecycle operation")
+        })?;
+    openshell_core::lifecycle_exec::validate_operation_command(operation, command)
+        .map_err(Status::invalid_argument)?;
+    let declared = sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy.as_ref())
+        .and_then(|policy| policy.process.as_ref())
+        .is_some_and(|process| {
+            process
+                .lifecycle_operations
+                .iter()
+                .any(|allowed| allowed == operation.id)
+        });
+    if !declared {
+        return Err(Status::permission_denied(format!(
+            "lifecycle operation '{}' is not declared by the sandbox process policy",
+            operation.id
+        )));
+    }
+    Ok(operation)
+}
+
 pub(super) async fn handle_exec_sandbox(
     state: &Arc<ServerState>,
     request: Request<ExecSandboxRequest>,
@@ -1079,6 +1110,8 @@ pub(super) async fn handle_exec_sandbox(
         ));
     }
     validate_exec_request_fields(&req)?;
+    let mode = ExecSandboxMode::try_from(req.mode)
+        .map_err(|_| Status::invalid_argument("unknown sandbox exec mode"))?;
 
     let sandbox = state
         .store
@@ -1091,16 +1124,35 @@ pub(super) async fn handle_exec_sandbox(
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
+    if mode == ExecSandboxMode::Lifecycle {
+        lifecycle_operation_declared(&sandbox, &req.command)?;
+    }
+
     // Open a relay channel through the supervisor session. Use a 15s
     // session-wait timeout, enough to cover a transient supervisor reconnect
     // while still failing quickly during normal operation.
-    let (channel_id, relay_rx) = state
-        .supervisor_sessions
-        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
-        .await
-        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+    let (channel_id, relay_rx) = if mode == ExecSandboxMode::Lifecycle {
+        state
+            .supervisor_sessions
+            .open_relay_with_target(
+                sandbox.object_id(),
+                relay_open::Target::LifecycleExec(LifecycleExecRelayTarget {}),
+                "lifecycle-exec".to_string(),
+                std::time::Duration::from_secs(15),
+            )
+            .await
+    } else {
+        state
+            .supervisor_sessions
+            .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
+            .await
+    }
+    .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let command_str = build_remote_exec_command(&req)
+    let command = req.command.clone();
+    let command_str = (mode == ExecSandboxMode::Workload)
+        .then(|| build_remote_exec_command(&req))
+        .transpose()
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let stdin_payload = req.stdin;
     let timeout_seconds = req.timeout_seconds;
@@ -1117,18 +1169,24 @@ pub(super) async fn handle_exec_sandbox(
             return;
         };
 
-        if let Err(err) = stream_exec_over_relay(
-            tx.clone(),
-            &sandbox_id,
-            &channel_id,
-            relay_stream,
-            &command_str,
-            stdin_payload,
-            timeout_seconds,
-            request_tty,
-        )
-        .await
-        {
+        let result = if mode == ExecSandboxMode::Lifecycle {
+            stream_lifecycle_exec_over_relay(tx.clone(), relay_stream, command, timeout_seconds)
+                .await
+        } else {
+            stream_exec_over_relay(
+                tx.clone(),
+                &sandbox_id,
+                &channel_id,
+                relay_stream,
+                command_str.as_deref().expect("workload command"),
+                stdin_payload,
+                timeout_seconds,
+                request_tty,
+                WORKLOAD_SSH_PRINCIPAL,
+            )
+            .await
+        };
+        if let Err(err) = result {
             warn!(sandbox_id = %sandbox_id, error = %err, "ExecSandbox failed");
             let _ = tx.send(Err(err)).await;
         }
@@ -1504,6 +1562,11 @@ fn validate_interactive_exec_start(
         ));
     }
     validate_exec_request_fields(&req)?;
+    if ExecSandboxMode::try_from(req.mode).ok() != Some(ExecSandboxMode::Workload) {
+        return Err(Status::invalid_argument(
+            "interactive exec supports workload mode only",
+        ));
+    }
 
     Ok(req)
 }
@@ -1753,6 +1816,7 @@ const EXEC_KEEPALIVE_MAX: usize = 4;
 
 /// Max wait for a trailing `Close` after `ExitStatus`.
 const EXEC_POST_EXIT_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+const MAX_LIFECYCLE_RELAY_FRAME: usize = 4 * 1024 * 1024;
 
 /// russh client config for exec relays.
 fn exec_ssh_client_config() -> russh::client::Config {
@@ -1773,6 +1837,131 @@ fn exec_loop_result(exit_code: Option<i32>) -> Result<i32, Status> {
         },
         Ok,
     )
+}
+
+async fn write_lifecycle_relay_message<M: Message>(
+    stream: &mut tokio::io::DuplexStream,
+    message: &M,
+) -> Result<(), Status> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let data = message.encode_to_vec();
+    let length = u32::try_from(data.len())
+        .map_err(|_| Status::invalid_argument("lifecycle relay message is too large"))?;
+    stream
+        .write_all(&length.to_be_bytes())
+        .await
+        .map_err(|error| Status::unavailable(format!("lifecycle relay write failed: {error}")))?;
+    stream
+        .write_all(&data)
+        .await
+        .map_err(|error| Status::unavailable(format!("lifecycle relay write failed: {error}")))?;
+    Ok(())
+}
+
+async fn read_lifecycle_relay_message<M: Message + Default>(
+    stream: &mut tokio::io::DuplexStream,
+) -> Result<Option<M>, Status> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut length = [0u8; 4];
+    match stream.read_exact(&mut length).await {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => {
+            return Err(Status::unavailable(format!(
+                "lifecycle relay read failed: {error}"
+            )));
+        }
+    }
+    let length = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+    if length == 0 || length > MAX_LIFECYCLE_RELAY_FRAME {
+        return Err(Status::invalid_argument(
+            "lifecycle relay frame has an invalid length",
+        ));
+    }
+    let mut data = vec![0u8; length];
+    stream
+        .read_exact(&mut data)
+        .await
+        .map_err(|error| Status::unavailable(format!("lifecycle relay read failed: {error}")))?;
+    M::decode(data.as_slice()).map(Some).map_err(|error| {
+        Status::invalid_argument(format!("invalid lifecycle relay frame: {error}"))
+    })
+}
+
+async fn stream_lifecycle_exec_over_relay(
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    mut relay_stream: tokio::io::DuplexStream,
+    command: Vec<String>,
+    timeout_seconds: u32,
+) -> Result<(), Status> {
+    write_lifecycle_relay_message(
+        &mut relay_stream,
+        &LifecycleExecRelayRequest {
+            command,
+            timeout_seconds,
+        },
+    )
+    .await?;
+
+    let mut saw_exit = false;
+    loop {
+        let event = tokio::select! {
+            biased;
+            () = tx.closed() => {
+                // Dropping the relay is the cancellation signal. The
+                // supervisor observes EOF and kills/reaps the process group.
+                return Ok(());
+            }
+            event = read_lifecycle_relay_message::<LifecycleExecRelayEvent>(&mut relay_stream) => {
+                event?
+            }
+        };
+        let Some(event) = event else {
+            break;
+        };
+        let payload = match event.payload {
+            Some(lifecycle_exec_relay_event::Payload::Stdout(data)) => {
+                openshell_core::proto::exec_sandbox_event::Payload::Stdout(ExecSandboxStdout {
+                    data,
+                })
+            }
+            Some(lifecycle_exec_relay_event::Payload::Stderr(data)) => {
+                openshell_core::proto::exec_sandbox_event::Payload::Stderr(ExecSandboxStderr {
+                    data,
+                })
+            }
+            Some(lifecycle_exec_relay_event::Payload::ExitCode(exit_code)) => {
+                saw_exit = true;
+                openshell_core::proto::exec_sandbox_event::Payload::Exit(ExecSandboxExit {
+                    exit_code,
+                })
+            }
+            Some(lifecycle_exec_relay_event::Payload::Error(error)) => {
+                return Err(Status::permission_denied(error));
+            }
+            None => return Err(Status::internal("lifecycle relay emitted an empty event")),
+        };
+        if tx
+            .send(Ok(ExecSandboxEvent {
+                payload: Some(payload),
+            }))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        if saw_exit {
+            break;
+        }
+    }
+    if !saw_exit {
+        return Err(Status::unavailable(
+            "lifecycle relay closed before reporting an exit status",
+        ));
+    }
+    Ok(())
 }
 
 fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
@@ -1814,6 +2003,7 @@ async fn stream_exec_over_relay(
     stdin_payload: Vec<u8>,
     timeout_seconds: u32,
     request_tty: bool,
+    ssh_principal: &'static str,
 ) -> Result<(), Status> {
     let command_preview: String = command.chars().take(120).collect();
     info!(
@@ -1825,15 +2015,12 @@ async fn stream_exec_over_relay(
         "ExecSandbox (relay): command started"
     );
 
-    let (local_proxy_port, proxy_task) = start_single_use_ssh_proxy_over_relay(relay_stream)
-        .await
-        .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
-
     let exec = run_exec_with_russh(
-        local_proxy_port,
+        relay_stream,
         command,
         stdin_payload,
         request_tty,
+        ssh_principal,
         tx.clone(),
     );
 
@@ -1854,19 +2041,13 @@ async fn stream_exec_over_relay(
                 )),
             }))
             .await;
-        let _ = proxy_task.await;
         return Ok(());
     };
 
     let exit_code = match exec_result {
         Ok(code) => code,
-        Err(status) => {
-            let _ = proxy_task.await;
-            return Err(status);
-        }
+        Err(status) => return Err(status),
     };
-
-    let _ = proxy_task.await;
 
     let _ = tx
         .send(Ok(ExecSandboxEvent {
@@ -1900,12 +2081,8 @@ async fn stream_interactive_exec_over_relay(
         "ExecSandboxInteractive (relay): command started"
     );
 
-    let (local_proxy_port, proxy_task) = start_single_use_ssh_proxy_over_relay(relay_stream)
-        .await
-        .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
-
     let exec = run_interactive_exec_with_russh(
-        local_proxy_port,
+        relay_stream,
         command,
         input_stream,
         cols,
@@ -1930,19 +2107,13 @@ async fn stream_interactive_exec_over_relay(
                 )),
             }))
             .await;
-        let _ = proxy_task.await;
         return Ok(());
     };
 
     let exit_code = match exec_result {
         Ok(code) => code,
-        Err(status) => {
-            let _ = proxy_task.await;
-            return Err(status);
-        }
+        Err(status) => return Err(status),
     };
-
-    let _ = proxy_task.await;
 
     let _ = tx
         .send(Ok(ExecSandboxEvent {
@@ -1956,7 +2127,7 @@ async fn stream_interactive_exec_over_relay(
 }
 
 async fn run_interactive_exec_with_russh(
-    local_proxy_port: u16,
+    relay_stream: tokio::io::DuplexStream,
     command: &str,
     mut input_stream: tonic::Streaming<ExecSandboxInput>,
     cols: u32,
@@ -1977,12 +2148,8 @@ async fn run_interactive_exec_with_russh(
         )));
     }
 
-    let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
-        .await
-        .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
-
     let config = Arc::new(exec_ssh_client_config());
-    let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
+    let mut client = russh::client::connect_stream(config, relay_stream, SandboxSshClientHandler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
@@ -2093,28 +2260,6 @@ async fn run_interactive_exec_with_russh(
     exec_loop_result(exit_code)
 }
 
-/// Create a localhost SSH proxy that bridges to a relay `DuplexStream`.
-///
-/// The proxy forwards raw SSH bytes between the `russh` client and the relay.
-/// The supervisor bridges the relay to its Unix-socket SSH daemon; filesystem
-/// permissions on that socket are the only access-control boundary.
-async fn start_single_use_ssh_proxy_over_relay(
-    mut relay_stream: tokio::io::DuplexStream,
-) -> Result<(u16, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-    let port = listener.local_addr()?.port();
-
-    let task = tokio::spawn(async move {
-        let Ok((mut client_conn, _)) = listener.accept().await else {
-            warn!("SSH relay proxy: failed to accept local connection");
-            return;
-        };
-        let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut relay_stream).await;
-    });
-
-    Ok((port, task))
-}
-
 #[derive(Debug, Clone, Copy)]
 struct SandboxSshClientHandler;
 
@@ -2130,10 +2275,11 @@ impl russh::client::Handler for SandboxSshClientHandler {
 }
 
 async fn run_exec_with_russh(
-    local_proxy_port: u16,
+    relay_stream: tokio::io::DuplexStream,
     command: &str,
     stdin_payload: Vec<u8>,
     request_tty: bool,
+    ssh_principal: &str,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
     // Defense-in-depth: validate command at the transport boundary.
@@ -2148,17 +2294,13 @@ async fn run_exec_with_russh(
         )));
     }
 
-    let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
-        .await
-        .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
-
     let config = Arc::new(exec_ssh_client_config());
-    let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
+    let mut client = russh::client::connect_stream(config, relay_stream, SandboxSshClientHandler)
         .await
         .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
 
     match client
-        .authenticate_none("sandbox")
+        .authenticate_none(ssh_principal)
         .await
         .map_err(|e| Status::internal(format!("failed to authenticate ssh session: {e}")))?
     {
@@ -2263,6 +2405,7 @@ mod tests {
     use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use std::collections::HashMap;
+    use tokio::io::AsyncReadExt as _;
 
     // ---- shell_escape ----
 
@@ -2384,6 +2527,116 @@ mod tests {
     }
 
     #[test]
+    fn gateway_lifecycle_authorization_requires_exact_operation_and_payload() {
+        let command = vec![
+            openshell_core::lifecycle_exec::NEMOCLAW_HERMES_MCP_CONFIG_EXECUTABLE.to_string(),
+            "add".to_string(),
+            "--payload".to_string(),
+            r#"{"server":"demo","url":"https://mcp.example.test/mcp","headers":{"Authorization":"Bearer openshell:resolve:env:DEMO_TOKEN"},"replace_existing":false}"#.to_string(),
+        ];
+        let sandbox = Sandbox {
+            spec: Some(openshell_core::proto::SandboxSpec {
+                policy: Some(openshell_core::proto::SandboxPolicy {
+                    process: Some(openshell_core::proto::ProcessPolicy {
+                        run_as_user: "sandbox".to_string(),
+                        run_as_group: "sandbox".to_string(),
+                        lifecycle_operations: vec![
+                            openshell_core::lifecycle_exec::NEMOCLAW_HERMES_MCP_CONFIG_OPERATION
+                                .to_string(),
+                        ],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(lifecycle_operation_declared(&sandbox, &command).is_ok());
+        let probe = vec![
+            openshell_core::lifecycle_exec::NEMOCLAW_HERMES_MCP_CONFIG_EXECUTABLE.to_string(),
+            "probe".to_string(),
+        ];
+        assert!(lifecycle_operation_declared(&sandbox, &probe).is_ok());
+        let mut interpreter = command.clone();
+        interpreter[0] = "/opt/hermes/.venv/bin/python".to_string();
+        assert!(lifecycle_operation_declared(&sandbox, &interpreter).is_err());
+        assert!(lifecycle_operation_declared(&Sandbox::default(), &command).is_err());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_gateway_keeps_request_half_open_until_exit() {
+        let command = vec![
+            openshell_core::lifecycle_exec::NEMOCLAW_HERMES_MCP_CONFIG_EXECUTABLE.to_string(),
+            "add".to_string(),
+            "--payload".to_string(),
+            r#"{"server":"demo","url":"https://mcp.example.test/mcp","headers":{"Authorization":"Bearer openshell:resolve:env:DEMO_TOKEN"},"replace_existing":false}"#.to_string(),
+        ];
+        let (gateway, mut supervisor) = tokio::io::duplex(64 * 1024);
+        let (tx, mut rx) = mpsc::channel(4);
+        let task = tokio::spawn(stream_lifecycle_exec_over_relay(tx, gateway, command, 620));
+
+        let request = read_lifecycle_relay_message::<LifecycleExecRelayRequest>(&mut supervisor)
+            .await
+            .expect("read lifecycle request")
+            .expect("request before EOF");
+        assert_eq!(request.timeout_seconds, 620);
+
+        let mut probe = [0u8; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(25),
+                supervisor.read(&mut probe),
+            )
+            .await
+            .is_err(),
+            "gateway must keep its write half open for cancellation signaling"
+        );
+
+        write_lifecycle_relay_message(
+            &mut supervisor,
+            &LifecycleExecRelayEvent {
+                payload: Some(lifecycle_exec_relay_event::Payload::ExitCode(0)),
+            },
+        )
+        .await
+        .expect("write lifecycle exit");
+        task.await.expect("gateway task").expect("gateway success");
+        let event = rx.recv().await.expect("forwarded exit").expect("event");
+        assert!(matches!(
+            event.payload,
+            Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                ExecSandboxExit { exit_code: 0 }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_gateway_drops_relay_when_client_cancels_silent_child() {
+        let command = vec![
+            openshell_core::lifecycle_exec::NEMOCLAW_HERMES_MCP_CONFIG_EXECUTABLE.to_string(),
+            "remove".to_string(),
+            "--payload".to_string(),
+            r#"{"server":"demo","url":"https://mcp.example.test/mcp","headers":{"Authorization":"Bearer openshell:resolve:env:DEMO_TOKEN"},"force":false}"#.to_string(),
+        ];
+        let (gateway, mut supervisor) = tokio::io::duplex(64 * 1024);
+        let (tx, rx) = mpsc::channel(1);
+        let task = tokio::spawn(stream_lifecycle_exec_over_relay(tx, gateway, command, 620));
+        read_lifecycle_relay_message::<LifecycleExecRelayRequest>(&mut supervisor)
+            .await
+            .expect("read lifecycle request")
+            .expect("request");
+
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("gateway cancellation deadline")
+            .expect("gateway task")
+            .expect("client cancellation is clean");
+        let mut probe = [0u8; 1];
+        assert_eq!(supervisor.read(&mut probe).await.expect("relay EOF"), 0);
+    }
+
+    #[test]
     fn tcp_forward_init_allows_loopback_targets() {
         for host in ["127.0.0.1", "::1", "localhost"] {
             let init = TcpForwardInit {
@@ -2408,7 +2661,7 @@ mod tests {
         };
         match validate_tcp_forward_init(&init).expect("ssh target should pass") {
             relay_open::Target::Ssh(_) => {}
-            other @ relay_open::Target::Tcp(_) => panic!("expected SSH target, got {other:?}"),
+            other => panic!("expected SSH target, got {other:?}"),
         }
     }
 

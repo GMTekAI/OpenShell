@@ -934,6 +934,11 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             .ok_or_else(|| miette::miette!("Failed to resolve user primary group"))?
     };
 
+    if user.uid.is_root() || group.gid.as_raw() == 0 {
+        return Err(miette::miette!(
+            "workload identity must resolve to nonzero uid and gid"
+        ));
+    }
     if user_name.is_some() {
         let user_cstr =
             CString::new(user.name.clone()).map_err(|_| miette::miette!("Invalid user name"))?;
@@ -1050,6 +1055,7 @@ impl From<std::process::ExitStatus> for ProcessStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[cfg(unix)]
     use nix::sys::wait::{WaitStatus, waitpid};
     #[cfg(unix)]
@@ -1088,6 +1094,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: None,
+            ..Default::default()
         });
         if nix::unistd::geteuid().is_root() {
             // As root, drop_privileges falls back to "sandbox:sandbox".
@@ -1105,6 +1112,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(String::new()),
             run_as_group: Some(String::new()),
+            ..Default::default()
         });
         if nix::unistd::geteuid().is_root() {
             let has_sandbox = User::from_name("sandbox").ok().flatten().is_some();
@@ -1128,6 +1136,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: Some(current_group.name),
+            ..Default::default()
         });
 
         assert!(drop_privileges(&policy).is_ok());
@@ -1150,6 +1159,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some(current_user.name),
             run_as_group: Some(current_group.name),
+            ..Default::default()
         });
 
         assert!(drop_privileges(&policy).is_ok());
@@ -1160,6 +1170,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: Some("__nonexistent_test_user_42__".to_string()),
             run_as_group: None,
+            ..Default::default()
         });
 
         let result = drop_privileges(&policy);
@@ -1173,6 +1184,7 @@ mod tests {
         let policy = policy_with_process(ProcessPolicy {
             run_as_user: None,
             run_as_group: Some("__nonexistent_test_group_42__".to_string()),
+            ..Default::default()
         });
 
         let result = drop_privileges(&policy);
@@ -1346,6 +1358,7 @@ mod tests {
             process: ProcessPolicy {
                 run_as_user,
                 run_as_group,
+                ..Default::default()
             },
         }
     }

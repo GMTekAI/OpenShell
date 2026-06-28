@@ -690,6 +690,15 @@ message RevokeSshSessionResponse {
   bool revoked = 1;
 }
 
+// Execution identity for a sandbox command.
+enum ExecSandboxMode {
+  // Run through the normal workload shell and process policy identity.
+  EXEC_SANDBOX_MODE_WORKLOAD = 0;
+  // Run one policy-allowlisted executable directly with the ordinary workload
+  // identity and an inherited one-shot supervisor authentication channel.
+  EXEC_SANDBOX_MODE_LIFECYCLE = 1;
+}
+
 // Execute command request.
 message ExecSandboxRequest {
   // Sandbox id.
@@ -718,6 +727,10 @@ message ExecSandboxRequest {
 
   // Initial terminal rows (used when tty=true, 0 = use default).
   uint32 rows = 9;
+
+  // Execution identity. Lifecycle mode rejects TTY, environment overrides,
+  // working-directory overrides, and stdin, and never invokes a shell.
+  ExecSandboxMode mode = 10;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -1524,6 +1537,7 @@ message RelayOpen {
   oneof target {
     SshRelayTarget ssh = 2;
     TcpRelayTarget tcp = 3;
+    LifecycleExecRelayTarget lifecycle_exec = 4;
   }
   // Optional service identifier for audit/correlation.
   string service_id = 5;
@@ -1532,12 +1546,33 @@ message RelayOpen {
 // Built-in SSH relay target.
 message SshRelayTarget {}
 
+// Internal compiled fixed-path lifecycle execution target. This target is emitted
+// only by the authenticated ExecSandbox handler and is not accepted by the
+// public TCP/SSH forwarding API.
+message LifecycleExecRelayTarget {}
+
 // TCP target dialed by the supervisor from inside the sandbox.
 message TcpRelayTarget {
   // Phase 1 accepts loopback only: 127.0.0.1, ::1, or localhost.
   string host = 1;
   // Target port. Must fit in u16 and be non-zero.
   uint32 port = 2;
+}
+
+// One length-delimited request sent over a lifecycle exec relay.
+message LifecycleExecRelayRequest {
+  repeated string command = 1;
+  uint32 timeout_seconds = 2;
+}
+
+// Length-delimited lifecycle exec output event.
+message LifecycleExecRelayEvent {
+  oneof payload {
+    bytes stdout = 1;
+    bytes stderr = 2;
+    int32 exit_code = 3;
+    string error = 4;
+  }
 }
 
 // Initial RelayStream frame sent by the supervisor to claim a pending relay.

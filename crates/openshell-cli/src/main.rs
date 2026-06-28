@@ -1429,6 +1429,7 @@ enum SandboxCommands {
     ///   openshell sandbox exec --name my-sandbox -- ls -la /workspace
     ///   openshell sandbox exec -n my-sandbox --workdir /app -- python script.py
     ///   echo "hello" | openshell sandbox exec -n my-sandbox -- cat
+    ///   openshell sandbox exec -n my-sandbox --lifecycle --timeout 30 -- /usr/local/lib/nemoclaw/hermes-mcp-config-transaction.py probe
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Exec {
         /// Sandbox name (defaults to last-used sandbox).
@@ -1439,7 +1440,8 @@ enum SandboxCommands {
         #[arg(long)]
         workdir: Option<String>,
 
-        /// Timeout in seconds (0 = no timeout).
+        /// Timeout in seconds. Workload mode accepts 0 for no timeout;
+        /// lifecycle mode requires a value from 1 through 900.
         #[arg(long, default_value_t = 0)]
         timeout: u32,
 
@@ -1457,6 +1459,13 @@ enum SandboxCommands {
         /// Environment variables to set for the command (KEY=VALUE format, repeatable).
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
+
+        /// Execute one process-policy allowlisted operation directly with the
+        /// workload identity and a one-shot supervisor authentication channel.
+        /// No shell, TTY, environment, working-directory override, or stdin is
+        /// available in this mode.
+        #[arg(long, conflicts_with_all = ["workdir", "tty", "envs"])]
+        lifecycle: bool,
 
         /// Command and arguments to execute.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -2891,11 +2900,12 @@ async fn main() -> Result<()> {
                             tty,
                             no_tty,
                             envs,
+                            lifecycle,
                             command,
                         } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
                             // Resolve --tty / --no-tty into an Option<bool> override.
-                            let tty_override = if no_tty {
+                            let tty_override = if lifecycle || no_tty {
                                 Some(false)
                             } else if tty {
                                 Some(true)
@@ -2911,6 +2921,11 @@ async fn main() -> Result<()> {
                                 timeout,
                                 tty_override,
                                 &env_map,
+                                if lifecycle {
+                                    openshell_core::proto::ExecSandboxMode::Lifecycle
+                                } else {
+                                    openshell_core::proto::ExecSandboxMode::Workload
+                                },
                                 &tls,
                             )
                             .await?;

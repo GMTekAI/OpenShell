@@ -45,6 +45,16 @@ const DEFAULT_MODE: &str = "network,process";
 static AUTHENTICATED_MCP_BOUNDARY_MARKER: &[u8] =
     b"authenticated-mcp-policy-bound-credential-rewrite-v1";
 
+/// Release/probe marker for the native authenticated lifecycle exec path.
+/// Keep the exact bytes stable for downstream version-skew checks.
+#[used]
+static POLICY_AUTHORIZED_LIFECYCLE_EXEC_MARKER: &[u8] = b"policy-authorized-lifecycle-exec-v1";
+
+/// Exact closed-registry operation marker for version-skew detection.
+#[used]
+static NEMOCLAW_HERMES_MCP_CONFIG_OPERATION_MARKER: &[u8] =
+    b"nemoclaw.hermes-mcp-config-transaction-v1";
+
 /// Which supervisor leaves are enabled in this process.
 ///
 /// Parsed from a comma-separated `--mode` value, e.g. `network`,
@@ -205,6 +215,8 @@ fn copy_self(dest: &str) -> Result<()> {
 
 fn main() -> Result<()> {
     std::hint::black_box(AUTHENTICATED_MCP_BOUNDARY_MARKER);
+    std::hint::black_box(POLICY_AUTHORIZED_LIFECYCLE_EXEC_MARKER);
+    std::hint::black_box(NEMOCLAW_HERMES_MCP_CONFIG_OPERATION_MARKER);
 
     // Handle `copy-self <DEST>` before clap so it works without any of the
     // sandbox flags. Kubernetes init containers invoke this path to seed an

@@ -83,6 +83,9 @@ pub struct ProcessPolicy {
 
     /// Group name to run the sandboxed process as.
     pub run_as_group: Option<String>,
+
+    /// Compiled fixed-path operations allowed for authenticated lifecycle exec.
+    pub lifecycle_operations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -162,6 +165,7 @@ impl From<ProtoProcessPolicy> for ProcessPolicy {
             } else {
                 Some(proto.run_as_group)
             },
+            lifecycle_operations: proto.lifecycle_operations,
         }
     }
 }

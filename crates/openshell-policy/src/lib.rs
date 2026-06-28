@@ -76,6 +76,8 @@ struct ProcessDef {
     run_as_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     run_as_group: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    lifecycle_operations: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -824,6 +826,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
         process: raw.process.map(|p| ProcessPolicy {
             run_as_user: p.run_as_user,
             run_as_group: p.run_as_group,
+            lifecycle_operations: p.lifecycle_operations,
         }),
         network_policies,
     }
@@ -845,12 +848,16 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
     });
 
     let process = policy.process.as_ref().and_then(|p| {
-        if p.run_as_user.is_empty() && p.run_as_group.is_empty() {
+        if p.run_as_user.is_empty()
+            && p.run_as_group.is_empty()
+            && p.lifecycle_operations.is_empty()
+        {
             None
         } else {
             Some(ProcessDef {
                 run_as_user: p.run_as_user.clone(),
                 run_as_group: p.run_as_group.clone(),
+                lifecycle_operations: p.lifecycle_operations.clone(),
             })
         }
     });
@@ -1078,6 +1085,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
         process: Some(ProcessPolicy {
             run_as_user: "sandbox".into(),
             run_as_group: "sandbox".into(),
+            lifecycle_operations: Vec::new(),
         }),
         network_policies: HashMap::new(),
     }
@@ -1108,11 +1116,20 @@ const MAX_FILESYSTEM_PATHS: usize = 256;
 /// Maximum length of any single filesystem path string.
 const MAX_PATH_LENGTH: usize = 4096;
 
+/// Maximum number of closed lifecycle operations declared by one sandbox.
+const MAX_LIFECYCLE_OPERATIONS: usize = 32;
+
 /// A safety violation found in a sandbox policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyViolation {
     /// `run_as_user` or `run_as_group` is not "sandbox".
     InvalidProcessIdentity { field: &'static str, value: String },
+    /// A lifecycle operation ID is not compiled into this `OpenShell` build.
+    UnknownLifecycleOperation { operation: String },
+    /// The same lifecycle operation is declared more than once.
+    DuplicateLifecycleOperation { operation: String },
+    /// Too many lifecycle operations are declared.
+    TooManyLifecycleOperations { count: usize },
     /// A filesystem path contains `..` components.
     PathTraversal { path: String },
     /// A filesystem path is not absolute (does not start with `/`).
@@ -1172,6 +1189,18 @@ impl fmt::Display for PolicyViolation {
         match self {
             Self::InvalidProcessIdentity { field, value } => {
                 write!(f, "{field} must be 'sandbox', got '{value}'")
+            }
+            Self::UnknownLifecycleOperation { operation } => {
+                write!(f, "unknown compiled lifecycle operation: {operation}")
+            }
+            Self::DuplicateLifecycleOperation { operation } => {
+                write!(f, "lifecycle operation is duplicated: {operation}")
+            }
+            Self::TooManyLifecycleOperations { count } => {
+                write!(
+                    f,
+                    "too many lifecycle operations ({count} > {MAX_LIFECYCLE_OPERATIONS})"
+                )
             }
             Self::PathTraversal { path } => {
                 write!(f, "path contains '..' traversal component: {path}")
@@ -1329,6 +1358,23 @@ pub fn validate_sandbox_policy(
                 field: "run_as_group",
                 value: process.run_as_group.clone(),
             });
+        }
+        if process.lifecycle_operations.len() > MAX_LIFECYCLE_OPERATIONS {
+            violations.push(PolicyViolation::TooManyLifecycleOperations {
+                count: process.lifecycle_operations.len(),
+            });
+        }
+        let mut lifecycle_operations = HashSet::new();
+        for operation in &process.lifecycle_operations {
+            if openshell_core::lifecycle_exec::operation_by_id(operation).is_none() {
+                violations.push(PolicyViolation::UnknownLifecycleOperation {
+                    operation: operation.clone(),
+                });
+            } else if !lifecycle_operations.insert(operation.as_str()) {
+                violations.push(PolicyViolation::DuplicateLifecycleOperation {
+                    operation: operation.clone(),
+                });
+            }
         }
     }
 
@@ -1785,6 +1831,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: String::new(),
             run_as_group: String::new(),
+            lifecycle_operations: Vec::new(),
         });
         ensure_sandbox_process_identity(&mut policy);
         let proc = policy.process.unwrap();
@@ -1819,6 +1866,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "root".into(),
             run_as_group: "sandbox".into(),
+            lifecycle_operations: Vec::new(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(violations.iter().any(|v| matches!(
@@ -1836,6 +1884,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "0".into(),
             run_as_group: "0".into(),
+            lifecycle_operations: Vec::new(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
@@ -1847,6 +1896,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: "nobody".into(),
             run_as_group: "nogroup".into(),
+            lifecycle_operations: Vec::new(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
@@ -1935,6 +1985,7 @@ network_policies:
         policy.process = Some(ProcessPolicy {
             run_as_user: String::new(),
             run_as_group: String::new(),
+            lifecycle_operations: Vec::new(),
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
@@ -2837,5 +2888,51 @@ network_policies:
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
         );
+    }
+
+    #[test]
+    fn round_trip_preserves_lifecycle_operation_allowlist() {
+        let yaml = r"
+version: 1
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+  lifecycle_operations:
+    - nemoclaw.hermes-mcp-config-transaction-v1
+";
+        let proto = parse_sandbox_policy(yaml).expect("parse lifecycle policy");
+        let process = proto.process.as_ref().expect("process policy");
+        assert_eq!(
+            process.lifecycle_operations,
+            vec!["nemoclaw.hermes-mcp-config-transaction-v1"]
+        );
+        validate_sandbox_policy(&proto).expect("safe lifecycle policy");
+
+        let serialized = serialize_sandbox_policy(&proto).expect("serialize lifecycle policy");
+        assert!(serialized.contains("lifecycle_operations:"));
+        assert!(serialized.contains("nemoclaw.hermes-mcp-config-transaction-v1"));
+    }
+
+    #[test]
+    fn lifecycle_allowlist_rejects_unknown_and_duplicate_operations() {
+        let mut policy = restrictive_default_policy();
+        policy
+            .process
+            .as_mut()
+            .expect("default process")
+            .lifecycle_operations = vec![
+            "unknown.operation".into(),
+            "nemoclaw.hermes-mcp-config-transaction-v1".into(),
+            "nemoclaw.hermes-mcp-config-transaction-v1".into(),
+        ];
+        let violations = validate_sandbox_policy(&policy).expect_err("unsafe lifecycle paths");
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::UnknownLifecycleOperation { .. }
+        )));
+        assert!(violations.iter().any(|violation| matches!(
+            violation,
+            PolicyViolation::DuplicateLifecycleOperation { .. }
+        )));
     }
 }

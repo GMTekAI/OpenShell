@@ -49,6 +49,10 @@ message ProcessPolicy {
   string run_as_user = 1;
   // Group name to run the sandboxed process as.
   string run_as_group = 2;
+  // Compiled fixed-path lifecycle operation IDs that an authenticated gateway user
+  // may invoke. Each ID maps to a compiled executable and argv schema in the
+  // gateway and supervisor; policy cannot grant arbitrary process execution.
+  repeated string lifecycle_operations = 3;
 }
 
 // A named network access policy rule.

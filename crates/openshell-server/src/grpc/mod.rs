@@ -187,6 +187,14 @@ impl OpenShellService {
     }
 }
 
+fn gateway_capabilities() -> Vec<String> {
+    vec![
+        "authenticated-mcp-policy-bound-credential-rewrite-v1".to_string(),
+        openshell_core::POLICY_AUTHORIZED_LIFECYCLE_EXEC_CAPABILITY.to_string(),
+        openshell_core::lifecycle_exec::NEMOCLAW_HERMES_MCP_CONFIG_OPERATION.to_string(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Trait impl — thin delegation to submodules
 // ---------------------------------------------------------------------------
@@ -202,7 +210,7 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
-            capabilities: vec!["authenticated-mcp-policy-bound-credential-rewrite-v1".to_string()],
+            capabilities: gateway_capabilities(),
         }))
     }
 
@@ -719,6 +727,16 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_attests_policy_authorized_lifecycle_exec() {
+        assert!(
+            gateway_capabilities().iter().any(|capability| capability
+                == openshell_core::POLICY_AUTHORIZED_LIFECYCLE_EXEC_CAPABILITY)
+        );
+        assert!(gateway_capabilities().iter().any(|capability| capability
+            == openshell_core::lifecycle_exec::NEMOCLAW_HERMES_MCP_CONFIG_OPERATION));
+    }
 
     #[test]
     fn clamp_limit_zero_returns_default() {

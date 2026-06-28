@@ -22,6 +22,7 @@ pub mod gpu;
 pub mod grpc_client;
 pub mod image;
 pub mod inference;
+pub mod lifecycle_exec;
 pub mod metadata;
 pub mod net;
 pub mod paths;
@@ -54,6 +55,9 @@ pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
+
+/// Stable gateway/supervisor capability for policy-authorized lifecycle exec.
+pub const POLICY_AUTHORIZED_LIFECYCLE_EXEC_CAPABILITY: &str = "policy-authorized-lifecycle-exec-v1";
 
 /// Encoded protobuf `FileDescriptorSet` for every proto in `proto/`.
 ///

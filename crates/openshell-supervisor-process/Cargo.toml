@@ -19,6 +19,7 @@ base64 = { workspace = true }
 hex = "0.4"
 miette = { workspace = true }
 nix = { workspace = true }
+prost = { workspace = true }
 rand_core = "0.6"
 russh = "0.57"
 serde_json = { workspace = true }

@@ -2754,6 +2754,10 @@ pub async fn sandbox_get(
 /// data into memory before the server rejects an oversized message.
 const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
 
+const fn exec_mode_reads_local_stdin(mode: openshell_core::proto::ExecSandboxMode) -> bool {
+    matches!(mode, openshell_core::proto::ExecSandboxMode::Workload)
+}
+
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
 /// Returns the remote command's exit code.
@@ -2766,6 +2770,7 @@ pub async fn sandbox_exec_grpc(
     timeout_seconds: u32,
     tty_override: Option<bool>,
     environment: &HashMap<String, String>,
+    mode: openshell_core::proto::ExecSandboxMode,
     tls: &TlsOptions,
 ) -> Result<i32> {
     let mut client = grpc_client(server, tls).await?;
@@ -2793,7 +2798,7 @@ pub async fn sandbox_exec_grpc(
     // Read stdin if piped (not a TTY), using spawn_blocking to avoid blocking
     // the async runtime. Cap the read at MAX_STDIN_PAYLOAD + 1 so we never
     // buffer more than the limit into memory.
-    let stdin_payload = if std::io::stdin().is_terminal() {
+    let stdin_payload = if !exec_mode_reads_local_stdin(mode) || std::io::stdin().is_terminal() {
         Vec::new()
     } else {
         tokio::task::spawn_blocking(|| {
@@ -2816,10 +2821,17 @@ pub async fn sandbox_exec_grpc(
     };
 
     // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
-    let tty = tty_override
-        .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let tty = if mode == openshell_core::proto::ExecSandboxMode::Lifecycle {
+        false
+    } else {
+        tty_override
+            .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal())
+    };
 
-    if tty_override == Some(true) && std::io::stdin().is_terminal() {
+    if mode == openshell_core::proto::ExecSandboxMode::Workload
+        && tty_override == Some(true)
+        && std::io::stdin().is_terminal()
+    {
         return sandbox_exec_interactive_grpc(
             client,
             &sandbox,
@@ -2841,6 +2853,7 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
+            mode: mode as i32,
             ..Default::default()
         })
         .await
@@ -3205,6 +3218,7 @@ async fn sandbox_exec_interactive_grpc(
                 tty: true,
                 cols: u32::from(cols),
                 rows: u32::from(rows),
+                mode: openshell_core::proto::ExecSandboxMode::Workload as i32,
             })),
         })
         .await
@@ -8043,10 +8057,11 @@ fn format_timestamp_ms(ms: i64) -> String {
 mod tests {
     use super::{
         ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
-        format_gateway_select_items, format_provider_attachment_table, gateway_add,
-        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_to_json,
-        gateway_type_label, git_sync_files, http_health_check, import_local_package_mtls_bundle,
+        dockerfile_sources_supported_for_gateway, exec_mode_reads_local_stdin, format_endpoint,
+        format_gateway_select_header, format_gateway_select_items,
+        format_provider_attachment_table, gateway_add, gateway_auth_label,
+        gateway_env_override_warning, gateway_select_with, gateway_to_json, gateway_type_label,
+        git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, plaintext_gateway_is_remote,
@@ -8079,6 +8094,16 @@ mod tests {
         ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
         ResourceRequirements, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
+
+    #[test]
+    fn lifecycle_exec_never_reads_local_stdin() {
+        assert!(exec_mode_reads_local_stdin(
+            openshell_core::proto::ExecSandboxMode::Workload
+        ));
+        assert!(!exec_mode_reads_local_stdin(
+            openshell_core::proto::ExecSandboxMode::Lifecycle
+        ));
+    }
 
     struct EnvVarGuard {
         key: &'static str,

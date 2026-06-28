@@ -5855,6 +5855,7 @@ mod tests {
             process: Some(openshell_core::proto::ProcessPolicy {
                 run_as_user: "sandbox".into(),
                 run_as_group: "sandbox".into(),
+                ..Default::default()
             }),
             ..Default::default()
         };
